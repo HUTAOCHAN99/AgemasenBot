@@ -16,7 +16,8 @@ const axios = require("axios");
 // =====================================================
 const sessions = new Map();
 
-const MAX_CANDIDATES = 100; // batas ambil dari safebooru per pencarian
+const MAX_CANDIDATES = null; // null = tidak pakai batas limit dari safebooru
+const MAX_SUGGESTS = null; // null = tidak pakai batas limit untuk saran tag
 
 // "tokai_teio_(umamusume)" -> "Tokai Teio (Umamusume)"
 function prettifyTag(tag) {
@@ -52,17 +53,19 @@ function buildCaption(post, karakterLabel, { isNext = false } = {}) {
 
 async function fetchCandidates(tag) {
     const url = "https://safebooru.org/index.php";
+    const params = {
+        page: "dapi",
+        s: "post",
+        q: "index",
+        json: 1,
+        tags: tag
+    };
 
-    const res = await axios.get(url, {
-        params: {
-            page: "dapi",
-            s: "post",
-            q: "index",
-            json: 1,
-            limit: MAX_CANDIDATES,
-            tags: tag
-        }
-    });
+    if (MAX_CANDIDATES !== null) {
+        params.limit = MAX_CANDIDATES;
+    }
+
+    const res = await axios.get(url, { params });
 
     if (!Array.isArray(res.data))
         return [];
@@ -70,7 +73,7 @@ async function fetchCandidates(tag) {
     return res.data.filter(p => p.file_url);
 }
 
-const MAX_TAG_SUGGESTIONS = 60; // batas tampilan list biar chat gak kepanjangan
+const TAG_PAGE_SIZE = 60; // jumlah tag per halaman list (bukan batas total, cuma biar chat gak kepanjangan)
 
 // Safebooru's s=tag&q=index endpoint ignores json=1 and always replies with
 // XML (unlike s=post&q=index which does honor json=1). axios won't auto-parse
@@ -104,16 +107,20 @@ function parseTagXml(xml) {
 // dipakai saat pencarian tag persis tidak ketemu gambar sama sekali.
 async function fetchMatchingTags(query) {
     const url = "https://safebooru.org/index.php";
+    const params = {
+        page: "dapi",
+        s: "tag",
+        q: "index",
+        json: 1,
+        name_pattern: `%${query}%`
+    };
+
+    if (MAX_SUGGESTS !== null) {
+        params.limit = MAX_SUGGESTS;
+    }
 
     const res = await axios.get(url, {
-        params: {
-            page: "dapi",
-            s: "tag",
-            q: "index",
-            json: 1,
-            limit: 100,
-            name_pattern: `%${query}%`
-        },
+        params,
         // Force raw text: if we let axios try to auto-parse and it gets XML
         // back (which it always does for this endpoint), the default
         // transform can throw or hand us something unpredictable.
@@ -139,8 +146,9 @@ async function fetchMatchingTags(query) {
 
     return tags
         .filter(t => Number(t.count) > 0)
-        .sort((a, b) => Number(b.count) - Number(a.count))
-        .slice(0, MAX_TAG_SUGGESTIONS);
+        .sort((a, b) => Number(b.count) - Number(a.count));
+    // tidak ada .slice() di sini lagi -> semua kandidat dikembalikan,
+    // pemotongan per halaman terjadi saat ditampilkan (buildTagChoiceList)
 }
 
 async function fetchById(id) {
@@ -164,16 +172,21 @@ async function fetchById(id) {
     return post.file_url ? post : null;
 }
 
-function buildTagChoiceList(tags) {
-    const lines = tags
-        .map((t, i) => `[${i + 1}] ${prettifyTag(t.name)}`)
+function buildTagChoiceList(allTags, offset = 0) {
+    const page = allTags.slice(offset, offset + TAG_PAGE_SIZE);
+    const remaining = allTags.length - (offset + page.length);
+
+    const lines = page
+        .map((t, i) => `[${offset + i + 1}] ${prettifyTag(t.name)}`)
         .join("\n");
 
-    return (
-`*KARAKTER DITEMUKAN*
-${lines}
+    const footer = remaining > 0
+        ? `\n\n_Masih ada ${remaining} lagi. Ketik *!more* untuk lihat selanjutnya._\n_Atau reply pesan ini dengan nomor urut karakter untuk melihat gambar_`
+        : `\n\n_Reply pesan ini dengan nomor urut karakter untuk melihat gambar_`;
 
-_Reply pesan ini dengan nomor urut karakter untuk melihat gambar_`
+    return (
+`*KARAKTER DITEMUKAN* (${offset + 1}-${offset + page.length} dari ${allTags.length})
+${lines}${footer}`
     );
 }
 
@@ -302,6 +315,7 @@ async function startBot() {
 !ping
 !help
 !img <tag>      cari gambar baru (kalau tag umum, akan muncul pilihan karakter)
+!more           halaman berikutnya dari daftar pilihan karakter
 !next           gambar berikutnya dari pencarian terakhirmu
 !id <kode>      buka ulang gambar pakai kode
 
@@ -358,6 +372,37 @@ Contoh:
         }
 
         // =====================
+        // !more (halaman berikutnya dari daftar karakter yang sedang pending)
+        // =====================
+        if (text === "!more") {
+            const session = sessions.get(sessionKey);
+
+            if (!session?.pendingTagChoices) {
+                await sock.sendMessage(jid, {
+                    text: "⚠️ Tidak ada daftar karakter yang sedang aktif. Pakai *!img <tag>* dulu."
+                });
+                return;
+            }
+
+            const nextOffset = session.pendingOffset + TAG_PAGE_SIZE;
+
+            if (nextOffset >= session.pendingTagChoices.length) {
+                await sock.sendMessage(jid, {
+                    text: "✅ Sudah halaman terakhir."
+                });
+                return;
+            }
+
+            session.pendingOffset = nextOffset;
+
+            await sock.sendMessage(jid, {
+                text: buildTagChoiceList(session.pendingTagChoices, nextOffset)
+            });
+
+            return;
+        }
+
+        // =====================
         // !img <tag>
         // =====================
         if (text === "!img" || text.startsWith("!img ")) {
@@ -395,10 +440,10 @@ Contoh:
                     return;
                 }
 
-                sessions.set(sessionKey, { pendingTagChoices: matches });
+                sessions.set(sessionKey, { pendingTagChoices: matches, pendingOffset: 0 });
 
                 await sock.sendMessage(jid, {
-                    text: buildTagChoiceList(matches)
+                    text: buildTagChoiceList(matches, 0)
                 });
 
             } catch (err) {
