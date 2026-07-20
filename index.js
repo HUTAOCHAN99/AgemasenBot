@@ -16,8 +16,11 @@ const axios = require("axios");
 // =====================================================
 const sessions = new Map();
 
-const MAX_CANDIDATES = null; // null = tidak pakai batas limit dari safebooru
-const MAX_SUGGESTS = null; // null = tidak pakai batas limit untuk saran tag
+// Safebooru's dapi menolak permintaan "limit" di atas 100 dalam satu request,
+// jadi buat ambil SEMUA post (tanpa batas), kita harus paging pakai "pid"
+// (page index, 0-based) sampai halaman yang balik lebih pendek dari
+// API_PAGE_SIZE (berarti itu halaman terakhir).
+const API_PAGE_SIZE = 100;
 
 // "tokai_teio_(umamusume)" -> "Tokai Teio (Umamusume)"
 function prettifyTag(tag) {
@@ -53,27 +56,35 @@ function buildCaption(post, karakterLabel, { isNext = false } = {}) {
 
 async function fetchCandidates(tag) {
     const url = "https://safebooru.org/index.php";
-    const params = {
-        page: "dapi",
-        s: "post",
-        q: "index",
-        json: 1,
-        tags: tag
-    };
+    const all = [];
+    let pid = 0;
 
-    if (MAX_CANDIDATES !== null) {
-        params.limit = MAX_CANDIDATES;
+    while (true) {
+        const res = await axios.get(url, {
+            params: {
+                page: "dapi",
+                s: "post",
+                q: "index",
+                json: 1,
+                limit: API_PAGE_SIZE,
+                pid,
+                tags: tag
+            }
+        });
+
+        if (!Array.isArray(res.data) || res.data.length === 0)
+            break;
+
+        all.push(...res.data);
+
+        if (res.data.length < API_PAGE_SIZE)
+            break; // halaman terakhir, tidak perlu lanjut
+
+        pid++;
     }
 
-    const res = await axios.get(url, { params });
-
-    if (!Array.isArray(res.data))
-        return [];
-
-    return res.data.filter(p => p.file_url);
+    return all.filter(p => p.file_url);
 }
-
-const TAG_PAGE_SIZE = 60; // jumlah tag per halaman list (bukan batas total, cuma biar chat gak kepanjangan)
 
 // Safebooru's s=tag&q=index endpoint ignores json=1 and always replies with
 // XML (unlike s=post&q=index which does honor json=1). axios won't auto-parse
@@ -107,48 +118,57 @@ function parseTagXml(xml) {
 // dipakai saat pencarian tag persis tidak ketemu gambar sama sekali.
 async function fetchMatchingTags(query) {
     const url = "https://safebooru.org/index.php";
-    const params = {
-        page: "dapi",
-        s: "tag",
-        q: "index",
-        json: 1,
-        name_pattern: `%${query}%`
-    };
+    const all = [];
+    let pid = 0;
 
-    if (MAX_SUGGESTS !== null) {
-        params.limit = MAX_SUGGESTS;
-    }
+    while (true) {
+        const res = await axios.get(url, {
+            params: {
+                page: "dapi",
+                s: "tag",
+                q: "index",
+                json: 1,
+                limit: API_PAGE_SIZE,
+                pid,
+                name_pattern: `%${query}%`
+            },
+            // Force raw text: if we let axios try to auto-parse and it gets XML
+            // back (which it always does for this endpoint), the default
+            // transform can throw or hand us something unpredictable.
+            responseType: "text",
+            transformResponse: (data) => data
+        });
 
-    const res = await axios.get(url, {
-        params,
-        // Force raw text: if we let axios try to auto-parse and it gets XML
-        // back (which it always does for this endpoint), the default
-        // transform can throw or hand us something unpredictable.
-        responseType: "text",
-        transformResponse: (data) => data
-    });
+        let tags;
 
-    let tags;
-
-    if (Array.isArray(res.data)) {
-        // In case Safebooru ever does honor json=1 for this endpoint.
-        tags = res.data;
-    } else if (typeof res.data === "string" && res.data.trim().startsWith("{")) {
-        try {
-            const parsed = JSON.parse(res.data);
-            tags = Array.isArray(parsed) ? parsed : parsed?.["@attributes"] ? [] : [];
-        } catch {
+        if (Array.isArray(res.data)) {
+            // In case Safebooru ever does honor json=1 for this endpoint.
+            tags = res.data;
+        } else if (typeof res.data === "string" && res.data.trim().startsWith("{")) {
+            try {
+                const parsed = JSON.parse(res.data);
+                tags = Array.isArray(parsed) ? parsed : parsed?.["@attributes"] ? [] : [];
+            } catch {
+                tags = parseTagXml(res.data);
+            }
+        } else {
             tags = parseTagXml(res.data);
         }
-    } else {
-        tags = parseTagXml(res.data);
+
+        if (tags.length === 0)
+            break;
+
+        all.push(...tags);
+
+        if (tags.length < API_PAGE_SIZE)
+            break; // halaman terakhir
+
+        pid++;
     }
 
-    return tags
+    return all
         .filter(t => Number(t.count) > 0)
         .sort((a, b) => Number(b.count) - Number(a.count));
-    // tidak ada .slice() di sini lagi -> semua kandidat dikembalikan,
-    // pemotongan per halaman terjadi saat ditampilkan (buildTagChoiceList)
 }
 
 async function fetchById(id) {
@@ -172,21 +192,16 @@ async function fetchById(id) {
     return post.file_url ? post : null;
 }
 
-function buildTagChoiceList(allTags, offset = 0) {
-    const page = allTags.slice(offset, offset + TAG_PAGE_SIZE);
-    const remaining = allTags.length - (offset + page.length);
-
-    const lines = page
-        .map((t, i) => `[${offset + i + 1}] ${prettifyTag(t.name)}`)
+function buildTagChoiceList(tags) {
+    const lines = tags
+        .map((t, i) => `[${i + 1}] ${prettifyTag(t.name)}`)
         .join("\n");
 
-    const footer = remaining > 0
-        ? `\n\n_Masih ada ${remaining} lagi. Ketik *!more* untuk lihat selanjutnya._\n_Atau reply pesan ini dengan nomor urut karakter untuk melihat gambar_`
-        : `\n\n_Reply pesan ini dengan nomor urut karakter untuk melihat gambar_`;
-
     return (
-`*KARAKTER DITEMUKAN* (${offset + 1}-${offset + page.length} dari ${allTags.length})
-${lines}${footer}`
+`*KARAKTER DITEMUKAN*
+${lines}
+
+_Reply pesan ini dengan nomor urut karakter untuk melihat gambar_`
     );
 }
 
@@ -315,7 +330,6 @@ async function startBot() {
 !ping
 !help
 !img <tag>      cari gambar baru (kalau tag umum, akan muncul pilihan karakter)
-!more           halaman berikutnya dari daftar pilihan karakter
 !next           gambar berikutnya dari pencarian terakhirmu
 !id <kode>      buka ulang gambar pakai kode
 
@@ -372,37 +386,6 @@ Contoh:
         }
 
         // =====================
-        // !more (halaman berikutnya dari daftar karakter yang sedang pending)
-        // =====================
-        if (text === "!more") {
-            const session = sessions.get(sessionKey);
-
-            if (!session?.pendingTagChoices) {
-                await sock.sendMessage(jid, {
-                    text: "⚠️ Tidak ada daftar karakter yang sedang aktif. Pakai *!img <tag>* dulu."
-                });
-                return;
-            }
-
-            const nextOffset = session.pendingOffset + TAG_PAGE_SIZE;
-
-            if (nextOffset >= session.pendingTagChoices.length) {
-                await sock.sendMessage(jid, {
-                    text: "✅ Sudah halaman terakhir."
-                });
-                return;
-            }
-
-            session.pendingOffset = nextOffset;
-
-            await sock.sendMessage(jid, {
-                text: buildTagChoiceList(session.pendingTagChoices, nextOffset)
-            });
-
-            return;
-        }
-
-        // =====================
         // !img <tag>
         // =====================
         if (text === "!img" || text.startsWith("!img ")) {
@@ -440,10 +423,10 @@ Contoh:
                     return;
                 }
 
-                sessions.set(sessionKey, { pendingTagChoices: matches, pendingOffset: 0 });
+                sessions.set(sessionKey, { pendingTagChoices: matches });
 
                 await sock.sendMessage(jid, {
-                    text: buildTagChoiceList(matches, 0)
+                    text: buildTagChoiceList(matches)
                 });
 
             } catch (err) {
