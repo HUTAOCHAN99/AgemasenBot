@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+auth_info/
+
+# Environment variables
+.env
+.env.local
+
+# Build output
+dist/
+build/
+.next/
+out/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Coverage
+coverage/
+
+# Package manager
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
