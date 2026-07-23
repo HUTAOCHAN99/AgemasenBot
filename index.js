@@ -434,6 +434,29 @@ function isAnyMediaSource(content) {
     return isAnimatedSource(content) || isStaticSource(content);
 }
 
+// PENTING: apakah medianya cuma 1 frame (gambar diam)?
+// Filter ffmpeg "fps=12" (dipakai bareng "-fps_mode cfr") butuh minimal 2
+// frame buat bisa nentuin durasi/timing antar-frame. Kalau sumbernya cuma
+// SATU frame (foto biasa, atau stiker WA yang statis/bukan animasi), filter
+// "fps=12" itu malah gagal ngeluarin frame sama sekali -> file output jadi
+// kosong (0 byte) dan dikirim sebagai stiker rusak ("Sticker with no
+// label" di WhatsApp). Makanya sebelum bikin stiker, kita cek dulu: kalau
+// medianya "still" (gambar diam), filter "fps=12" di-skip total di
+// gifToTextSticker/mediaToSticker.
+function isStillMedia(content) {
+    if (!content) return false;
+
+    if (content.stickerMessage) return !content.stickerMessage.isAnimated;
+    if (content.imageMessage) return true;
+
+    if (content.documentMessage) {
+        const mime = content.documentMessage.mimetype || "";
+        return mime.startsWith("image/") && mime !== "image/gif";
+    }
+
+    return false; // videoMessage, dokumen video/gif -> selalu dianggap stream, bukan still
+}
+
 async function downloadGifBuffer(content, refKey) {
     const fakeMsg = {
         key: refKey,
@@ -500,8 +523,11 @@ function parseMemeText(raw) {
     return { top: null, bottom: parts[0] || raw.trim() };
 }
 
-// Proses inti: buffer GIF/video input -> buffer stiker WebP animasi bertext.
-async function gifToTextSticker(inputBuffer, memeText) {
+// Proses inti: buffer GIF/video/foto/stiker input -> buffer stiker WebP
+// bertext. `isStill` = true kalau sumbernya cuma 1 frame (foto/stiker
+// statis) -> filter "fps=12" di-skip karena butuh minimal 2 frame buat
+// jalan, kalau tetap dipaksa malah bikin output kosong (lihat isStillMedia).
+async function gifToTextSticker(inputBuffer, memeText, isStill = false) {
     const tmpDir = os.tmpdir();
     const uid = crypto.randomBytes(6).toString("hex");
     const inputPath = path.join(tmpDir, `meme-in-${uid}`);
@@ -529,7 +555,7 @@ async function gifToTextSticker(inputBuffer, memeText) {
             "format=rgba",
             "scale=512:512:force_original_aspect_ratio=decrease",
             "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
-            "fps=12",
+            ...(isStill ? [] : ["fps=12"]),
             `subtitles='${escapeFilterPath(assPath)}'`
         ];
 
@@ -560,8 +586,10 @@ async function gifToTextSticker(inputBuffer, memeText) {
 // Proses inti buat "!s": buffer GIF/video/stiker/foto -> buffer stiker WebP
 // polos, TANPA teks (tidak lewat tahap subtitle/.ass sama sekali). Filter
 // scale+pad+fps-nya sama persis dengan gifToTextSticker supaya hasil
-// crop/rasio-nya konsisten antara "!s" dan "!meme"/"!smeme".
-async function mediaToSticker(inputBuffer) {
+// crop/rasio-nya konsisten antara "!s" dan "!meme"/"!smeme". `isStill` sama
+// perannya kayak di gifToTextSticker: skip "fps=12" buat gambar diam (lihat
+// isStillMedia untuk alasannya).
+async function mediaToSticker(inputBuffer, isStill = false) {
     const tmpDir = os.tmpdir();
     const uid = crypto.randomBytes(6).toString("hex");
     const inputPath = path.join(tmpDir, `s-in-${uid}`);
@@ -574,7 +602,7 @@ async function mediaToSticker(inputBuffer) {
             "format=rgba",
             "scale=512:512:force_original_aspect_ratio=decrease",
             "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
-            "fps=12"
+            ...(isStill ? [] : ["fps=12"])
         ];
 
         const args = [
@@ -839,7 +867,7 @@ Kirim medianya dengan caption "!s", atau reply media itu dengan "!s"`
                 await sock.sendMessage(jid, { text: "⏳ Membuat stiker..." });
 
                 const mediaBuffer = await downloadGifBuffer(source.content, source.refKey);
-                const stickerBuffer = await gifToTextSticker(mediaBuffer, memeText);
+                const stickerBuffer = await gifToTextSticker(mediaBuffer, memeText, isStillMedia(source.content));
 
                 await sock.sendMessage(jid, { sticker: stickerBuffer });
 
@@ -874,7 +902,7 @@ Kirim medianya dengan caption "!s", atau reply media itu dengan "!s"`
                 await sock.sendMessage(jid, { text: "⏳ Membuat stiker..." });
 
                 const mediaBuffer = await downloadGifBuffer(source.content, source.refKey);
-                const stickerBuffer = await mediaToSticker(mediaBuffer);
+                const stickerBuffer = await mediaToSticker(mediaBuffer, isStillMedia(source.content));
 
                 await sock.sendMessage(jid, { sticker: stickerBuffer });
 
