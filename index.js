@@ -3,11 +3,18 @@ const {
     default: makeWASocket,
     useMultiFileAuthState,
     fetchLatestBaileysVersion,
-    DisconnectReason
+    DisconnectReason,
+    downloadMediaMessage
 } = require("@whiskeysockets/baileys");
 
 const P = require("pino");
 const axios = require("axios");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
+const ffmpegPath = require("ffmpeg-static");
 
 // =====================================================
 // Session per pengguna (bukan per chat/grup)
@@ -242,6 +249,193 @@ async function downloadImage(fileUrl) {
     return Buffer.from(image.data);
 }
 
+// =====================================================
+// Fitur: GIF -> Stiker animasi dengan teks ("!meme")
+// =====================================================
+
+// Nama font (family) yang dipakai untuk teks meme. Dicari lewat fontconfig,
+// jadi tidak perlu path file eksplisit. Bisa dioverride lewat env var
+// MEME_FONT_FAMILY kalau server tidak punya DejaVu Sans (mis. pakai
+// Liberation Sans, Arial, dst).
+const FONT_FAMILY = process.env.MEME_FONT_FAMILY || "DejaVu Sans";
+
+// Escape teks untuk dipakai di dalam file subtitle .ass.
+// Di format ASS, "{" dan "}" punya arti khusus (dipakai untuk tag styling
+// seperti \an8), jadi karakter itu perlu di-escape, dan newline literal
+// harus jadi "\N".
+function escapeAssText(str) {
+    return String(str)
+        .replace(/\{/g, "\uFF5B")
+        .replace(/\}/g, "\uFF5D")
+        .replace(/\r?\n/g, "\\N");
+}
+
+// Bikin file subtitle .ass sederhana: satu style, teks atas (opsional)
+// dan teks bawah, ditempatkan pakai tag alignment ASS (\an8 = atas-tengah,
+// \an2 = bawah-tengah). Dirender lewat filter "subtitles" (libass),
+// yang jauh lebih portable ketimbang "drawtext" karena tidak semua build
+// ffmpeg (termasuk ffmpeg-static) menyertakan filter drawtext.
+function buildAssSubtitle({ top, bottom }) {
+    // Waktu akhir digenerosir (10 menit); tidak masalah lebih panjang dari
+    // video aslinya karena output tetap dipotong lewat "-t 10" di ffmpeg.
+    const endTag = "0:10:00.00";
+
+    const header =
+`[Script Info]
+ScriptType: v4.00+
+PlayResX: 512
+PlayResY: 512
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Meme,${FONT_FAMILY},46,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,0,2,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+    const lines = [];
+
+    if (top) {
+        lines.push(`Dialogue: 0,0:00:00.00,${endTag},Meme,,0,0,0,,{\\an8}${escapeAssText(top)}`);
+    }
+    if (bottom) {
+        lines.push(`Dialogue: 0,0:00:00.00,${endTag},Meme,,0,0,0,,{\\an2}${escapeAssText(bottom)}`);
+    }
+
+    return header + lines.join("\n") + "\n";
+}
+
+// Escape path file untuk dipakai sebagai argumen filter subtitles=...
+// (":" dan "\" punya arti khusus di dalam filtergraph ffmpeg).
+function escapeFilterPath(p) {
+    return p.replace(/\\/g, "\\\\\\\\").replace(/:/g, "\\\\:").replace(/'/g, "\\\\'");
+}
+
+// Jalankan ffmpeg dan tunggu sampai selesai.
+function runFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+        const proc = spawn(ffmpegPath, args);
+        let stderr = "";
+
+        proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+        proc.on("error", reject);
+        proc.on("close", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`ffmpeg keluar dengan kode ${code}\n${stderr.slice(-800)}`));
+        });
+    });
+}
+
+// Ambil buffer media dari sebuah "message content" (msg.message ATAU
+// contextInfo.quotedMessage), khusus untuk yang berbentuk gif/video
+// (videoMessage dengan gifPlayback, atau documentMessage bertipe video/gif).
+// Baileys' downloadMediaMessage butuh objek berbentuk { key, message }.
+function isGifLike(content) {
+    if (!content) return false;
+
+    if (content.videoMessage) return true;
+
+    if (content.documentMessage) {
+        const mime = content.documentMessage.mimetype || "";
+        return mime.startsWith("video/") || mime === "image/gif";
+    }
+
+    return false;
+}
+
+async function downloadGifBuffer(content, refKey) {
+    const fakeMsg = {
+        key: refKey,
+        message: content
+    };
+
+    return downloadMediaMessage(fakeMsg, "buffer", {});
+}
+
+// Cari konten gif dari pesan masuk: bisa dari pesan itu sendiri
+// (caption langsung di GIF), atau dari pesan yang di-reply (quoted).
+function findGifSource(msg) {
+    const jid = msg.key.remoteJid;
+
+    if (isGifLike(msg.message)) {
+        return { content: msg.message, refKey: msg.key };
+    }
+
+    const ctx = msg.message?.extendedTextMessage?.contextInfo;
+    const quoted = ctx?.quotedMessage;
+
+    if (quoted && isGifLike(quoted)) {
+        return {
+            content: quoted,
+            refKey: {
+                remoteJid: jid,
+                id: ctx.stanzaId,
+                participant: ctx.participant
+            }
+        };
+    }
+
+    return null;
+}
+
+// teks bisa "atas|bawah" (dua baris) atau cuma "teks" (satu baris di bawah)
+function parseMemeText(raw) {
+    const parts = raw.split("|").map(s => s.trim()).filter(Boolean);
+
+    if (parts.length >= 2) {
+        return { top: parts[0], bottom: parts[1] };
+    }
+
+    return { top: null, bottom: parts[0] || raw.trim() };
+}
+
+// Proses inti: buffer GIF/video input -> buffer stiker WebP animasi bertext.
+async function gifToTextSticker(inputBuffer, memeText) {
+    const tmpDir = os.tmpdir();
+    const uid = crypto.randomBytes(6).toString("hex");
+    const inputPath = path.join(tmpDir, `meme-in-${uid}`);
+    const assPath = path.join(tmpDir, `meme-${uid}.ass`);
+    const outputPath = path.join(tmpDir, `meme-out-${uid}.webp`);
+
+    fs.writeFileSync(inputPath, inputBuffer);
+
+    try {
+        const parsed = parseMemeText(memeText);
+        fs.writeFileSync(assPath, buildAssSubtitle(parsed), "utf8");
+
+        const filters = [
+            // WA sticker wajib 512x512, dijaga aspect ratio + padding transparan
+            "scale=512:512:force_original_aspect_ratio=decrease",
+            "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
+            "fps=12",
+            `subtitles='${escapeFilterPath(assPath)}'`
+        ];
+
+        const args = [
+            "-y",
+            "-i", inputPath,
+            "-vf", filters.join(","),
+            "-vcodec", "libwebp",
+            "-loop", "0",
+            "-preset", "default",
+            "-an",
+            "-fps_mode", "cfr",
+            "-t", "10", // batas durasi stiker WA
+            outputPath
+        ];
+
+        await runFfmpeg(args);
+
+        return fs.readFileSync(outputPath);
+    } finally {
+        fs.rm(inputPath, { force: true }, () => {});
+        fs.rm(assPath, { force: true }, () => {});
+        fs.rm(outputPath, { force: true }, () => {});
+    }
+}
+
 async function startBot() {
     console.log("Starting bot...");
 
@@ -308,6 +502,8 @@ async function startBot() {
         const text = (
             msg.message.conversation ||
             msg.message.extendedTextMessage?.text ||
+            msg.message.videoMessage?.caption ||
+            msg.message.documentMessage?.caption ||
             ""
         ).trim();
 
@@ -332,12 +528,20 @@ async function startBot() {
 !img <tag>      cari gambar baru (kalau tag umum, akan muncul pilihan karakter)
 !next           gambar berikutnya dari pencarian terakhirmu
 !id <kode>      buka ulang gambar pakai kode
+!meme <teks>    ubah GIF jadi stiker animasi dengan teks
 
 Contoh:
 !img umamusume
 !img tokai_teio_(umamusume)
 !img uchiha      -> muncul daftar karakter, balas dengan angka
-!id 12345`
+!id 12345
+
+Cara pakai !meme:
+1) Kirim GIF dengan caption "!meme teks kamu"
+   atau
+2) Kirim GIF dulu, lalu balas (reply) GIF itu dengan "!meme teks kamu"
+Mau 2 baris (atas & bawah)? Pisahkan dengan "|":
+!meme HALO DUNIA|SELAMAT PAGI`
             });
             return;
         }
@@ -383,6 +587,49 @@ Contoh:
             }
 
             // angka tanpa daftar pending -> biarkan lewat, bukan command
+        }
+
+        // =====================
+        // !meme <teks>  -> GIF jadi stiker animasi dengan teks
+        // Bisa dari caption langsung di GIF, atau reply ke GIF.
+        // =====================
+        if (text === "!meme" || text.startsWith("!meme ")) {
+            const memeText = text.slice(5).trim();
+
+            if (!memeText) {
+                await sock.sendMessage(jid, {
+                    text: "⚠️ Sertakan teksnya. Contoh: !meme HALO DUNIA\n" +
+                          "(atau kirim sebagai caption/reply ke GIF-nya)"
+                });
+                return;
+            }
+
+            const source = findGifSource(msg);
+
+            if (!source) {
+                await sock.sendMessage(jid, {
+                    text: "⚠️ Tidak ada GIF terdeteksi.\n" +
+                          "Kirim GIF dengan caption *!meme teks*, atau reply GIF-nya dengan *!meme teks*."
+                });
+                return;
+            }
+
+            try {
+                await sock.sendMessage(jid, { text: "⏳ Membuat stiker..." });
+
+                const gifBuffer = await downloadGifBuffer(source.content, source.refKey);
+                const stickerBuffer = await gifToTextSticker(gifBuffer, memeText);
+
+                await sock.sendMessage(jid, { sticker: stickerBuffer });
+
+            } catch (err) {
+                console.log(err);
+                await sock.sendMessage(jid, {
+                    text: `❌ Gagal membuat stiker.\n${err.message || ""}`
+                });
+            }
+
+            return;
         }
 
         // =====================
