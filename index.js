@@ -270,12 +270,64 @@ function escapeAssText(str) {
         .replace(/\r?\n/g, "\\N");
 }
 
+// Sticker WA selalu dipaksa jadi kanvas 512x512, sementara GIF/video sumber
+// bisa punya rasio aspek apa saja. Karena filter video pakai
+// "scale=512:512:force_original_aspect_ratio=decrease" lalu di-pad transparan
+// biar pas 512x512, ukuran konten asli yang KELIHATAN (non-transparan) bisa
+// lebih kecil dari 512x512 -- bisa ada bar transparan di atas/bawah (video
+// landscape) atau di kiri/kanan (video portrait). Fungsi ini menghitung
+// seberapa besar bar atas/bawah itu, supaya margin teks bisa disesuaikan
+// otomatis untuk SEMUA ukuran/rasio GIF, bukan angka tetap yang cuma pas
+// buat satu rasio tertentu.
+function probeVideoDimensions(inputPath) {
+    return new Promise((resolve) => {
+        const proc = spawn(ffmpegPath, ["-i", inputPath]);
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+        proc.on("error", () => resolve(null));
+        proc.on("close", () => {
+            // Contoh baris yang mau ditangkap:
+            // "Stream #0:0: Video: gif, bgra, 480x270, ..."
+            const match = stderr.match(/Video:.*?(\d{2,5})x(\d{2,5})/);
+            if (!match) return resolve(null);
+            resolve({ width: parseInt(match[1], 10), height: parseInt(match[2], 10) });
+        });
+    });
+}
+
+// Hitung MarginV (jarak dari tepi atas/bawah kanvas 512x512) yang aman
+// dipakai, berdasarkan ukuran asli video/GIF. Selalu memberi margin minimum
+// (MIN_MARGIN) walau videonya kebetulan pas 1:1 (tidak ada bar transparan),
+// dan menambah margin ekstra sebesar bar transparan + jarak aman kalau video
+// landscape/portrait menyebabkan letterboxing vertikal.
+function computeSafeMargins(srcDims) {
+    const CANVAS = 512;
+    const MIN_MARGIN = 20; // margin dasar biar teks tetap enak dilihat, tidak nempel tepi
+    const SAFE_GAP_TOP = 20; // jarak ekstra dari batas area transparan buat teks atas
+    const SAFE_GAP_BOTTOM = 25; // jarak ekstra dari batas area transparan buat teks bawah
+
+    if (!srcDims || !srcDims.width || !srcDims.height) {
+        // Gagal deteksi ukuran -> fallback ke margin aman generik.
+        return { top: MIN_MARGIN + SAFE_GAP_TOP, bottom: MIN_MARGIN + SAFE_GAP_BOTTOM };
+    }
+
+    const scale = Math.min(CANVAS / srcDims.width, CANVAS / srcDims.height);
+    const scaledHeight = srcDims.height * scale;
+    // Setengah dari total bar transparan atas+bawah (pad simetris di tengah).
+    const verticalPad = Math.max(0, Math.round((CANVAS - scaledHeight) / 2));
+
+    return {
+        top: Math.max(MIN_MARGIN, verticalPad + SAFE_GAP_TOP),
+        bottom: Math.max(MIN_MARGIN, verticalPad + SAFE_GAP_BOTTOM)
+    };
+}
+
 // Bikin file subtitle .ass sederhana: satu style, teks atas (opsional)
 // dan teks bawah, ditempatkan pakai tag alignment ASS (\an8 = atas-tengah,
 // \an2 = bawah-tengah). Dirender lewat filter "subtitles" (libass),
 // yang jauh lebih portable ketimbang "drawtext" karena tidak semua build
 // ffmpeg (termasuk ffmpeg-static) menyertakan filter drawtext.
-function buildAssSubtitle({ top, bottom }) {
+function buildAssSubtitle({ top, bottom, marginTop, marginBottom }) {
     // Waktu akhir digenerosir (10 menit); tidak masalah lebih panjang dari
     // video aslinya karena output tetap dipotong lewat "-t 10" di ffmpeg.
     const endTag = "0:10:00.00";
@@ -296,10 +348,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
     // MarginV per baris (override MarginV di style) supaya teks atas & bawah
-    // tidak kepotong area transparan stiker: teks atas digeser turun sedikit,
-    // teks bawah digeser naik sedikit dari posisi awal (MarginV 20).
-    const TOP_MARGIN_V = 40;
-    const BOTTOM_MARGIN_V = 45;
+    // tidak kepotong area transparan stiker. Nilainya dihitung dinamis lewat
+    // computeSafeMargins() berdasarkan rasio aspek GIF/video sumber, jadi
+    // selalu aman untuk semua ukuran -- bukan angka tetap yang cuma pas buat
+    // satu rasio tertentu. Tetap ada fallback kalau caller tidak mengirim
+    // margin (mis. dipanggil langsung tanpa lewat gifToTextSticker).
+    const TOP_MARGIN_V = marginTop ?? 40;
+    const BOTTOM_MARGIN_V = marginBottom ?? 45;
 
     const lines = [];
 
@@ -409,7 +464,13 @@ async function gifToTextSticker(inputBuffer, memeText) {
 
     try {
         const parsed = parseMemeText(memeText);
-        fs.writeFileSync(assPath, buildAssSubtitle(parsed), "utf8");
+        const srcDims = await probeVideoDimensions(inputPath);
+        const margins = computeSafeMargins(srcDims);
+        fs.writeFileSync(
+            assPath,
+            buildAssSubtitle({ ...parsed, marginTop: margins.top, marginBottom: margins.bottom }),
+            "utf8"
+        );
 
         const filters = [
             // WA sticker wajib 512x512. GIF di-scale biar muat penuh tanpa
