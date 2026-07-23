@@ -295,13 +295,19 @@ Style: Meme,${FONT_FAMILY},46,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
+    // MarginV per baris (override MarginV di style) supaya teks atas & bawah
+    // tidak kepotong area transparan stiker: teks atas digeser turun sedikit,
+    // teks bawah digeser naik sedikit dari posisi awal (MarginV 20).
+    const TOP_MARGIN_V = 40;
+    const BOTTOM_MARGIN_V = 45;
+
     const lines = [];
 
     if (top) {
-        lines.push(`Dialogue: 0,0:00:00.00,${endTag},Meme,,0,0,0,,{\\an8}${escapeAssText(top)}`);
+        lines.push(`Dialogue: 0,0:00:00.00,${endTag},Meme,,0,0,${TOP_MARGIN_V},,{\\an8}${escapeAssText(top)}`);
     }
     if (bottom) {
-        lines.push(`Dialogue: 0,0:00:00.00,${endTag},Meme,,0,0,0,,{\\an2}${escapeAssText(bottom)}`);
+        lines.push(`Dialogue: 0,0:00:00.00,${endTag},Meme,,0,0,${BOTTOM_MARGIN_V},,{\\an2}${escapeAssText(bottom)}`);
     }
 
     return header + lines.join("\n") + "\n";
