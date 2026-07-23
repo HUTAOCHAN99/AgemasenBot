@@ -390,17 +390,23 @@ function runFfmpeg(args) {
 }
 
 // Ambil buffer media dari sebuah "message content" (msg.message ATAU
-// contextInfo.quotedMessage), khusus untuk yang berbentuk gif/video
-// (videoMessage dengan gifPlayback, atau documentMessage bertipe video/gif).
+// contextInfo.quotedMessage), untuk semua jenis media yang bisa dijadiin
+// stiker meme: GIF/video (videoMessage, documentMessage bertipe video/gif),
+// stiker WA / "emote" (stickerMessage, statis maupun animasi), dan foto biasa
+// (imageMessage, documentMessage bertipe image). ffmpeg otomatis bisa nangani
+// baik input berupa gambar diam (hasilnya 1 frame) maupun animasi (banyak
+// frame) lewat filter yang sama, jadi tidak perlu penanganan khusus di sini.
 // Baileys' downloadMediaMessage butuh objek berbentuk { key, message }.
 function isGifLike(content) {
     if (!content) return false;
 
     if (content.videoMessage) return true;
+    if (content.stickerMessage) return true;
+    if (content.imageMessage) return true;
 
     if (content.documentMessage) {
         const mime = content.documentMessage.mimetype || "";
-        return mime.startsWith("video/") || mime === "image/gif";
+        return mime.startsWith("video/") || mime.startsWith("image/");
     }
 
     return false;
@@ -509,6 +515,49 @@ async function gifToTextSticker(inputBuffer, memeText) {
     }
 }
 
+// Proses inti buat "!s": buffer GIF/video/stiker/foto -> buffer stiker WebP
+// polos, TANPA teks (tidak lewat tahap subtitle/.ass sama sekali). Filter
+// scale+pad+fps-nya sama persis dengan gifToTextSticker supaya hasil
+// crop/rasio-nya konsisten antara "!s" dan "!meme"/"!smeme".
+async function mediaToSticker(inputBuffer) {
+    const tmpDir = os.tmpdir();
+    const uid = crypto.randomBytes(6).toString("hex");
+    const inputPath = path.join(tmpDir, `s-in-${uid}`);
+    const outputPath = path.join(tmpDir, `s-out-${uid}.webp`);
+
+    fs.writeFileSync(inputPath, inputBuffer);
+
+    try {
+        const filters = [
+            "format=rgba",
+            "scale=512:512:force_original_aspect_ratio=decrease",
+            "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
+            "fps=12"
+        ];
+
+        const args = [
+            "-y",
+            "-i", inputPath,
+            "-vf", filters.join(","),
+            "-vcodec", "libwebp",
+            "-pix_fmt", "yuva420p",
+            "-loop", "0",
+            "-preset", "default",
+            "-an",
+            "-fps_mode", "cfr",
+            "-t", "10",
+            outputPath
+        ];
+
+        await runFfmpeg(args);
+
+        return fs.readFileSync(outputPath);
+    } finally {
+        fs.rm(inputPath, { force: true }, () => {});
+        fs.rm(outputPath, { force: true }, () => {});
+    }
+}
+
 async function startBot() {
     console.log("Starting bot...");
 
@@ -576,6 +625,7 @@ async function startBot() {
             msg.message.conversation ||
             msg.message.extendedTextMessage?.text ||
             msg.message.videoMessage?.caption ||
+            msg.message.imageMessage?.caption ||
             msg.message.documentMessage?.caption ||
             ""
         ).trim();
@@ -601,7 +651,9 @@ async function startBot() {
 !img <tag>      cari gambar baru (kalau tag umum, akan muncul pilihan karakter)
 !next           gambar berikutnya dari pencarian terakhirmu
 !id <kode>      buka ulang gambar pakai kode
-!meme <teks>    ubah GIF jadi stiker animasi dengan teks
+!meme <teks>    ubah GIF/video/stiker/foto jadi stiker bertext
+!smeme <teks>   sama seperti !meme (alias)
+!s              ubah GIF/video/stiker/foto jadi stiker polos (tanpa teks)
 
 Contoh:
 !img umamusume
@@ -609,12 +661,15 @@ Contoh:
 !img uchiha      -> muncul daftar karakter, balas dengan angka
 !id 12345
 
-Cara pakai !meme:
-1) Kirim GIF dengan caption "!meme teks kamu"
+Cara pakai !meme / !smeme:
+1) Kirim GIF/video/stiker (emote)/foto dengan caption "!meme teks kamu"
    atau
-2) Kirim GIF dulu, lalu balas (reply) GIF itu dengan "!meme teks kamu"
+2) Kirim media itu dulu, lalu balas (reply) dengan "!meme teks kamu"
 Mau 2 baris (atas & bawah)? Pisahkan dengan "|":
-!meme HALO DUNIA|SELAMAT PAGI`
+!meme HALO DUNIA|SELAMAT PAGI
+
+Cara pakai !s:
+Kirim GIF/video/stiker/foto dengan caption "!s", atau reply media itu dengan "!s"`
             });
             return;
         }
@@ -663,16 +718,19 @@ Mau 2 baris (atas & bawah)? Pisahkan dengan "|":
         }
 
         // =====================
-        // !meme <teks>  -> GIF jadi stiker animasi dengan teks
-        // Bisa dari caption langsung di GIF, atau reply ke GIF.
+        // !meme / !smeme <teks>  -> GIF/video/stiker(emote)/foto jadi stiker
+        // bertext. Keduanya alias, fungsinya identik. Bisa dari caption
+        // langsung di medianya, atau reply ke medianya.
         // =====================
-        if (text === "!meme" || text.startsWith("!meme ")) {
-            const memeText = text.slice(5).trim();
+        const memeMatch = text.match(/^!(?:meme|smeme)(?:\s+([\s\S]*))?$/);
+
+        if (memeMatch) {
+            const memeText = (memeMatch[1] || "").trim();
 
             if (!memeText) {
                 await sock.sendMessage(jid, {
                     text: "⚠️ Sertakan teksnya. Contoh: !meme HALO DUNIA\n" +
-                          "(atau kirim sebagai caption/reply ke GIF-nya)"
+                          "(atau kirim sebagai caption/reply ke GIF/video/stiker/fotonya)"
                 });
                 return;
             }
@@ -681,8 +739,8 @@ Mau 2 baris (atas & bawah)? Pisahkan dengan "|":
 
             if (!source) {
                 await sock.sendMessage(jid, {
-                    text: "⚠️ Tidak ada GIF terdeteksi.\n" +
-                          "Kirim GIF dengan caption *!meme teks*, atau reply GIF-nya dengan *!meme teks*."
+                    text: "⚠️ Tidak ada GIF/video/stiker/foto terdeteksi.\n" +
+                          "Kirim salah satunya dengan caption *!meme teks*, atau reply dengan *!meme teks*."
                 });
                 return;
             }
@@ -692,6 +750,39 @@ Mau 2 baris (atas & bawah)? Pisahkan dengan "|":
 
                 const gifBuffer = await downloadGifBuffer(source.content, source.refKey);
                 const stickerBuffer = await gifToTextSticker(gifBuffer, memeText);
+
+                await sock.sendMessage(jid, { sticker: stickerBuffer });
+
+            } catch (err) {
+                console.log(err);
+                await sock.sendMessage(jid, {
+                    text: `❌ Gagal membuat stiker.\n${err.message || ""}`
+                });
+            }
+
+            return;
+        }
+
+        // =====================
+        // !s  -> GIF/video/stiker(emote)/foto jadi stiker polos, TANPA teks.
+        // Bisa dari caption langsung di medianya, atau reply ke medianya.
+        // =====================
+        if (text === "!s") {
+            const source = findGifSource(msg);
+
+            if (!source) {
+                await sock.sendMessage(jid, {
+                    text: "⚠️ Tidak ada GIF/video/stiker/foto terdeteksi.\n" +
+                          "Kirim salah satunya dengan caption *!s*, atau reply dengan *!s*."
+                });
+                return;
+            }
+
+            try {
+                await sock.sendMessage(jid, { text: "⏳ Membuat stiker..." });
+
+                const mediaBuffer = await downloadGifBuffer(source.content, source.refKey);
+                const stickerBuffer = await mediaToSticker(mediaBuffer);
 
                 await sock.sendMessage(jid, { sticker: stickerBuffer });
 
