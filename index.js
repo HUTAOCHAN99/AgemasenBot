@@ -406,7 +406,12 @@ async function gifToTextSticker(inputBuffer, memeText) {
         fs.writeFileSync(assPath, buildAssSubtitle(parsed), "utf8");
 
         const filters = [
-            // WA sticker wajib 512x512, dijaga aspect ratio + padding transparan
+            // WA sticker wajib 512x512. GIF di-scale biar muat penuh tanpa
+            // kepotong, sisa ruang di-pad transparan (bukan hitam).
+            // "format=rgba" WAJIB di sini: GIF sumber biasanya tidak punya
+            // channel alpha sama sekali, jadi kalau langsung di-pad warna
+            // "transparan" itu malah dianggap hitam solid oleh encoder.
+            "format=rgba",
             "scale=512:512:force_original_aspect_ratio=decrease",
             "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
             "fps=12",
@@ -418,6 +423,7 @@ async function gifToTextSticker(inputBuffer, memeText) {
             "-i", inputPath,
             "-vf", filters.join(","),
             "-vcodec", "libwebp",
+            "-pix_fmt", "yuva420p", // paksa encoder ikut simpan channel alpha
             "-loop", "0",
             "-preset", "default",
             "-an",
