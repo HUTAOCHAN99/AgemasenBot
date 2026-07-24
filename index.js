@@ -255,32 +255,32 @@ async function downloadImage(fileUrl) {
 
 // =====================================================
 // Render teks meme (+ emoji WA) ke PNG lewat canvas, lalu di-overlay ke
-// video/gif pakai ffmpeg. Ini menggantikan pendekatan lama (subtitles/.ass
-// via libass), karena libass TIDAK bisa render emoji berwarna -- hasilnya
-// cuma kotak "tofu" kosong. @napi-rs/canvas (Skia) bisa render emoji
-// berwarna asal font emoji terdaftar, jadi "!meme"/"!smeme" sekarang bisa
-// ditulisi emoji WA (mis. "!smeme awokawokawok😂") dan emoji itu ikut
-// muncul di stikernya.
+// video/gif pakai ffmpeg.
+//
+// Catatan penting: sempat dicoba render emoji lewat FONT emoji berwarna
+// (NotoColorEmoji.ttf) langsung di canvas, tapi @napi-rs/canvas (berbasis
+// Skia) ternyata tidak bisa render bitmap warna dari font itu (format
+// CBDT/CBLC) -- hasilnya jatuh ke outline hitam-putih saja, gak
+// berwarna. Jadi sekarang emoji TIDAK dirender lewat font sama sekali:
+// tiap emoji di teks dideteksi, gambarnya (PNG asli, dari Twemoji) di-
+// download & di-cache, lalu ditempel (drawImage) di canvas persis di
+// posisi emoji itu. Teks biasa tetap pakai font seperti biasa.
 // =====================================================
-const { createCanvas, GlobalFonts } = require("@napi-rs/canvas");
+const { createCanvas, GlobalFonts, loadImage } = require("@napi-rs/canvas");
 
-// Path font, bisa dioverride lewat env var kalau lokasinya beda di server.
-// MEME_FONT_PATH  -> font buat teks biasa (gaya meme, tebal).
-// EMOJI_FONT_PATH -> font khusus emoji berwarna (WAJIB "Noto Color Emoji"
-//                    supaya emoji tampil berwarna, bukan cuma outline/tofu).
-//                    Di Ubuntu/Debian: apt-get install -y fonts-noto-color-emoji
+// Path font teks (bukan emoji). Bisa dioverride lewat env var kalau lokasinya
+// beda di server.
 const MEME_FONT_PATH = process.env.MEME_FONT_PATH
     || "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
-const EMOJI_FONT_PATH = process.env.EMOJI_FONT_PATH
-    || "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
-
 const MEME_FONT_FAMILY = "MemeFont";
-const EMOJI_FONT_FAMILY = "MemeEmoji";
+
+// Sumber gambar emoji (Twemoji), bisa dioverride lewat env var kalau CDN ini
+// diblokir di server. {code} diganti dengan codepoint hex (mis. "1f602").
+const EMOJI_IMAGE_BASE_URL = process.env.EMOJI_IMAGE_BASE_URL
+    || "https://raw.githubusercontent.com/jdecked/twemoji/main/assets/72x72";
 
 let fontsRegistered = false;
 
-// Daftarkan font secara eksplisit (bukan mengandalkan fontconfig sistem),
-// supaya urutan fallback font-teks -> font-emoji konsisten di semua server.
 function ensureFontsRegistered() {
     if (fontsRegistered) return;
     fontsRegistered = true;
@@ -290,74 +290,169 @@ function ensureFontsRegistered() {
     } else {
         console.log(`⚠️ Font meme tidak ditemukan di ${MEME_FONT_PATH} (set env MEME_FONT_PATH).`);
     }
+}
 
-    if (fs.existsSync(EMOJI_FONT_PATH)) {
-        GlobalFonts.registerFromPath(EMOJI_FONT_PATH, EMOJI_FONT_FAMILY);
-    } else {
-        console.log(
-            `⚠️ Font emoji tidak ditemukan di ${EMOJI_FONT_PATH} (set env EMOJI_FONT_PATH).\n` +
-            `   Emoji WA di !meme/!smeme tidak akan tampil berwarna sampai font ini ada.\n` +
-            `   Ubuntu/Debian: sudo apt-get install -y fonts-noto-color-emoji`
-        );
+// Regex Unicode buat nangkep 1 "cluster" emoji utuh, termasuk emoji
+// gabungan (mis. 👨‍👩‍👧, atau emoji+variation selector ❤️) supaya tidak
+// kepotong jadi beberapa gambar terpisah.
+const EMOJI_REGEX = /\p{Extended_Pictographic}(\u200D\p{Extended_Pictographic})*\uFE0F?/gu;
+
+// "😂" -> "1f602" (dipakai buat nama file Twemoji). Variation selector
+// (U+FE0F) dibuang karena Twemoji umumnya tidak menyertakannya di nama file,
+// kecuali untuk emoji gabungan pakai ZWJ (U+200D) yang justru harus tetap ada.
+function emojiToCodepoints(emoji) {
+    return Array.from(emoji)
+        .map(ch => ch.codePointAt(0))
+        .filter(cp => cp !== 0xFE0F)
+        .map(cp => cp.toString(16))
+        .join("-");
+}
+
+// Pecah teks jadi array segmen { type: "text" | "emoji", value }.
+function splitTextEmoji(text) {
+    const segments = [];
+    let lastIndex = 0;
+
+    for (const match of text.matchAll(EMOJI_REGEX)) {
+        if (match.index > lastIndex) {
+            segments.push({ type: "text", value: text.slice(lastIndex, match.index) });
+        }
+        segments.push({ type: "emoji", value: match[0] });
+        lastIndex = match.index + match[0].length;
+    }
+    if (lastIndex < text.length) {
+        segments.push({ type: "text", value: text.slice(lastIndex) });
+    }
+
+    return segments;
+}
+
+// Cache in-memory: codepoint -> Image (atau null kalau gagal/tidak ada,
+// supaya tidak coba fetch berulang-ulang untuk emoji yang sama yang gagal).
+const emojiImageCache = new Map();
+
+async function getEmojiImage(emoji) {
+    const code = emojiToCodepoints(emoji);
+    if (emojiImageCache.has(code)) return emojiImageCache.get(code);
+
+    try {
+        const res = await axios.get(`${EMOJI_IMAGE_BASE_URL}/${code}.png`, {
+            responseType: "arraybuffer",
+            timeout: 8000
+        });
+        const img = await loadImage(Buffer.from(res.data));
+        emojiImageCache.set(code, img);
+        return img;
+    } catch (err) {
+        console.log(`⚠️ Gagal ambil gambar emoji "${emoji}" (${code}):`, err.message);
+        emojiImageCache.set(code, null);
+        return null;
     }
 }
 
-// Pecah teks jadi baris-baris yang muat dalam maxWidth (word-wrap manual,
-// karena canvas tidak wrap otomatis kayak libass).
-function wrapCanvasText(ctx, text, maxWidth) {
+// Pra-load semua emoji unik yang dipakai di sebuah teks (dipanggil sebelum
+// render, supaya proses gambar di canvas sendiri tetap synchronous/simpel).
+async function preloadEmojisInText(text) {
+    if (!text) return;
+    const emojis = new Set(splitTextEmoji(text).filter(s => s.type === "emoji").map(s => s.value));
+    await Promise.all([...emojis].map(getEmojiImage));
+}
+
+// Ukur lebar total 1 baris (campuran teks+emoji), emoji dihitung selebar
+// fontSize (persegi).
+function measureSegments(ctx, segments, fontSize) {
+    let width = 0;
+    for (const seg of segments) {
+        width += seg.type === "emoji" ? fontSize : ctx.measureText(seg.value).width;
+    }
+    return width;
+}
+
+// Pecah teks (boleh mengandung emoji) jadi baris-baris yang muat dalam
+// maxWidth. Wrapping dilakukan per KATA (dipisah spasi), tapi emoji di
+// dalam kata tetap dihitung sebagai unit lebar sendiri lewat measureSegments.
+function wrapMixedText(ctx, text, fontSize, maxWidth) {
+    ctx.font = `bold ${fontSize}px "${MEME_FONT_FAMILY}"`;
     const words = text.split(/\s+/).filter(Boolean);
     if (words.length === 0) return [];
 
     const lines = [];
-    let current = words[0];
+    let current = [];
 
-    for (let i = 1; i < words.length; i++) {
-        const test = `${current} ${words[i]}`;
-        if (ctx.measureText(test).width > maxWidth) {
+    for (const word of words) {
+        // untuk kata kedua dst, gabungkan spasi ke potongan pertama word itu
+        const candidateSegments = current.length
+            ? [...current, ...prependSpace(splitTextEmoji(word))]
+            : splitTextEmoji(word);
+
+        if (current.length && measureSegments(ctx, candidateSegments, fontSize) > maxWidth) {
             lines.push(current);
-            current = words[i];
+            current = splitTextEmoji(word);
         } else {
-            current = test;
+            current = candidateSegments;
         }
     }
-    lines.push(current);
+    if (current.length) lines.push(current);
     return lines;
 }
 
-// Cari ukuran font terbesar (mulai dari `startSize`, turun bertahap) yang
-// bikin teks tetap muat dalam maxWidth x maxLines baris, supaya teks
-// panjang otomatis mengecil alih-alih meluber keluar kanvas.
-function fitTextLines(ctx, text, { startSize, maxWidth, maxLines, minSize = 20 }) {
-    for (let size = startSize; size >= minSize; size -= 2) {
-        ctx.font = `bold ${size}px "${MEME_FONT_FAMILY}", "${EMOJI_FONT_FAMILY}"`;
-        const lines = wrapCanvasText(ctx, text, maxWidth);
-        if (lines.length <= maxLines) {
-            return { size, lines };
-        }
+function prependSpace(segments) {
+    if (segments.length === 0) return segments;
+    const [first, ...rest] = segments;
+    if (first.type === "text") {
+        return [{ type: "text", value: " " + first.value }, ...rest];
     }
-    ctx.font = `bold ${minSize}px "${MEME_FONT_FAMILY}", "${EMOJI_FONT_FAMILY}"`;
-    return { size: minSize, lines: wrapCanvasText(ctx, text, maxWidth) };
+    return [{ type: "text", value: " " }, first, ...rest];
 }
 
-function drawStrokedLine(ctx, text, x, y, fontSize) {
-    ctx.font = `bold ${fontSize}px "${MEME_FONT_FAMILY}", "${EMOJI_FONT_FAMILY}"`;
-    ctx.textAlign = "center";
+// Cari ukuran font terbesar (mulai dari startSize, turun bertahap) yang
+// bikin teks tetap muat dalam maxWidth x maxLines baris.
+function fitMixedTextLines(ctx, text, { startSize, maxWidth, maxLines, minSize = 20 }) {
+    for (let size = startSize; size >= minSize; size -= 2) {
+        const lines = wrapMixedText(ctx, text, size, maxWidth);
+        if (lines.length <= maxLines) return { size, lines };
+    }
+    return { size: minSize, lines: wrapMixedText(ctx, text, minSize, maxWidth) };
+}
+
+// Gambar 1 baris (segmen teks+emoji campuran) terpusat secara horizontal
+// di y tertentu. Teks pakai stroke hitam + fill putih (gaya meme klasik);
+// emoji ditempel apa adanya (drawImage) sejajar tengah baris itu.
+function drawMixedLine(ctx, segments, centerX, y, fontSize) {
+    ctx.font = `bold ${fontSize}px "${MEME_FONT_FAMILY}"`;
+    const totalWidth = measureSegments(ctx, segments, fontSize);
+    let x = centerX - totalWidth / 2;
+
+    ctx.textAlign = "left";
     ctx.textBaseline = "middle";
     ctx.lineJoin = "round";
     ctx.miterLimit = 2;
     ctx.lineWidth = Math.max(4, Math.round(fontSize / 9));
-    ctx.strokeStyle = "black";
-    ctx.fillStyle = "white";
-    ctx.strokeText(text, x, y);
-    ctx.fillText(text, x, y);
+
+    for (const seg of segments) {
+        if (seg.type === "emoji") {
+            const img = emojiImageCache.get(emojiToCodepoints(seg.value));
+            if (img) {
+                ctx.drawImage(img, x, y - fontSize / 2, fontSize, fontSize);
+            }
+            x += fontSize;
+        } else {
+            ctx.strokeStyle = "black";
+            ctx.fillStyle = "white";
+            ctx.strokeText(seg.value, x, y);
+            ctx.fillText(seg.value, x, y);
+            x += ctx.measureText(seg.value).width;
+        }
+    }
 }
 
 // Render teks atas/bawah (bisa berisi emoji WA) jadi 1 lembar PNG 512x512
 // transparan, siap di-overlay ke frame video/gif. `marginTop`/`marginBottom`
 // = jarak aman dari tepi (dihitung computeSafeMargins berdasar rasio asli
-// video sumber, sama seperti sebelumnya).
-function renderMemeOverlayPng({ top, bottom, marginTop, marginBottom }) {
+// video sumber).
+async function renderMemeOverlayPng({ top, bottom, marginTop, marginBottom }) {
     ensureFontsRegistered();
+    await Promise.all([preloadEmojisInText(top), preloadEmojisInText(bottom)]);
 
     const CANVAS_SIZE = 512;
     const MAX_WIDTH = 470;
@@ -369,26 +464,26 @@ function renderMemeOverlayPng({ top, bottom, marginTop, marginBottom }) {
     const ctx = canvas.getContext("2d");
 
     if (top) {
-        const { size, lines } = fitTextLines(ctx, top, {
+        const { size, lines } = fitMixedTextLines(ctx, top, {
             startSize: START_SIZE, maxWidth: MAX_WIDTH, maxLines: MAX_LINES
         });
         const lineGap = size * LINE_HEIGHT;
         let y = marginTop + size / 2;
         for (const line of lines) {
-            drawStrokedLine(ctx, line, CANVAS_SIZE / 2, y, size);
+            drawMixedLine(ctx, line, CANVAS_SIZE / 2, y, size);
             y += lineGap;
         }
     }
 
     if (bottom) {
-        const { size, lines } = fitTextLines(ctx, bottom, {
+        const { size, lines } = fitMixedTextLines(ctx, bottom, {
             startSize: START_SIZE, maxWidth: MAX_WIDTH, maxLines: MAX_LINES
         });
         const lineGap = size * LINE_HEIGHT;
         const totalHeight = lineGap * (lines.length - 1);
         let y = (CANVAS_SIZE - marginBottom) - size / 2 - totalHeight;
         for (const line of lines) {
-            drawStrokedLine(ctx, line, CANVAS_SIZE / 2, y, size);
+            drawMixedLine(ctx, line, CANVAS_SIZE / 2, y, size);
             y += lineGap;
         }
     }
@@ -618,7 +713,7 @@ async function gifToTextSticker(inputBuffer, memeText, isStill = false) {
         // Render teks (+ emoji WA kalau ada) ke PNG transparan 512x512 sekali
         // di awal, lalu PNG ini di-overlay ke SETIAP frame lewat ffmpeg.
         // Karena tekstnya statis (tidak animasi), 1 gambar overlay saja cukup.
-        const overlayBuffer = renderMemeOverlayPng({
+        const overlayBuffer = await renderMemeOverlayPng({
             ...parsed,
             marginTop: margins.top,
             marginBottom: margins.bottom
