@@ -281,7 +281,7 @@ const HELP_IMAGE_TAG = "special_week_(umamusume)";
 
 // Teks !help, dirapikan pakai heading per section + monospace buat contoh.
 const HELP_TEXT =
-`✨ *SAFEBOORU BOT* ✨
+`✨ *AGEMASEN BOT* ✨
 _Semua command, satu tempat_
 
 ┏━━━━━━━━━━━━━━━┓
