@@ -253,21 +253,147 @@ async function downloadImage(fileUrl) {
 // Fitur: GIF -> Stiker animasi dengan teks ("!meme")
 // =====================================================
 
-// Nama font (family) yang dipakai untuk teks meme. Dicari lewat fontconfig,
-// jadi tidak perlu path file eksplisit. Bisa dioverride lewat env var
-// MEME_FONT_FAMILY kalau server tidak punya DejaVu Sans (mis. pakai
-// Liberation Sans, Arial, dst).
-const FONT_FAMILY = process.env.MEME_FONT_FAMILY || "DejaVu Sans";
+// =====================================================
+// Render teks meme (+ emoji WA) ke PNG lewat canvas, lalu di-overlay ke
+// video/gif pakai ffmpeg. Ini menggantikan pendekatan lama (subtitles/.ass
+// via libass), karena libass TIDAK bisa render emoji berwarna -- hasilnya
+// cuma kotak "tofu" kosong. @napi-rs/canvas (Skia) bisa render emoji
+// berwarna asal font emoji terdaftar, jadi "!meme"/"!smeme" sekarang bisa
+// ditulisi emoji WA (mis. "!smeme awokawokawok😂") dan emoji itu ikut
+// muncul di stikernya.
+// =====================================================
+const { createCanvas, GlobalFonts } = require("@napi-rs/canvas");
 
-// Escape teks untuk dipakai di dalam file subtitle .ass.
-// Di format ASS, "{" dan "}" punya arti khusus (dipakai untuk tag styling
-// seperti \an8), jadi karakter itu perlu di-escape, dan newline literal
-// harus jadi "\N".
-function escapeAssText(str) {
-    return String(str)
-        .replace(/\{/g, "\uFF5B")
-        .replace(/\}/g, "\uFF5D")
-        .replace(/\r?\n/g, "\\N");
+// Path font, bisa dioverride lewat env var kalau lokasinya beda di server.
+// MEME_FONT_PATH  -> font buat teks biasa (gaya meme, tebal).
+// EMOJI_FONT_PATH -> font khusus emoji berwarna (WAJIB "Noto Color Emoji"
+//                    supaya emoji tampil berwarna, bukan cuma outline/tofu).
+//                    Di Ubuntu/Debian: apt-get install -y fonts-noto-color-emoji
+const MEME_FONT_PATH = process.env.MEME_FONT_PATH
+    || "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+const EMOJI_FONT_PATH = process.env.EMOJI_FONT_PATH
+    || "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf";
+
+const MEME_FONT_FAMILY = "MemeFont";
+const EMOJI_FONT_FAMILY = "MemeEmoji";
+
+let fontsRegistered = false;
+
+// Daftarkan font secara eksplisit (bukan mengandalkan fontconfig sistem),
+// supaya urutan fallback font-teks -> font-emoji konsisten di semua server.
+function ensureFontsRegistered() {
+    if (fontsRegistered) return;
+    fontsRegistered = true;
+
+    if (fs.existsSync(MEME_FONT_PATH)) {
+        GlobalFonts.registerFromPath(MEME_FONT_PATH, MEME_FONT_FAMILY);
+    } else {
+        console.log(`⚠️ Font meme tidak ditemukan di ${MEME_FONT_PATH} (set env MEME_FONT_PATH).`);
+    }
+
+    if (fs.existsSync(EMOJI_FONT_PATH)) {
+        GlobalFonts.registerFromPath(EMOJI_FONT_PATH, EMOJI_FONT_FAMILY);
+    } else {
+        console.log(
+            `⚠️ Font emoji tidak ditemukan di ${EMOJI_FONT_PATH} (set env EMOJI_FONT_PATH).\n` +
+            `   Emoji WA di !meme/!smeme tidak akan tampil berwarna sampai font ini ada.\n` +
+            `   Ubuntu/Debian: sudo apt-get install -y fonts-noto-color-emoji`
+        );
+    }
+}
+
+// Pecah teks jadi baris-baris yang muat dalam maxWidth (word-wrap manual,
+// karena canvas tidak wrap otomatis kayak libass).
+function wrapCanvasText(ctx, text, maxWidth) {
+    const words = text.split(/\s+/).filter(Boolean);
+    if (words.length === 0) return [];
+
+    const lines = [];
+    let current = words[0];
+
+    for (let i = 1; i < words.length; i++) {
+        const test = `${current} ${words[i]}`;
+        if (ctx.measureText(test).width > maxWidth) {
+            lines.push(current);
+            current = words[i];
+        } else {
+            current = test;
+        }
+    }
+    lines.push(current);
+    return lines;
+}
+
+// Cari ukuran font terbesar (mulai dari `startSize`, turun bertahap) yang
+// bikin teks tetap muat dalam maxWidth x maxLines baris, supaya teks
+// panjang otomatis mengecil alih-alih meluber keluar kanvas.
+function fitTextLines(ctx, text, { startSize, maxWidth, maxLines, minSize = 20 }) {
+    for (let size = startSize; size >= minSize; size -= 2) {
+        ctx.font = `bold ${size}px "${MEME_FONT_FAMILY}", "${EMOJI_FONT_FAMILY}"`;
+        const lines = wrapCanvasText(ctx, text, maxWidth);
+        if (lines.length <= maxLines) {
+            return { size, lines };
+        }
+    }
+    ctx.font = `bold ${minSize}px "${MEME_FONT_FAMILY}", "${EMOJI_FONT_FAMILY}"`;
+    return { size: minSize, lines: wrapCanvasText(ctx, text, maxWidth) };
+}
+
+function drawStrokedLine(ctx, text, x, y, fontSize) {
+    ctx.font = `bold ${fontSize}px "${MEME_FONT_FAMILY}", "${EMOJI_FONT_FAMILY}"`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.lineJoin = "round";
+    ctx.miterLimit = 2;
+    ctx.lineWidth = Math.max(4, Math.round(fontSize / 9));
+    ctx.strokeStyle = "black";
+    ctx.fillStyle = "white";
+    ctx.strokeText(text, x, y);
+    ctx.fillText(text, x, y);
+}
+
+// Render teks atas/bawah (bisa berisi emoji WA) jadi 1 lembar PNG 512x512
+// transparan, siap di-overlay ke frame video/gif. `marginTop`/`marginBottom`
+// = jarak aman dari tepi (dihitung computeSafeMargins berdasar rasio asli
+// video sumber, sama seperti sebelumnya).
+function renderMemeOverlayPng({ top, bottom, marginTop, marginBottom }) {
+    ensureFontsRegistered();
+
+    const CANVAS_SIZE = 512;
+    const MAX_WIDTH = 470;
+    const START_SIZE = 46;
+    const MAX_LINES = 3;
+    const LINE_HEIGHT = 1.15;
+
+    const canvas = createCanvas(CANVAS_SIZE, CANVAS_SIZE);
+    const ctx = canvas.getContext("2d");
+
+    if (top) {
+        const { size, lines } = fitTextLines(ctx, top, {
+            startSize: START_SIZE, maxWidth: MAX_WIDTH, maxLines: MAX_LINES
+        });
+        const lineGap = size * LINE_HEIGHT;
+        let y = marginTop + size / 2;
+        for (const line of lines) {
+            drawStrokedLine(ctx, line, CANVAS_SIZE / 2, y, size);
+            y += lineGap;
+        }
+    }
+
+    if (bottom) {
+        const { size, lines } = fitTextLines(ctx, bottom, {
+            startSize: START_SIZE, maxWidth: MAX_WIDTH, maxLines: MAX_LINES
+        });
+        const lineGap = size * LINE_HEIGHT;
+        const totalHeight = lineGap * (lines.length - 1);
+        let y = (CANVAS_SIZE - marginBottom) - size / 2 - totalHeight;
+        for (const line of lines) {
+            drawStrokedLine(ctx, line, CANVAS_SIZE / 2, y, size);
+            y += lineGap;
+        }
+    }
+
+    return canvas.toBuffer("image/png");
 }
 
 // Sticker WA selalu dipaksa jadi kanvas 512x512, sementara GIF/video sumber
@@ -320,58 +446,6 @@ function computeSafeMargins(srcDims) {
         top: Math.max(MIN_MARGIN, verticalPad + SAFE_GAP_TOP),
         bottom: Math.max(MIN_MARGIN, verticalPad + SAFE_GAP_BOTTOM)
     };
-}
-
-// Bikin file subtitle .ass sederhana: satu style, teks atas (opsional)
-// dan teks bawah, ditempatkan pakai tag alignment ASS (\an8 = atas-tengah,
-// \an2 = bawah-tengah). Dirender lewat filter "subtitles" (libass),
-// yang jauh lebih portable ketimbang "drawtext" karena tidak semua build
-// ffmpeg (termasuk ffmpeg-static) menyertakan filter drawtext.
-function buildAssSubtitle({ top, bottom, marginTop, marginBottom }) {
-    // Waktu akhir digenerosir (10 menit); tidak masalah lebih panjang dari
-    // video aslinya karena output tetap dipotong lewat "-t 10" di ffmpeg.
-    const endTag = "0:10:00.00";
-
-    const header =
-`[Script Info]
-ScriptType: v4.00+
-PlayResX: 512
-PlayResY: 512
-ScaledBorderAndShadow: yes
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Meme,${FONT_FAMILY},46,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,0,2,20,20,20,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-`;
-
-    // MarginV per baris (override MarginV di style) supaya teks atas & bawah
-    // tidak kepotong area transparan stiker. Nilainya dihitung dinamis lewat
-    // computeSafeMargins() berdasarkan rasio aspek GIF/video sumber, jadi
-    // selalu aman untuk semua ukuran -- bukan angka tetap yang cuma pas buat
-    // satu rasio tertentu. Tetap ada fallback kalau caller tidak mengirim
-    // margin (mis. dipanggil langsung tanpa lewat gifToTextSticker).
-    const TOP_MARGIN_V = marginTop ?? 40;
-    const BOTTOM_MARGIN_V = marginBottom ?? 45;
-
-    const lines = [];
-
-    if (top) {
-        lines.push(`Dialogue: 0,0:00:00.00,${endTag},Meme,,0,0,${TOP_MARGIN_V},,{\\an8}${escapeAssText(top)}`);
-    }
-    if (bottom) {
-        lines.push(`Dialogue: 0,0:00:00.00,${endTag},Meme,,0,0,${BOTTOM_MARGIN_V},,{\\an2}${escapeAssText(bottom)}`);
-    }
-
-    return header + lines.join("\n") + "\n";
-}
-
-// Escape path file untuk dipakai sebagai argumen filter subtitles=...
-// (":" dan "\" punya arti khusus di dalam filtergraph ffmpeg).
-function escapeFilterPath(p) {
-    return p.replace(/\\/g, "\\\\\\\\").replace(/:/g, "\\\\:").replace(/'/g, "\\\\'");
 }
 
 // Jalankan ffmpeg dan tunggu sampai selesai.
@@ -531,7 +605,7 @@ async function gifToTextSticker(inputBuffer, memeText, isStill = false) {
     const tmpDir = os.tmpdir();
     const uid = crypto.randomBytes(6).toString("hex");
     const inputPath = path.join(tmpDir, `meme-in-${uid}`);
-    const assPath = path.join(tmpDir, `meme-${uid}.ass`);
+    const overlayPath = path.join(tmpDir, `meme-${uid}.png`);
     const outputPath = path.join(tmpDir, `meme-out-${uid}.webp`);
 
     fs.writeFileSync(inputPath, inputBuffer);
@@ -540,29 +614,39 @@ async function gifToTextSticker(inputBuffer, memeText, isStill = false) {
         const parsed = parseMemeText(memeText);
         const srcDims = await probeVideoDimensions(inputPath);
         const margins = computeSafeMargins(srcDims);
-        fs.writeFileSync(
-            assPath,
-            buildAssSubtitle({ ...parsed, marginTop: margins.top, marginBottom: margins.bottom }),
-            "utf8"
-        );
 
-        const filters = [
-            // WA sticker wajib 512x512. GIF di-scale biar muat penuh tanpa
-            // kepotong, sisa ruang di-pad transparan (bukan hitam).
-            // "format=rgba" WAJIB di sini: GIF sumber biasanya tidak punya
-            // channel alpha sama sekali, jadi kalau langsung di-pad warna
-            // "transparan" itu malah dianggap hitam solid oleh encoder.
+        // Render teks (+ emoji WA kalau ada) ke PNG transparan 512x512 sekali
+        // di awal, lalu PNG ini di-overlay ke SETIAP frame lewat ffmpeg.
+        // Karena tekstnya statis (tidak animasi), 1 gambar overlay saja cukup.
+        const overlayBuffer = renderMemeOverlayPng({
+            ...parsed,
+            marginTop: margins.top,
+            marginBottom: margins.bottom
+        });
+        fs.writeFileSync(overlayPath, overlayBuffer);
+
+        // Background (video/gif sumber) diskalakan & di-pad transparan ke
+        // 512x512 seperti sebelumnya, lalu overlay teks/emoji ditumpuk di
+        // atasnya. "format=rgba" WAJIB: GIF sumber biasanya tidak punya
+        // channel alpha, jadi kalau langsung di-pad warna "transparan" itu
+        // malah dianggap hitam solid oleh encoder.
+        const bgFilters = [
             "format=rgba",
             "scale=512:512:force_original_aspect_ratio=decrease",
             "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
-            ...(isStill ? [] : ["fps=12"]),
-            `subtitles='${escapeFilterPath(assPath)}'`
+            ...(isStill ? [] : ["fps=12"])
         ];
+
+        const filterComplex =
+            `[0:v]${bgFilters.join(",")}[bg];` +
+            `[bg][1:v]overlay=0:0:format=auto[vout]`;
 
         const args = [
             "-y",
             "-i", inputPath,
-            "-vf", filters.join(","),
+            "-i", overlayPath,
+            "-filter_complex", filterComplex,
+            "-map", "[vout]",
             "-vcodec", "libwebp",
             "-pix_fmt", "yuva420p", // paksa encoder ikut simpan channel alpha
             "-loop", "0",
@@ -578,7 +662,7 @@ async function gifToTextSticker(inputBuffer, memeText, isStill = false) {
         return fs.readFileSync(outputPath);
     } finally {
         fs.rm(inputPath, { force: true }, () => {});
-        fs.rm(assPath, { force: true }, () => {});
+        fs.rm(overlayPath, { force: true }, () => {});
         fs.rm(outputPath, { force: true }, () => {});
     }
 }
@@ -737,6 +821,8 @@ Cara pakai !meme (khusus GIF/video):
 2) Kirim GIF/video dulu, lalu balas (reply) dengan "!meme teks kamu"
 Mau 2 baris (atas & bawah)? Pisahkan dengan "|":
 !meme HALO DUNIA|SELAMAT PAGI
+Bisa juga pakai emoji WA, contoh:
+!smeme awokawokawok😂
 
 Cara pakai !smeme (khusus stiker/foto):
 1) Kirim stiker (emote)/foto dengan caption "!smeme teks kamu"
