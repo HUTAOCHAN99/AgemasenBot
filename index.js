@@ -250,6 +250,94 @@ async function downloadImage(fileUrl) {
     return Buffer.from(image.data);
 }
 
+// Ambil SATU gambar acak dari 1 halaman hasil safebooru saja (tanpa paging
+// SEMUA halaman kayak fetchCandidates) -- dipakai cuma buat hiasan !help,
+// jadi cukup cepat & ringan tiap kali user ketik !help.
+async function fetchRandomImageForHelp(tag) {
+    try {
+        const res = await axios.get("https://safebooru.org/index.php", {
+            params: {
+                page: "dapi",
+                s: "post",
+                q: "index",
+                json: 1,
+                limit: API_PAGE_SIZE,
+                tags: tag
+            }
+        });
+
+        const posts = Array.isArray(res.data) ? res.data.filter(p => p.file_url) : [];
+        if (posts.length === 0) return null;
+
+        return posts[Math.floor(Math.random() * posts.length)];
+    } catch (err) {
+        console.log(`⚠️ Gagal ambil gambar hiasan !help ("${tag}"):`, err.message);
+        return null;
+    }
+}
+
+// Tag khusus buat gambar hiasan di !help.
+const HELP_IMAGE_TAG = "special_week_(umamusume)";
+
+// Teks !help, dirapikan pakai heading per section + monospace buat contoh.
+const HELP_TEXT =
+`✨ *SAFEBOORU BOT* ✨
+_Semua command, satu tempat_
+
+┏━━━━━━━━━━━━━━━┓
+┃ 🔎 *PENCARIAN GAMBAR*
+┗━━━━━━━━━━━━━━━┛
+▸ *!img* <tag> — cari gambar baru
+   _(tag umum ➜ muncul pilihan karakter)_
+▸ *!next* — gambar berikutnya dari pencarian terakhir
+▸ *!id* <kode> — buka ulang gambar pakai kode
+
+_Contoh:_
+\`\`\`!img umamusume
+!img tokai_teio_(umamusume)
+!img uchiha        ← balas dgn angka
+!id 12345\`\`\`
+
+┏━━━━━━━━━━━━━━━┓
+┃ 🎨 *STIKER*
+┗━━━━━━━━━━━━━━━┛
+▸ *!meme* <teks> — GIF/video ➜ stiker bertext
+▸ *!smeme* <teks> — stiker/foto ➜ stiker bertext
+▸ *!s* — media apapun ➜ stiker polos
+
+_Cara pakai:_
+1️⃣ Kirim media, caption \`!meme teks\` / \`!smeme teks\` / \`!s\`
+2️⃣ Atau kirim media dulu, lalu *reply* pakai caption yang sama
+↳ 2 baris (atas|bawah)? Pisah pakai "|"
+\`\`\`!meme HALO DUNIA|SELAMAT PAGI\`\`\`
+↳ Bisa emoji WA juga: \`!smeme awokawokawok😂\`
+
+┏━━━━━━━━━━━━━━━┓
+┃ ⚙️ *LAIN-LAIN*
+┗━━━━━━━━━━━━━━━┛
+▸ *!ping* — cek bot hidup
+▸ *!help* — tampilkan pesan ini
+
+💡 _Ketik command-nya langsung, ya!_`;
+
+async function sendHelp(sock, jid) {
+    const post = await fetchRandomImageForHelp(HELP_IMAGE_TAG);
+
+    if (post) {
+        try {
+            const buffer = await downloadImage(post.file_url);
+            await sock.sendMessage(jid, { image: buffer, caption: HELP_TEXT });
+            return;
+        } catch (err) {
+            console.log("⚠️ Gagal kirim gambar hiasan !help, fallback ke teks polos:", err.message);
+        }
+    }
+
+    // Fallback: kalau gambar gagal diambil/dikirim, tetap kirim teksnya saja
+    // supaya !help tidak pernah gagal total gara-gara masalah di sisi gambar.
+    await sock.sendMessage(jid, { text: HELP_TEXT });
+}
+
 // =====================================================
 // Fitur: GIF -> Stiker animasi dengan teks ("!meme")
 // =====================================================
@@ -930,43 +1018,7 @@ async function startBot() {
         // !help
         // =====================
         if (text === "!help") {
-            await sock.sendMessage(jid, {
-                text:
-`📖 Safebooru Bot
-
-!ping
-!help
-!img <tag>      cari gambar baru (kalau tag umum, akan muncul pilihan karakter)
-!next           gambar berikutnya dari pencarian terakhirmu
-!id <kode>      buka ulang gambar pakai kode
-!meme <teks>    ubah GIF/video jadi stiker bertext
-!smeme <teks>   ubah stiker(emote)/foto jadi stiker bertext
-!s              ubah GIF/video/stiker/foto jadi stiker polos (tanpa teks)
-
-Contoh:
-!img umamusume
-!img tokai_teio_(umamusume)
-!img uchiha      -> muncul daftar karakter, balas dengan angka
-!id 12345
-
-Cara pakai !meme (khusus GIF/video):
-1) Kirim GIF/video dengan caption "!meme teks kamu"
-   atau
-2) Kirim GIF/video dulu, lalu balas (reply) dengan "!meme teks kamu"
-Mau 2 baris (atas & bawah)? Pisahkan dengan "|":
-!meme HALO DUNIA|SELAMAT PAGI
-Bisa juga pakai emoji WA, contoh:
-!smeme awokawokawok😂
-
-Cara pakai !smeme (khusus stiker/foto):
-1) Kirim stiker (emote)/foto dengan caption "!smeme teks kamu"
-   atau
-2) Kirim stiker/foto dulu, lalu balas (reply) dengan "!smeme teks kamu"
-Format teks 2 baris sama seperti !meme.
-
-Cara pakai !s (GIF/video/stiker/foto, apa saja):
-Kirim medianya dengan caption "!s", atau reply media itu dengan "!s"`
-            });
+            await sendHelp(sock, jid);
             return;
         }
 
