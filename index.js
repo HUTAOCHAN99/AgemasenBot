@@ -320,13 +320,29 @@ _Cara pakai:_
 
 💡 _Ketik command-nya langsung, ya!_`;
 
+// Ukuran banner !help, rasio 16:9. "cover" = crop biar penuh tanpa distorsi
+// (bagian tengah gambar yang dipertahankan), bukan sekadar di-squeeze.
+const HELP_BANNER_WIDTH = 1280;
+const HELP_BANNER_HEIGHT = 720; // 1280:720 = 16:9
+
+async function toHelpBanner(buffer) {
+    return sharp(buffer)
+        .resize(HELP_BANNER_WIDTH, HELP_BANNER_HEIGHT, {
+            fit: "cover",
+            position: "attention" // fokus crop ke area paling "menarik" (biasanya wajah/subjek)
+        })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+}
+
 async function sendHelp(sock, jid) {
     const post = await fetchRandomImageForHelp(HELP_IMAGE_TAG);
 
     if (post) {
         try {
-            const buffer = await downloadImage(post.file_url);
-            await sock.sendMessage(jid, { image: buffer, caption: HELP_TEXT });
+            const rawBuffer = await downloadImage(post.file_url);
+            const bannerBuffer = await toHelpBanner(rawBuffer);
+            await sock.sendMessage(jid, { image: bannerBuffer, caption: HELP_TEXT });
             return;
         } catch (err) {
             console.log("⚠️ Gagal kirim gambar hiasan !help, fallback ke teks polos:", err.message);
