@@ -251,8 +251,8 @@ async function downloadImage(fileUrl) {
 }
 
 // Ambil SATU gambar acak dari 1 halaman hasil safebooru saja (tanpa paging
-// SEMUA halaman kayak fetchCandidates) -- dipakai cuma buat hiasan !help,
-// jadi cukup cepat & ringan tiap kali user ketik !help.
+// SEMUA halaman kayak fetchCandidates) -- dipakai cuma buat hiasan !menu,
+// jadi cukup cepat & ringan tiap kali user ketik !menu.
 async function fetchRandomImageForHelp(tag) {
   try {
     const res = await axios.get("https://safebooru.org/index.php", {
@@ -273,87 +273,134 @@ async function fetchRandomImageForHelp(tag) {
 
     return posts[Math.floor(Math.random() * posts.length)];
   } catch (err) {
-    console.log(`⚠️ Gagal ambil gambar hiasan !help ("${tag}"):`, err.message);
+    console.log(`⚠️ Gagal ambil gambar hiasan !menu ("${tag}"):`, err.message);
     return null;
   }
 }
 
-// Tag khusus buat gambar hiasan di !help.
+// Tag khusus buat gambar hiasan di !menu.
 const HELP_IMAGE_TAG = "special_week_(umamusume)";
 
-// Teks !help, dirapikan pakai heading per section + monospace buat contoh.
-const HELP_TEXT = `
+// Teks !menu: cuma sapaan + daftar command singkat. Penjelasan detail per
+// command TIDAK ada di sini lagi -- itu baru muncul otomatis kalau user
+// salah/kurang lengkap nulis command-nya (lihat COMMAND_DETAILS di bawah).
+const MENU_TEXT = `
 ✨ *AGEMASEN BOT* ✨
 
-Hmph... jangan salah paham. Aku cuma jelasin cara pakainya biar kamu nggak bikin kerjaanku makin ribet.
+Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti aku niat bantuin kamu banget.
 
 ┏━━━━━━━━━━━━━━━┓
 ┃ 🔎 *PENCARIAN GAMBAR*
 ┗━━━━━━━━━━━━━━━┛
-▸ *!img* — cari gambar berdasarkan tag.
-  *(Kalau tag-nya terlalu umum, nanti muncul daftar pilihan. Tinggal balas pakai angkanya.)*
-▸ *!next* — lanjut ke gambar berikutnya.
-▸ *!id* — buka lagi gambar berdasarkan ID.
+▸ !img
+▸ !next
+▸ !id
+
+┏━━━━━━━━━━━━━━━┓
+┃ 🎨 *STIKER*
+┗━━━━━━━━━━━━━━━┛
+▸ !meme
+▸ !smeme
+▸ !s
+
+┏━━━━━━━━━━━━━━━┓
+┃ ⚙️ *LAIN-LAIN*
+┗━━━━━━━━━━━━━━━┛
+▸ !ping
+▸ !menu
+
+━━━━━━━━━━━━━━━━━━
+
+Bingung cara pakai command yang mana? Ketik aja command-nya (biar salah/kurang lengkap juga gapapa), nanti aku jelasin sendiri caranya.
+
+...B-bukan karena aku peduli sama kamu atau apa. Cuma males aja kalau pertanyaannya diulang terus.
+`;
+
+// Penjelasan detail per command. Dikirim otomatis kapan pun user salah
+// nulis command ini (argumen kosong, media gak ketemu, dst), jadi user
+// gak perlu buka !menu buat tau cara pakainya.
+const COMMAND_DETAILS = {
+  img: `🔎 *!img <tag>*
+
+Cari gambar berdasarkan tag.
+_(Kalau tag-nya terlalu umum, nanti muncul daftar pilihan. Tinggal balas pakai angkanya.)_
 
 *Contoh:*
 \`\`\`
 !img umamusume
 !img tokai_teio_(umamusume)
 !img uchiha
-!id 12345
 \`\`\`
 
-"Uchiha" itu terlalu banyak hasilnya... ya makanya pilih nomor yang muncul. Masa gitu aja harus dijelasin...
+"Uchiha" itu terlalu banyak hasilnya... ya makanya pilih nomor yang muncul. Masa gitu aja harus dijelasin...`,
 
-┏━━━━━━━━━━━━━━━┓
-┃ 🎨 *STIKER*
-┗━━━━━━━━━━━━━━━┛
-▸ *!meme* — GIF/video jadi stiker dengan teks.
-▸ *!smeme* — foto atau stiker ditambah teks.
-▸ *!s* — ubah media apa pun jadi stiker biasa.
+  next: `➡️ *!next*
+
+Lanjut ke gambar berikutnya dari pencarian tag yang sama.
+
+⚠️ Pakai *!img <tag>* dulu sebelum pakai ini.`,
+
+  id: `🆔 *!id <kode>*
+
+Buka lagi gambar tertentu berdasarkan kode ID-nya.
+
+*Contoh:*
+\`\`\`
+!id 12345
+\`\`\``,
+
+  meme: `🎨 *!meme <teks>*
+
+Ubah GIF/video jadi stiker animasi dengan teks.
 
 *Cara pakai:*
-• Kirim media dengan caption \`!meme\`, \`!smeme\`, atau \`!s\`.
-• Atau kirim medianya dulu, terus *reply* pakai command yang sesuai.
+• Kirim GIF/video dengan caption \`!meme teks\`.
+• Atau kirim GIF/video-nya dulu, terus *reply* pakai \`!meme teks\`.
 
-Mau dua baris? Pisahkan aja pakai \`|\`.
+Mau dua baris? Pisahkan pakai \`|\`. Emoji WhatsApp juga bisa dipakai.
 
+*Contoh:*
 \`\`\`
 !meme HALO DUNIA|SELAMAT PAGI
 \`\`\`
 
-Emoji WhatsApp juga bisa.
+(Buat stiker/foto, pakai *!smeme* ya)`,
 
+  smeme: `🎨 *!smeme <teks>*
+
+Ubah stiker (emote) atau foto jadi stiker bertulisan teks.
+
+*Cara pakai:*
+• Kirim stiker/foto dengan caption \`!smeme teks\`.
+• Atau kirim medianya dulu, terus *reply* pakai \`!smeme teks\`.
+
+Mau dua baris? Pisahkan pakai \`|\`. Emoji WhatsApp juga bisa dipakai.
+
+*Contoh:*
 \`\`\`
 !smeme awokawokawok😂
 \`\`\`
 
-Jangan salahin aku kalau teksnya kepanjangan terus kepotong.
+(Buat GIF/video, pakai *!meme* ya)`,
 
-┏━━━━━━━━━━━━━━━┓
-┃ ⚙️ *LAIN-LAIN*
-┗━━━━━━━━━━━━━━━┛
-▸ *!ping* — cek aku masih hidup.
-▸ *!help* — ya... nampilin menu ini lagi.
+  s: `🎨 *!s*
 
-━━━━━━━━━━━━━━━━━━
+Ubah GIF/video/stiker/foto apa pun jadi stiker biasa, tanpa teks.
 
-💢 Jangan spam command.
-💢 Baca dulu sebelum nanya.
-💢 Kalau masih bingung... ya ketik aja command-nya. Aku bakal bantuin.
-
-...B-bukan karena aku peduli sama kamu atau apa. Cuma males aja kalau pertanyaannya diulang terus.
-`;
+*Cara pakai:*
+• Kirim medianya dengan caption \`!s\`.
+• Atau kirim medianya dulu, terus *reply* dengan \`!s\`.`,
+};
 
 
-// Ukuran banner !help, rasio 16:9. "cover" = crop biar penuh tanpa distorsi
+// Ukuran banner !menu, rasio 16:9. "cover" = crop biar penuh tanpa distorsi
 // (bagian tengah gambar yang dipertahankan), bukan sekadar di-squeeze.
-const HELP_BANNER_WIDTH = 1280;
-const HELP_BANNER_HEIGHT = 720; // 1280:720 = 16:9
+const MENU_BANNER_WIDTH = 1280;
+const MENU_BANNER_HEIGHT = 720; // 1280:720 = 16:9
 
-async function toHelpBanner(buffer) {
+async function toMenuBanner(buffer) {
   return sharp(buffer)
-    .resize(HELP_BANNER_WIDTH, HELP_BANNER_HEIGHT, {
+    .resize(MENU_BANNER_WIDTH, MENU_BANNER_HEIGHT, {
       fit: "cover",
       position: "attention", // fokus crop ke area paling "menarik" (biasanya wajah/subjek)
     })
@@ -361,26 +408,32 @@ async function toHelpBanner(buffer) {
     .toBuffer();
 }
 
-async function sendHelp(sock, jid) {
+async function sendMenu(sock, jid) {
   const post = await fetchRandomImageForHelp(HELP_IMAGE_TAG);
 
   if (post) {
     try {
       const rawBuffer = await downloadImage(post.file_url);
-      const bannerBuffer = await toHelpBanner(rawBuffer);
-      await sock.sendMessage(jid, { image: bannerBuffer, caption: HELP_TEXT });
+      const bannerBuffer = await toMenuBanner(rawBuffer);
+      await sock.sendMessage(jid, { image: bannerBuffer, caption: MENU_TEXT });
       return;
     } catch (err) {
       console.log(
-        "⚠️ Gagal kirim gambar hiasan !help, fallback ke teks polos:",
+        "⚠️ Gagal kirim gambar hiasan !menu, fallback ke teks polos:",
         err.message,
       );
     }
   }
 
   // Fallback: kalau gambar gagal diambil/dikirim, tetap kirim teksnya saja
-  // supaya !help tidak pernah gagal total gara-gara masalah di sisi gambar.
-  await sock.sendMessage(jid, { text: HELP_TEXT });
+  // supaya !menu tidak pernah gagal total gara-gara masalah di sisi gambar.
+  await sock.sendMessage(jid, { text: MENU_TEXT });
+}
+
+// Kirim penjelasan detail command tertentu (dipanggil otomatis saat user
+// salah/kurang lengkap nulis command itu).
+async function sendCommandDetail(sock, jid, commandKey) {
+  await sock.sendMessage(jid, { text: COMMAND_DETAILS[commandKey] });
 }
 
 // =====================================================
@@ -1119,10 +1172,10 @@ async function startBot() {
     }
 
     // =====================
-    // !help
+    // !menu
     // =====================
-    if (text === "!help") {
-      await sendHelp(sock, jid);
+    if (text === "!menu") {
+      await sendMenu(sock, jid);
       return;
     }
 
@@ -1182,23 +1235,14 @@ async function startBot() {
       const memeText = text.slice(5).trim();
 
       if (!memeText) {
-        await sock.sendMessage(jid, {
-          text:
-            "⚠️ Sertakan teksnya. Contoh: !meme HALO DUNIA\n" +
-            "(atau kirim sebagai caption/reply ke GIF/video-nya)",
-        });
+        await sendCommandDetail(sock, jid, "meme");
         return;
       }
 
       const source = findGifSource(msg);
 
       if (!source) {
-        await sock.sendMessage(jid, {
-          text:
-            "⚠️ Tidak ada GIF/video terdeteksi.\n" +
-            "Kirim GIF/video dengan caption *!meme teks*, atau reply dengan *!meme teks*.\n" +
-            "(Buat stiker/foto, pakai *!smeme* ya)",
-        });
+        await sendCommandDetail(sock, jid, "meme");
         return;
       }
 
@@ -1230,23 +1274,14 @@ async function startBot() {
       const memeText = text.slice(7).trim();
 
       if (!memeText) {
-        await sock.sendMessage(jid, {
-          text:
-            "⚠️ Sertakan teksnya. Contoh: !smeme HALO DUNIA\n" +
-            "(atau kirim sebagai caption/reply ke stiker/fotonya)",
-        });
+        await sendCommandDetail(sock, jid, "smeme");
         return;
       }
 
       const source = findStickerSource(msg);
 
       if (!source) {
-        await sock.sendMessage(jid, {
-          text:
-            "⚠️ Tidak ada stiker/foto terdeteksi.\n" +
-            "Kirim stiker/foto dengan caption *!smeme teks*, atau reply dengan *!smeme teks*.\n" +
-            "(Buat GIF/video, pakai *!meme* ya)",
-        });
+        await sendCommandDetail(sock, jid, "smeme");
         return;
       }
 
@@ -1284,11 +1319,7 @@ async function startBot() {
       const source = findAnySource(msg);
 
       if (!source) {
-        await sock.sendMessage(jid, {
-          text:
-            "⚠️ Tidak ada GIF/video/stiker/foto terdeteksi.\n" +
-            "Kirim salah satunya dengan caption *!s*, atau reply dengan *!s*.",
-        });
+        await sendCommandDetail(sock, jid, "s");
         return;
       }
 
@@ -1322,9 +1353,7 @@ async function startBot() {
       const tag = text.slice(4).trim();
 
       if (!tag) {
-        await sock.sendMessage(jid, {
-          text: "⚠️ Sertakan tag. Contoh: !img umamusume",
-        });
+        await sendCommandDetail(sock, jid, "img");
         return;
       }
 
@@ -1381,9 +1410,7 @@ async function startBot() {
       const session = sessions.get(sessionKey);
 
       if (!session) {
-        await sock.sendMessage(jid, {
-          text: "⚠️ Belum ada pencarian aktif. Pakai *!img <tag>* dulu.",
-        });
+        await sendCommandDetail(sock, jid, "next");
         return;
       }
 
@@ -1432,9 +1459,7 @@ async function startBot() {
       const id = text.slice(3).trim();
 
       if (!id || !/^\d+$/.test(id)) {
-        await sock.sendMessage(jid, {
-          text: "⚠️ Sertakan kode angka. Contoh: !id 12345",
-        });
+        await sendCommandDetail(sock, jid, "id");
         return;
       }
 
@@ -1460,6 +1485,21 @@ async function startBot() {
           text: "Terjadi kesalahan.",
         });
       }
+
+      return;
+    }
+
+    // =====================
+    // Command tidak dikenal (mis. salah ketik "!ing", "!imgg", dst).
+    // Cuma dicek kalau memang diawali "!" -- teks biasa (bukan niat jadi
+    // command) dibiarkan lewat tanpa respons.
+    // =====================
+    if (text.startsWith("!")) {
+      await sock.sendMessage(jid, {
+        text:
+          "❓ Command tidak dikenal.\n" +
+          "Ketik *!menu* buat lihat daftar command yang ada.",
+      });
     }
   });
 }
