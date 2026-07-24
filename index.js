@@ -284,55 +284,67 @@ const HELP_IMAGE_TAG = "special_week_(umamusume)";
 // Teks !help, dirapikan pakai heading per section + monospace buat contoh.
 const HELP_TEXT = `
 ✨ *AGEMASEN BOT* ✨
-Hmph... butuh bantuan? Ya udah, aku bantu. Jangan salah pencet aja.
+
+Hmph... jangan salah paham. Aku cuma jelasin cara pakainya biar kamu nggak bikin kerjaanku makin ribet.
 
 ┏━━━━━━━━━━━━━━━┓
 ┃ 🔎 *PENCARIAN GAMBAR*
 ┗━━━━━━━━━━━━━━━┛
-▸ *!img* — cari gambar yang kamu mau.
-  *(Kalau tag-nya terlalu umum, nanti bakal muncul pilihan karakter.)*
+▸ *!img* — cari gambar berdasarkan tag.
+  *(Kalau tag-nya terlalu umum, nanti muncul daftar pilihan. Tinggal balas pakai angkanya.)*
 ▸ *!next* — lanjut ke gambar berikutnya.
-▸ *!id* — buka lagi gambar terakhir pakai ID.
+▸ *!id* — buka lagi gambar berdasarkan ID.
 
 *Contoh:*
 \`\`\`
 !img umamusume
 !img tokai_teio_(umamusume)
-!img uchiha        ← tinggal balas pakai angka
+!img uchiha
 !id 12345
 \`\`\`
+
+"Uchiha" itu terlalu banyak hasilnya... ya makanya pilih nomor yang muncul. Masa gitu aja harus dijelasin...
 
 ┏━━━━━━━━━━━━━━━┓
 ┃ 🎨 *STIKER*
 ┗━━━━━━━━━━━━━━━┛
-▸ *!meme* — ubah GIF/video jadi stiker dengan teks.
-▸ *!smeme* — kasih teks ke foto atau stiker.
+▸ *!meme* — GIF/video jadi stiker dengan teks.
+▸ *!smeme* — foto atau stiker ditambah teks.
 ▸ *!s* — ubah media apa pun jadi stiker biasa.
 
 *Cara pakai:*
-1️⃣ Kirim medianya dengan caption \`!meme teks\`, \`!smeme teks\`, atau \`!s\`.
-2️⃣ Atau kirim medianya dulu, lalu *reply* dengan command yang sama.
+• Kirim media dengan caption \`!meme\`, \`!smeme\`, atau \`!s\`.
+• Atau kirim medianya dulu, terus *reply* pakai command yang sesuai.
 
-↳ Mau teks atas & bawah? Pisahkan pakai \`|\`.
+Mau dua baris? Pisahkan aja pakai \`|\`.
 
 \`\`\`
 !meme HALO DUNIA|SELAMAT PAGI
 \`\`\`
 
-↳ Emoji WhatsApp juga bisa dipakai.
+Emoji WhatsApp juga bisa.
 
 \`\`\`
 !smeme awokawokawok😂
 \`\`\`
 
+Jangan salahin aku kalau teksnya kepanjangan terus kepotong.
+
 ┏━━━━━━━━━━━━━━━┓
 ┃ ⚙️ *LAIN-LAIN*
 ┗━━━━━━━━━━━━━━━┛
-▸ *!ping* — cek aku masih jalan atau nggak.
-▸ *!help* — tampilkan menu ini lagi.
+▸ *!ping* — cek aku masih hidup.
+▸ *!help* — ya... nampilin menu ini lagi.
 
-💢 *Ketik aja command yang kamu butuhin. Jangan nyuruh aku nebak maunya apa... hmph.*
+━━━━━━━━━━━━━━━━━━
+
+💢 Jangan spam command.
+💢 Baca dulu sebelum nanya.
+💢 Kalau masih bingung... ya ketik aja command-nya. Aku bakal bantuin.
+
+...B-bukan karena aku peduli sama kamu atau apa. Cuma males aja kalau pertanyaannya diulang terus.
 `;
+
 
 // Ukuran banner !help, rasio 16:9. "cover" = crop biar penuh tanpa distorsi
 // (bagian tengah gambar yang dipertahankan), bukan sekadar di-squeeze.
