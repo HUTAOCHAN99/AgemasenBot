@@ -15,6 +15,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
+const sharp = require("sharp");
 
 // =====================================================
 // Session per pengguna (bukan per chat/grup)
@@ -681,6 +682,42 @@ function findAnySource(msg) {
 
 
 
+// ffmpeg (termasuk build "ffmpeg-static" yang dipakai bot ini) BISA encode
+// WebP animasi (dipakai buat OUTPUT stiker), tapi decoder bawaannya TIDAK
+// bisa baca WebP animasi sebagai INPUT (cuma baca frame pertama atau
+// langsung gagal total dengan "Invalid data found when processing input").
+// Stiker WA (baik yang dikirim user maupun quoted/reply) formatnya WebP,
+// dan yang animasi otomatis bikin ffmpeg gagal proses -> "Gagal membuat
+// stiker" walau teksnya sudah benar. Makanya sebelum masuk ffmpeg, WebP
+// animasi dideteksi & dikonversi dulu ke GIF pakai sharp/libvips (yang
+// decode WebP animasinya beres). Stiker statis & GIF/video biasa tidak
+// kena ini sama sekali, langsung lewat jalur lama seperti biasa.
+function isAnimatedWebpBuffer(buffer) {
+    if (!buffer || buffer.length < 16) return false;
+
+    const isRiffWebp =
+        buffer.slice(0, 4).toString("ascii") === "RIFF" &&
+        buffer.slice(8, 12).toString("ascii") === "WEBP";
+
+    if (!isRiffWebp) return false;
+
+    // WebP animasi selalu punya chunk "ANIM" (beda dari WebP statis biasa).
+    return buffer.includes(Buffer.from("ANIM"));
+}
+
+// Konversi buffer WebP animasi -> buffer GIF animasi (frame & timing tetap
+// terjaga), supaya bisa dipakai sebagai input ffmpeg seperti GIF biasa.
+async function normalizeFfmpegInputBuffer(buffer) {
+    if (!isAnimatedWebpBuffer(buffer)) return buffer;
+
+    try {
+        return await sharp(buffer, { animated: true }).gif().toBuffer();
+    } catch (err) {
+        console.log("⚠️ Gagal convert stiker WebP animasi ke GIF, coba pakai buffer asli:", err.message);
+        return buffer;
+    }
+}
+
 // teks bisa "atas|bawah" (dua baris) atau cuma "teks" (satu baris di bawah)
 function parseMemeText(raw) {
     const parts = raw.split("|").map(s => s.trim()).filter(Boolean);
@@ -703,6 +740,7 @@ async function gifToTextSticker(inputBuffer, memeText, isStill = false) {
     const overlayPath = path.join(tmpDir, `meme-${uid}.png`);
     const outputPath = path.join(tmpDir, `meme-out-${uid}.webp`);
 
+    inputBuffer = await normalizeFfmpegInputBuffer(inputBuffer);
     fs.writeFileSync(inputPath, inputBuffer);
 
     try {
@@ -774,6 +812,7 @@ async function mediaToSticker(inputBuffer, isStill = false) {
     const inputPath = path.join(tmpDir, `s-in-${uid}`);
     const outputPath = path.join(tmpDir, `s-out-${uid}.webp`);
 
+    inputBuffer = await normalizeFfmpegInputBuffer(inputBuffer);
     fs.writeFileSync(inputPath, inputBuffer);
 
     try {
