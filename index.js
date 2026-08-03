@@ -1227,14 +1227,63 @@ function runYtDlp(args) {
     });
     proc.on("close", (code) => {
       if (code === 0) resolve();
-      else
-        reject(
-          new Error(
-            `yt-dlp keluar dengan kode ${code}\n${stderr.slice(-800)}`,
-          ),
+      else {
+        const err = new Error(
+          `yt-dlp keluar dengan kode ${code}\n${stderr.slice(-800)}`,
         );
+        err.stderr = stderr;
+        reject(err);
+      }
     });
   });
+}
+
+// Ubah pesan error mentah dari yt-dlp (yang teknis/kadang bahasa lain,
+// kadang malah traceback Python) jadi pesan yang gampang dipahami user
+// WhatsApp, buat kasus-kasus umum yang sering ketemu. Kalau gak ada pola
+// yang dikenal, fallback ke baris pertama pesan error yt-dlp-nya.
+function friendlyDlError(err) {
+  const raw = err.stderr || "";
+
+  if (
+    /版权地区受限|not available in your country|not available in your location|geo.?restrict/i.test(
+      raw,
+    )
+  ) {
+    return "🌍 Video ini dibatasi wilayah (geo-restricted) oleh platform aslinya -- server bot tidak bisa akses dari lokasinya. Coba video/link lain.";
+  }
+  if (/private video|video is private/i.test(raw)) {
+    return "🔒 Videonya bersifat privat, gak bisa diakses tanpa login.";
+  }
+  if (/sign in to confirm|age.?restrict/i.test(raw)) {
+    return "🔞 Video ini dibatasi umur oleh platformnya dan butuh login -- bot ini gak bisa login akun.";
+  }
+  if (
+    /video unavailable|content isn.?t available|no longer available|this video (has been removed|is unavailable)/i.test(
+      raw,
+    )
+  ) {
+    return "❌ Video/postingannya sudah tidak tersedia (mungkin dihapus atau link-nya salah).";
+  }
+  if (/unsupported url|no extractor/i.test(raw)) {
+    return "❌ Link ini belum didukung buat didownload.";
+  }
+
+  if (!err.stderr) {
+    // Ini error yang kita lempar sendiri (bukan dari stderr yt-dlp),
+    // pesannya udah pasti ramah buat user, tinggal dipakai apa adanya.
+    return err.message;
+  }
+
+  // Fallback terakhir: baris "ERROR: ..." pertama dari output yt-dlp,
+  // dipangkas biar gak nampilin traceback Python yang teknis banget.
+  const firstErrorLine =
+    raw.split("\n").find((l) => l.trim().startsWith("ERROR:")) ||
+    raw.split("\n").find(Boolean);
+  return (firstErrorLine || "Terjadi kesalahan saat download.").replace(
+    /^ERROR:\s*/,
+    "",
+  );
 }
 
 // Deteksi link YouTube (termasuk youtu.be & Shorts) -- dipakai buat
@@ -1351,7 +1400,7 @@ async function handleDlDownload(sock, jid, url, mode) {
   } catch (err) {
     console.log(err);
     await sock.sendMessage(jid, {
-      text: `❌ Gagal download.\n${err.message || ""}`,
+      text: `❌ Gagal download.\n${friendlyDlError(err)}`,
     });
   }
 }
