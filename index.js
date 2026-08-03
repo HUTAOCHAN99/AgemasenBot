@@ -345,6 +345,8 @@ Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti
 ▸ !meme
 ▸ !smeme
 ▸ !s
+▸ !togif
+▸ !toimg
 
 ┏━━━━━━━━━━━━━━━┓
 ┃ ⚙️ *LAIN-LAIN*
@@ -437,6 +439,24 @@ Ubah GIF/video/stiker/foto apa pun jadi stiker biasa, tanpa teks.
 *Cara pakai:*
 • Kirim medianya dengan caption \`!s\`.
 • Atau kirim medianya dulu, terus *reply* dengan \`!s\`.`,
+
+  togif: `🎞️ *!togif*
+
+Ubah stiker ANIMASI balik jadi GIF (dikirim sebagai video yang muter-loop kayak GIF).
+
+*Cara pakai:*
+• Kirim stikernya dengan caption \`!togif\`.
+• Atau kirim stikernya dulu, terus *reply* dengan \`!togif\`.
+
+⚠️ Cuma buat stiker animasi. Kalau stikernya statis (bukan animasi), pakai *!toimg* aja.`,
+
+  toimg: `🖼️ *!toimg*
+
+Ubah stiker jadi gambar biasa (PNG). Kalau stikernya animasi, yang diambil cuma frame pertamanya.
+
+*Cara pakai:*
+• Kirim stikernya dengan caption \`!toimg\`.
+• Atau kirim stikernya dulu, terus *reply* dengan \`!toimg\`.`,
 };
 
 
@@ -991,6 +1011,67 @@ async function normalizeFfmpegInputBuffer(buffer) {
   }
 }
 
+// Khusus stiker WA (BEDA dari findStickerSource yang generik, nerima
+// stiker ATAUPUN foto -- dipakai !smeme). !togif dan !toimg maunya emang
+// spesifik dari stiker, jadi foto/GIF/video yang di-reply sengaja tidak
+// dianggap valid di sini.
+function isStickerOnlySource(content) {
+  return !!(content && content.stickerMessage);
+}
+
+function findStickerOnlySource(msg) {
+  return findMediaSource(msg, isStickerOnlySource);
+}
+
+// !togif: stiker ANIMASI -> video mp4 yang dikirim dengan flag
+// `gifPlayback`, supaya WhatsApp nampilin & muter-loop-in kayak GIF asli
+// (WhatsApp gak pernah kirim file .gif mentah, selalu mp4 + flag ini).
+async function animatedStickerToGifVideo(buffer) {
+  const tmpDir = os.tmpdir();
+  const uid = crypto.randomBytes(6).toString("hex");
+  const inputPath = path.join(tmpDir, `togif-in-${uid}`);
+  const outputPath = path.join(tmpDir, `togif-out-${uid}.mp4`);
+
+  // Stiker animasi WA selalu WebP, dan ffmpeg gak bisa decode WebP animasi
+  // langsung (lihat catatan panjang di normalizeFfmpegInputBuffer), jadi
+  // dikonversi dulu ke GIF pakai sharp sebelum masuk ffmpeg.
+  const normalized = await normalizeFfmpegInputBuffer(buffer);
+  fs.writeFileSync(inputPath, normalized);
+
+  try {
+    const args = [
+      "-y",
+      "-i",
+      inputPath,
+      "-movflags",
+      "+faststart",
+      "-pix_fmt",
+      "yuv420p",
+      // Lebar/tinggi WAJIB genap buat yuv420p, makanya dibulatkan ke bawah
+      // ke kelipatan 2 terdekat (biasanya sudah genap, ini cuma jaga-jaga).
+      "-vf",
+      "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+      "-an",
+      outputPath,
+    ];
+
+    await runFfmpeg(args);
+
+    return fs.readFileSync(outputPath);
+  } finally {
+    fs.rm(inputPath, { force: true }, () => {});
+    fs.rm(outputPath, { force: true }, () => {});
+  }
+}
+
+// !toimg: stiker (statis, atau animasi -- kalau animasi cuma diambil
+// frame pertamanya) -> buffer gambar PNG biasa. Sharp otomatis kasih
+// frame pertama aja buat WebP animasi kalau {animated:true} gak di-set,
+// jadi tidak perlu penanganan animasi/statis secara terpisah di sini.
+async function stickerToImageBuffer(buffer) {
+  return sharp(buffer).png().toBuffer();
+}
+
 // teks bisa "atas|bawah" (dua baris) atau cuma "teks" (satu baris di bawah)
 function parseMemeText(raw) {
   const parts = raw
@@ -1439,6 +1520,82 @@ async function startBot() {
         console.log(err);
         await sock.sendMessage(jid, {
           text: `❌ Gagal membuat stiker.\n${err.message || ""}`,
+        });
+      }
+
+      return;
+    }
+
+    // =====================
+    // !togif  -> stiker ANIMASI jadi "GIF" (dikirim sbg video+gifPlayback,
+    // karena WhatsApp memang selalu begitu buat GIF).
+    // Bisa dari caption langsung di stikernya, atau reply ke stikernya.
+    // =====================
+    if (text === "!togif") {
+      const source = findStickerOnlySource(msg);
+
+      if (!source) {
+        await sendCommandDetail(sock, jid, "togif");
+        return;
+      }
+
+      if (!source.content.stickerMessage.isAnimated) {
+        await sock.sendMessage(jid, {
+          text:
+            "⚠️ Itu stiker biasa (bukan animasi), jadi gak ada apa-apanya buat dijadiin GIF.\n" +
+            "Mau dijadiin gambar? Pakai *!toimg*.",
+        });
+        return;
+      }
+
+      try {
+        await sock.sendMessage(jid, { text: "⏳ Membuat GIF..." });
+
+        const stickerBuffer = await downloadGifBuffer(
+          source.content,
+          source.refKey,
+        );
+        const gifVideoBuffer = await animatedStickerToGifVideo(stickerBuffer);
+
+        await sock.sendMessage(jid, {
+          video: gifVideoBuffer,
+          gifPlayback: true,
+        });
+      } catch (err) {
+        console.log(err);
+        await sock.sendMessage(jid, {
+          text: `❌ Gagal membuat GIF.\n${err.message || ""}`,
+        });
+      }
+
+      return;
+    }
+
+    // =====================
+    // !toimg  -> stiker (biasa/statis, atau animasi -> ambil frame
+    // pertamanya) jadi gambar biasa.
+    // Bisa dari caption langsung di stikernya, atau reply ke stikernya.
+    // =====================
+    if (text === "!toimg") {
+      const source = findStickerOnlySource(msg);
+
+      if (!source) {
+        await sendCommandDetail(sock, jid, "toimg");
+        return;
+      }
+
+      try {
+        const stickerBuffer = await downloadGifBuffer(
+          source.content,
+          source.refKey,
+        );
+        const imageBuffer = await stickerToImageBuffer(stickerBuffer);
+
+        await sock.sendMessage(jid, { image: imageBuffer });
+      } catch (err) {
+        console.log(err);
+        await sock.sendMessage(jid, {
+          text: `❌ Gagal membuat gambar.\n${err.message || ""}`,
         });
       }
 
