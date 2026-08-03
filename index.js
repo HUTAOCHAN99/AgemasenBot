@@ -349,6 +349,11 @@ Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti
 ▸ !toimg
 
 ┏━━━━━━━━━━━━━━━┓
+┃ 📥 *DOWNLOAD MEDIA*
+┗━━━━━━━━━━━━━━━┛
+▸ !dl
+
+┏━━━━━━━━━━━━━━━┓
 ┃ ⚙️ *LAIN-LAIN*
 ┗━━━━━━━━━━━━━━━┛
 ▸ !ping
@@ -457,6 +462,24 @@ Ubah stiker jadi gambar biasa (PNG). Kalau stikernya animasi, yang diambil cuma 
 *Cara pakai:*
 • Kirim stikernya dengan caption \`!toimg\`.
 • Atau kirim stikernya dulu, terus *reply* dengan \`!toimg\`.`,
+
+  dl: `📥 *!dl <link>*
+
+Download video/audio dari sebuah link: YouTube, Bilibili, Facebook (video/reel/postingan video), TikTok, Instagram, X/Twitter, dan situs lain yang didukung.
+
+*Khusus link YouTube:* nanti dikasih pilihan mau *MP4* (video) atau *MP3* (audio) -- tinggal balas angka *1* atau *2*.
+
+*Contoh:*
+\`\`\`
+!dl https://youtu.be/xxxxxxxxxxx
+!dl https://youtu.be/xxxxxxxxxxx mp3
+!dl https://www.bilibili.com/video/xxxxxxxxxxx
+!dl https://www.facebook.com/reel/xxxxxxxxxxx
+\`\`\`
+
+Bisa langsung tambahin *mp3* atau *mp4* setelah link-nya (khusus YouTube) kalau males milih pakai angka.
+
+⚠️ Batas ukuran file *95MB*. Postingan Facebook yang isinya cuma FOTO (bukan video) tidak didukung -- ini murni buat video/audio.`,
 };
 
 
@@ -1158,6 +1181,181 @@ async function stickerToImageBuffer(buffer) {
   return image.toBuffer();
 }
 
+// =====================================================
+// Fitur: Download media dari link ("!dl")
+// YouTube (video/short, pilihan MP4 atau MP3), Bilibili, Facebook
+// (video/reel/postingan video), TikTok, Instagram, Twitter/X, dst --
+// pada dasarnya semua situs yang didukung yt-dlp (1000+ situs).
+//
+// PENTING: ini butuh binary "yt-dlp" TERINSTALL DI SERVER, terpisah dari
+// dependency npm project ini (npm wrapper yt-dlp-exec ternyata rapuh --
+// postinstall-nya sering gagal ambil binary dari GitHub releases). Cara
+// paling gampang & paling stabil: `pip install -U yt-dlp` di server, atau
+// download binary standalone-nya dari GitHub releases resmi yt-dlp lalu
+// taruh di PATH. Kalau nama/lokasi binary-nya beda, override lewat env
+// var YTDLP_PATH (sama seperti pola MEME_FONT_PATH di atas).
+//
+// ffmpeg TIDAK perlu diinstall terpisah untuk fitur ini -- kita pakai
+// ffmpeg-static yang sudah jadi dependency project ini (lewat
+// --ffmpeg-location), jadi yt-dlp bisa gabungin stream video+audio atau
+// convert ke MP3 tanpa butuh ffmpeg sistem.
+// =====================================================
+const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp";
+
+// Batas ukuran file hasil download, biar gak nyoba kirim file raksasa yang
+// bakal gagal/lambat banget dikirim lewat WhatsApp.
+const DL_MAX_FILESIZE = "95M";
+
+function runYtDlp(args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(YTDLP_PATH, args);
+    let stderr = "";
+
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    proc.on("error", (err) => {
+      if (err.code === "ENOENT") {
+        reject(
+          new Error(
+            "yt-dlp tidak ditemukan di server. Install dulu (`pip install -U yt-dlp`) lalu pastikan ada di PATH, atau set env var YTDLP_PATH ke lokasi binary-nya.",
+          ),
+        );
+        return;
+      }
+      reject(err);
+    });
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else
+        reject(
+          new Error(
+            `yt-dlp keluar dengan kode ${code}\n${stderr.slice(-800)}`,
+          ),
+        );
+    });
+  });
+}
+
+// Deteksi link YouTube (termasuk youtu.be & Shorts) -- dipakai buat
+// nentuin kapan harus nanya pilihan MP4/MP3 dulu.
+function isYoutubeUrl(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "");
+    return host === "youtube.com" || host === "m.youtube.com" || host === "youtu.be";
+  } catch {
+    return false;
+  }
+}
+
+// mode: "video" -> MP4 (gabungan video+audio terbaik dalam batas ukuran)
+//       "audio" -> MP3 (audio-only, hasil ekstraksi)
+// Dipakai buat YouTube (pilihan) DAN situs lain (langsung mode "video"),
+// jadi generik untuk Bilibili, Facebook (video/reel/postingan video),
+// TikTok, Instagram, X/Twitter, dst -- apa pun yang didukung yt-dlp.
+async function downloadMediaFromUrl(url, mode) {
+  const tmpDir = os.tmpdir();
+  const uid = crypto.randomBytes(6).toString("hex");
+  const outputTemplate = path.join(tmpDir, `dl-${uid}.%(ext)s`);
+
+  const commonArgs = [
+    "--no-playlist",
+    "--no-warnings",
+    "--ffmpeg-location",
+    path.dirname(ffmpegPath),
+    "--max-filesize",
+    DL_MAX_FILESIZE,
+    "-o",
+    outputTemplate,
+  ];
+
+  const args =
+    mode === "audio"
+      ? [
+          ...commonArgs,
+          "-x",
+          "--audio-format",
+          "mp3",
+          "--audio-quality",
+          "5",
+          url,
+        ]
+      : [
+          ...commonArgs,
+          "-f",
+          "bestvideo[filesize<95M]+bestaudio[filesize<95M]/best[filesize<95M]/best",
+          "--merge-output-format",
+          "mp4",
+          url,
+        ];
+
+  try {
+    await runYtDlp(args);
+
+    // Nama file pastinya baru ketahuan setelah yt-dlp selesai (ekstensi
+    // ditentukan otomatis olehnya), jadi dicari lewat prefix uid ini.
+    const files = fs
+      .readdirSync(tmpDir)
+      .filter((f) => f.startsWith(`dl-${uid}`));
+
+    if (files.length === 0) {
+      throw new Error(
+        "File hasil download tidak ditemukan. Mungkin link-nya tidak mengandung video/audio (mis. postingan berupa foto saja), atau ukurannya melebihi batas 95MB.",
+      );
+    }
+
+    const outputPath = path.join(tmpDir, files[0]);
+    const buffer = fs.readFileSync(outputPath);
+
+    return { buffer };
+  } finally {
+    // Bersihin semua file sisa dengan prefix uid ini (termasuk file
+    // sementara lain yang mungkin ditinggal yt-dlp kalau prosesnya gagal
+    // di tengah jalan).
+    try {
+      for (const f of fs.readdirSync(tmpDir)) {
+        if (f.startsWith(`dl-${uid}`)) {
+          fs.rm(path.join(tmpDir, f), { force: true }, () => {});
+        }
+      }
+    } catch {
+      // abaikan -- ini cuma usaha bersih-bersih tmp, bukan hal kritis
+    }
+  }
+}
+
+async function handleDlDownload(sock, jid, url, mode) {
+  try {
+    await sock.sendMessage(jid, {
+      text:
+        mode === "audio"
+          ? "⏳ Download audio (MP3), tunggu ya..."
+          : "⏳ Download video, tunggu ya...",
+    });
+
+    const { buffer } = await downloadMediaFromUrl(url, mode);
+
+    if (mode === "audio") {
+      await sock.sendMessage(jid, {
+        audio: buffer,
+        mimetype: "audio/mpeg",
+        fileName: "audio.mp3",
+      });
+    } else {
+      await sock.sendMessage(jid, {
+        video: buffer,
+        mimetype: "video/mp4",
+        caption: `✅ Berhasil didownload.\n🔗 ${url}`,
+      });
+    }
+  } catch (err) {
+    console.log(err);
+    await sock.sendMessage(jid, {
+      text: `❌ Gagal download.\n${err.message || ""}`,
+    });
+  }
+}
+
 // teks bisa "atas|bawah" (dua baris) atau cuma "teks" (satu baris di bawah)
 function parseMemeText(raw) {
   const parts = raw
@@ -1399,6 +1597,21 @@ async function startBot() {
     // =====================
     if (/^\d+$/.test(text)) {
       const session = sessions.get(sessionKey);
+
+      // Lagi nunggu pilihan MP4/MP3 dari !dl link YouTube?
+      if (session?.pendingDlChoice) {
+        if (text !== "1" && text !== "2") {
+          await sock.sendMessage(jid, {
+            text: "⚠️ Balas dengan *1* (MP4) atau *2* (MP3) ya.",
+          });
+          return;
+        }
+
+        const { url } = session.pendingDlChoice;
+        sessions.delete(sessionKey);
+        await handleDlDownload(sock, jid, url, text === "1" ? "video" : "audio");
+        return;
+      }
 
       if (session?.pendingTagChoices) {
         const idx = parseInt(text, 10) - 1;
@@ -1831,6 +2044,48 @@ async function startBot() {
         });
       }
 
+      return;
+    }
+
+    // =====================
+    // !dl <link> [mp3|mp4]
+    // =====================
+    if (text === "!dl" || text.startsWith("!dl ")) {
+      const rest = text.slice(3).trim();
+      const urlMatch = rest.match(/https?:\/\/\S+/i);
+
+      if (!urlMatch) {
+        await sendCommandDetail(sock, jid, "dl");
+        return;
+      }
+
+      const url = urlMatch[0];
+      // Sisa teks setelah link (kalau ada) dipakai buat override format,
+      // mis. "!dl <link> mp3" -- biar gak perlu balas angka lagi.
+      const hint = rest
+        .slice(urlMatch.index + urlMatch[0].length)
+        .trim()
+        .toLowerCase();
+
+      try {
+        new URL(url); // validasi cepat, lempar kalau bukan URL valid
+      } catch {
+        await sock.sendMessage(jid, { text: "❌ Link tidak valid." });
+        return;
+      }
+
+      // Link YouTube tanpa format eksplisit -> tanya dulu MP4 atau MP3.
+      if (isYoutubeUrl(url) && hint !== "mp3" && hint !== "mp4" && hint !== "audio" && hint !== "video") {
+        sessions.set(sessionKey, { pendingDlChoice: { url } });
+        await sock.sendMessage(jid, {
+          text:
+            "📥 *Link YouTube terdeteksi*\n\nMau download dalam bentuk apa?\n\n[1] 🎬 MP4 (Video)\n[2] 🎵 MP3 (Audio)\n\n_Balas pesan ini dengan angka 1 atau 2._",
+        });
+        return;
+      }
+
+      const mode = hint === "mp3" || hint === "audio" ? "audio" : "video";
+      await handleDlDownload(sock, jid, url, mode);
       return;
     }
 
