@@ -24,6 +24,38 @@ const sharp = require("sharp");
 // =====================================================
 const sessions = new Map();
 
+// =====================================================
+// Kode sesi per-chat (BUKAN per-pengirim)
+// Supaya siapa pun di grup yang sama bisa ketik angka kodenya buat lanjut
+// (!next) pencarian tertentu -- termasuk pencarian milik orang lain --
+// tanpa bentrok dengan pencarian orang lain di grup yang sama.
+//
+// Objeknya SAMA PERSIS (reference yang sama) dengan yang disimpan di
+// `sessions` untuk pemilik aslinya, jadi kalau pool-nya berubah (baik lewat
+// "!next" ketik teks oleh pemiliknya, ATAU lewat siapa pun ketik kodenya)
+// keduanya otomatis tetap sinkron.
+//
+// jid -> Map<kode(number), session>
+const chatCodeSessions = new Map();
+// jid -> kode berikutnya yang akan dipakai
+const chatNextCode = new Map();
+
+// Kasih (atau pakai ulang) kode sesi untuk satu hasil pencarian di 1 chat.
+// Kode ini SENGAJA di-scope per-chat (bukan global bot), jadi grup A dan
+// grup B bisa sama-sama punya "kode 1" tanpa saling ganggu.
+function assignSessionCode(jid, session) {
+  if (session.code) return session.code; // sesi ini sudah punya kode, pakai lagi
+
+  const next = (chatNextCode.get(jid) || 0) + 1;
+  chatNextCode.set(jid, next);
+  session.code = next;
+
+  if (!chatCodeSessions.has(jid)) chatCodeSessions.set(jid, new Map());
+  chatCodeSessions.get(jid).set(next, session);
+
+  return next;
+}
+
 // Safebooru's dapi menolak permintaan "limit" di atas 100 dalam satu request,
 // jadi buat ambil SEMUA post (tanpa batas), kita harus paging pakai "pid"
 // (page index, 0-based) sampai halaman yang balik lebih pendek dari
@@ -50,16 +82,21 @@ function getSessionKey(msg) {
   return participant ? `${jid}::${participant}` : jid;
 }
 
-function buildCaption(post, karakterLabel, { isNext = false } = {}) {
+function buildCaption(post, karakterLabel, { isNext = false, code } = {}) {
   const link = `https://safebooru.org/index.php?page=post&s=view&id=${post.id}`;
+
+  const codeLine = code ? `\n🔢 *Kode Sesi:* ${code}` : "";
+  const continueLine = code
+    ? `➡️ Ketik *${code}* (siapa saja boleh) atau *!next* untuk gambar lain dari pencarian ini`
+    : `➡️ Ketik *!next* untuk gambar lain dari pencarian ini`;
 
   return `🖼️ *Hasil Gambar*${isNext ? " (lanjutan)" : ""}
 
-👤 *Karakter:* ${karakterLabel}
-🆔 *Kode:* ${post.id}
+👤 *Karakter:* ${karakterLabel}${codeLine}
+🆔 *Kode Gambar:* ${post.id}
 🔗 *Link:* ${link}
 
-➡️ Ketik *!next* untuk gambar lain dari pencarian ini
+${continueLine}
 🔁 Ketik *!id ${post.id}* untuk lihat gambar ini lagi kapan saja`;
 }
 
@@ -219,11 +256,17 @@ _Reply pesan ini dengan nomor urut karakter untuk melihat gambar_`;
 async function searchAndSendImage(sock, jid, sessionKey, tag, candidates) {
   const post = pickRandom(candidates);
 
-  sessions.set(sessionKey, {
+  const session = {
     tag,
     pool: candidates,
     lastId: post.id,
-  });
+  };
+
+  // Objek session yang sama dipakai baik di `sessions` (buat pemiliknya,
+  // dipakai untuk "!next" ketik teks) maupun di `chatCodeSessions` (buat
+  // siapa saja di chat ini, dipakai untuk lanjut pakai angka kode).
+  sessions.set(sessionKey, session);
+  const code = assignSessionCode(jid, session);
 
   const buffer = await downloadImage(post.file_url);
   const karakterLabel = tag
@@ -235,7 +278,7 @@ async function searchAndSendImage(sock, jid, sessionKey, tag, candidates) {
 
   await sock.sendMessage(jid, {
     image: buffer,
-    caption: buildCaption(post, karakterLabel),
+    caption: buildCaption(post, karakterLabel, { code }),
   });
 }
 
@@ -325,6 +368,8 @@ const COMMAND_DETAILS = {
 Cari gambar berdasarkan tag.
 _(Kalau tag-nya terlalu umum, nanti muncul daftar pilihan. Tinggal balas pakai angkanya.)_
 
+Tiap hasil pencarian dikasih *Kode Sesi* (angka). Siapa pun di grup boleh ketik angka itu buat lanjut ke gambar lain dari pencarian tersebut -- gak harus yang mulai duluan, dan gak akan ketuker sama pencarian orang lain karena tiap pencarian punya kodenya sendiri.
+
 *Contoh:*
 \`\`\`
 !img umamusume
@@ -337,6 +382,8 @@ _(Kalau tag-nya terlalu umum, nanti muncul daftar pilihan. Tinggal balas pakai a
   next: `➡️ *!next*
 
 Lanjut ke gambar berikutnya dari pencarian tag yang sama.
+
+💡 Selain ketik *!next*, bisa juga ketik *Kode Sesi*-nya (angka yang muncul di hasil gambar) -- ini bisa dipakai siapa saja di grup, gak cuma yang mulai pencariannya.
 
 ⚠️ Pakai *!img <tag>* dulu sebelum pakai ini.`,
 
@@ -1224,7 +1271,59 @@ async function startBot() {
         return;
       }
 
-      // angka tanpa daftar pending -> biarkan lewat, bukan command
+      // Bukan lagi soal daftar disambiguasi milik pengirim ini -> cek apakah
+      // angka ini KODE SESI pencarian yang lagi aktif di chat ini. Kode sesi
+      // ini scope-nya per-chat (bukan per-pengirim), jadi siapa pun di grup
+      // yang sama boleh pakai kode punya orang lain buat lanjut (!next)
+      // pencarian itu, dan ini tidak bentrok dengan kode punya pencarian
+      // lain karena tiap pencarian dapat nomor kodenya sendiri-sendiri.
+      const codeNum = parseInt(text, 10);
+      const codeSession = chatCodeSessions.get(jid)?.get(codeNum);
+
+      if (codeSession) {
+        try {
+          // pool habis -> refill otomatis dari tag yang sama
+          if (codeSession.pool.length === 0) {
+            codeSession.pool = await fetchCandidates(codeSession.tag);
+
+            if (codeSession.pool.length === 0) {
+              await sock.sendMessage(jid, {
+                text: "❌ Tidak ada gambar lain untuk tag ini.",
+              });
+              return;
+            }
+          }
+
+          const post = pickRandom(codeSession.pool);
+          codeSession.lastId = post.id;
+
+          const buffer = await downloadImage(post.file_url);
+          const karakterLabel = codeSession.tag
+            .toLowerCase()
+            .split(/\s+/)
+            .filter(Boolean)
+            .map(prettifyTag)
+            .join(", ");
+
+          await sock.sendMessage(jid, {
+            image: buffer,
+            caption: buildCaption(post, karakterLabel, {
+              isNext: true,
+              code: codeNum,
+            }),
+          });
+        } catch (err) {
+          console.log(err);
+          await sock.sendMessage(jid, {
+            text: "Terjadi kesalahan.",
+          });
+        }
+
+        return;
+      }
+
+      // angka tanpa daftar pending & bukan kode sesi yang aktif -> biarkan
+      // lewat, bukan command
     }
 
     // =====================
@@ -1440,7 +1539,10 @@ async function startBot() {
 
         await sock.sendMessage(jid, {
           image: buffer,
-          caption: buildCaption(post, karakterLabel, { isNext: true }),
+          caption: buildCaption(post, karakterLabel, {
+            isNext: true,
+            code: session.code,
+          }),
         });
       } catch (err) {
         console.log(err);
