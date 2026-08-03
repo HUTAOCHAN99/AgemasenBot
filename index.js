@@ -1255,6 +1255,15 @@ function friendlyDlError(err) {
   if (/private video|video is private/i.test(raw)) {
     return "🔒 Videonya bersifat privat, gak bisa diakses tanpa login.";
   }
+  // PENTING: dicek DULUAN sebelum age-restrict, karena pesan ini pola
+  // katanya mirip ("sign in to confirm...") tapi artinya beda total --
+  // ini YouTube curiga IP server-nya bot/datacenter, BUKAN video-nya
+  // dibatasi umur. Kalau ini yang muncul dan berhasil di komputer lain
+  // (residential IP), berarti memang soal reputasi IP server, bukan
+  // soal video atau butuh login akun asli.
+  if (/sign in to confirm you.?re not a bot/i.test(raw)) {
+    return "🤖 YouTube mendeteksi server bot ini sebagai traffic mencurigakan (umum terjadi di IP cloud/datacenter kayak Railway/AWS/GCP) -- ini BUKAN soal video dibatasi umur. Solusinya butuh cookies akun YouTube asli di server, atau ganti ke IP residential/proxy.";
+  }
   if (/sign in to confirm|age.?restrict/i.test(raw)) {
     return "🔞 Video ini dibatasi umur oleh platformnya dan butuh login -- bot ini gak bisa login akun.";
   }
@@ -1317,6 +1326,19 @@ async function downloadMediaFromUrl(url, mode) {
     "-o",
     outputTemplate,
   ];
+
+  // Khusus YouTube: paksa pakai client android_vr/mweb duluan (bukan client
+  // "web" default yang paling sering kena "sign in to confirm you're not
+  // a bot" dari IP datacenter/cloud). Ini persis client yang otomatis
+  // dipilih yt-dlp waktu berhasil download dari IP rumah/residential --
+  // kalau server (mis. Railway) IP-nya kena curiga, client ini kadang
+  // masih lolos karena jalur verifikasinya beda dari client "web".
+  if (isYoutubeUrl(url)) {
+    commonArgs.push(
+      "--extractor-args",
+      "youtube:player_client=android_vr,mweb",
+    );
+  }
 
   const args =
     mode === "audio"
@@ -1398,7 +1420,15 @@ async function handleDlDownload(sock, jid, url, mode) {
       });
     }
   } catch (err) {
-    console.log(err);
+    console.log("=== [dl] yt-dlp gagal ===");
+    console.log("message:", err.message);
+    if (err.stderr) {
+      // Ini yang paling penting buat debug di Railway logs -- pesan asli
+      // dari yt-dlp sebelum "dihaluskan" friendlyDlError(). Kalau user
+      // lapor error tapi kamu bingung penyebab aslinya apa, cek baris ini.
+      console.log("raw stderr:\n" + err.stderr);
+    }
+    console.log("=========================");
     await sock.sendMessage(jid, {
       text: `❌ Gagal download.\n${friendlyDlError(err)}`,
     });
