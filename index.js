@@ -1023,6 +1023,59 @@ function findStickerOnlySource(msg) {
   return findMediaSource(msg, isStickerOnlySource);
 }
 
+// Stiker yang aslinya bukan rasio 1:1 (mis. dibikin lewat !s/!meme/!smeme
+// dari foto/video non-persegi) disimpan dengan border TRANSPARAN biar pas
+// jadi kanvas 512x512 (syarat stiker WA). Masalahnya: MP4 (dipakai buat
+// "GIF" WhatsApp lewat gifPlayback) TIDAK support transparansi -- begitu
+// di-flatten, border transparan itu otomatis diisi warna solid (biasanya
+// PUTIH) oleh ffmpeg, jadi hasilnya kelihatan ada "ruang putih" gak sesuai
+// ukuran konten aslinya. Fungsi ini deteksi bounding-box area yang BENERAN
+// kelihatan (alpha > threshold) dari 1 frame representatif, supaya nanti
+// bisa di-crop dulu sebelum alpha-nya dibuang -- hasilnya pas ukuran
+// konten aslinya, gak ada sisa border putih.
+async function detectContentBoundingBox(buffer) {
+  const { data, info } = await sharp(buffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height, channels } = info;
+  const ALPHA_THRESHOLD = 10; // toleransi noise kompresi di pinggir gambar
+
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const alpha = data[(y * width + x) * channels + (channels - 1)];
+      if (alpha > ALPHA_THRESHOLD) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return null; // semua transparan, aneh -> skip
+
+  // Konten sudah memenuhi seluruh kanvas (gak ada border) -> gak perlu crop.
+  if (minX === 0 && minY === 0 && maxX === width - 1 && maxY === height - 1) {
+    return null;
+  }
+
+  let cropW = maxX - minX + 1;
+  let cropH = maxY - minY + 1;
+
+  // Lebar/tinggi wajib genap buat yuv420p.
+  if (cropW % 2 !== 0) cropW = Math.min(width - minX, cropW + 1);
+  if (cropH % 2 !== 0) cropH = Math.min(height - minY, cropH + 1);
+
+  return { x: minX, y: minY, width: cropW, height: cropH };
+}
+
 // !togif: stiker ANIMASI -> video mp4 yang dikirim dengan flag
 // `gifPlayback`, supaya WhatsApp nampilin & muter-loop-in kayak GIF asli
 // (WhatsApp gak pernah kirim file .gif mentah, selalu mp4 + flag ini).
@@ -1032,13 +1085,33 @@ async function animatedStickerToGifVideo(buffer) {
   const inputPath = path.join(tmpDir, `togif-in-${uid}`);
   const outputPath = path.join(tmpDir, `togif-out-${uid}.mp4`);
 
-  // Stiker animasi WA selalu WebP, dan ffmpeg gak bisa decode WebP animasi
+  // Deteksi border transparan dari frame ASLI (sebelum lewat konversi apa
+  // pun) -- asumsinya border ini statis/sama persis di semua frame, karena
+  // memang begitu cara kerja letterbox/pad (bordernya gak ikut geser-geser
+  // pas animasi jalan).
+  const bbox = await detectContentBoundingBox(buffer).catch((err) => {
+    console.log("⚠️ Gagal deteksi bounding-box, lanjut tanpa crop:", err.message);
+    return null;
+  });
+
+  // Stiker WA animasi selalu WebP, dan ffmpeg gak bisa decode WebP animasi
   // langsung (lihat catatan panjang di normalizeFfmpegInputBuffer), jadi
   // dikonversi dulu ke GIF pakai sharp sebelum masuk ffmpeg.
   const normalized = await normalizeFfmpegInputBuffer(buffer);
   fs.writeFileSync(inputPath, normalized);
 
   try {
+    const filters = [];
+
+    if (bbox) {
+      filters.push(`crop=${bbox.width}:${bbox.height}:${bbox.x}:${bbox.y}`);
+    }
+
+    // Lebar/tinggi WAJIB genap buat yuv420p, makanya dibulatkan ke bawah
+    // ke kelipatan 2 terdekat (biasanya sudah genap habis crop, ini cuma
+    // jaga-jaga).
+    filters.push("scale=trunc(iw/2)*2:trunc(ih/2)*2");
+
     const args = [
       "-y",
       "-i",
@@ -1047,10 +1120,8 @@ async function animatedStickerToGifVideo(buffer) {
       "+faststart",
       "-pix_fmt",
       "yuv420p",
-      // Lebar/tinggi WAJIB genap buat yuv420p, makanya dibulatkan ke bawah
-      // ke kelipatan 2 terdekat (biasanya sudah genap, ini cuma jaga-jaga).
       "-vf",
-      "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+      filters.join(","),
       "-an",
       outputPath,
     ];
@@ -1068,8 +1139,23 @@ async function animatedStickerToGifVideo(buffer) {
 // frame pertamanya) -> buffer gambar PNG biasa. Sharp otomatis kasih
 // frame pertama aja buat WebP animasi kalau {animated:true} gak di-set,
 // jadi tidak perlu penanganan animasi/statis secara terpisah di sini.
+// Border transparan (padding biar pas kanvas persegi stiker WA) juga
+// di-crop dulu, supaya ukuran gambar yang keluar itu sesuai konten
+// aslinya, bukan ukuran kanvas stiker yang dipaksa persegi.
 async function stickerToImageBuffer(buffer) {
-  return sharp(buffer).png().toBuffer();
+  const image = sharp(buffer).png();
+  const bbox = await detectContentBoundingBox(buffer).catch(() => null);
+
+  if (bbox) {
+    image.extract({
+      left: bbox.x,
+      top: bbox.y,
+      width: bbox.width,
+      height: bbox.height,
+    });
+  }
+
+  return image.toBuffer();
 }
 
 // teks bisa "atas|bawah" (dua baris) atau cuma "teks" (satu baris di bawah)
