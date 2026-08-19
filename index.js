@@ -1223,6 +1223,85 @@ const DL_MAX_FILESIZE = "95M";
 // jalan seperti biasa (cuma mengandalkan trik player_client di bawah).
 const YTDLP_POT_BASE_URL = process.env.YTDLP_POT_BASE_URL || "";
 
+// =====================================================
+// CACHE -- video yang sama (video ID + mode) yang sudah pernah didownload
+// disimpan di sini, biar request berikutnya (dari user yang sama atau user
+// lain) gak perlu hit YouTube lagi sama sekali. Ini juga yang paling efektif
+// nurunin resiko kena rate-limit (429)/deteksi bot, karena request ke
+// YouTube jadi jauh lebih jarang.
+//
+// Catatan: cache ini di tmpdir, jadi otomatis kosong lagi tiap kali service
+// Railway di-restart/redeploy -- itu sudah cukup, gak perlu disimpan
+// permanen selamanya.
+// =====================================================
+const DL_CACHE_DIR = path.join(os.tmpdir(), "botwa-dl-cache");
+try {
+  fs.mkdirSync(DL_CACHE_DIR, { recursive: true });
+} catch {
+  // abaikan -- kalau gagal bikin folder cache, fitur cache cuma jadi
+  // gak aktif (selalu cache-miss), bot tetap jalan normal
+}
+
+// Ambil video ID YouTube dari berbagai bentuk URL (watch?v=, youtu.be/,
+// /shorts/). Dipakai sebagai key cache. Return null kalau gagal diparse
+// (mis. link playlist tanpa ID tunggal) -- artinya cache di-skip.
+function extractYoutubeVideoId(url) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.replace(/^www\./, "");
+    if (host === "youtu.be") return u.pathname.slice(1).split("/")[0] || null;
+    if (host === "youtube.com" || host === "m.youtube.com") {
+      if (u.pathname.startsWith("/shorts/")) {
+        return u.pathname.split("/")[2] || null;
+      }
+      return u.searchParams.get("v");
+    }
+  } catch {
+    // url tidak valid
+  }
+  return null;
+}
+
+// Ekstensi hasil download sudah pasti (lihat downloadMediaFromUrl: mode
+// "video" selalu di-merge jadi .mp4, mode "audio" selalu di-extract jadi
+// .mp3), jadi nama file cache bisa ditentukan di awal tanpa nunggu hasil.
+function cachePathFor(videoId, mode) {
+  const ext = mode === "audio" ? "mp3" : "mp4";
+  return path.join(DL_CACHE_DIR, `${videoId}-${mode}.${ext}`);
+}
+
+// =====================================================
+// QUEUE -- batasin berapa banyak proses yt-dlp yang boleh jalan BERSAMAAN.
+// Tanpa ini, kalau 10-20 orang nge-`!dl` bareng, server bisa langsung
+// jalanin 10-20 proses yt-dlp sekaligus -> gampang banget kena rate-limit
+// (429) atau bikin server kehabisan resource. Dengan queue, cuma
+// DL_QUEUE_CONCURRENCY job yang jalan bersamaan, sisanya ngantre giliran.
+// =====================================================
+const DL_QUEUE_CONCURRENCY = Number(process.env.DL_QUEUE_CONCURRENCY) || 2;
+let dlActiveWorkers = 0;
+const dlQueue = [];
+
+function processDlQueue() {
+  while (dlActiveWorkers < DL_QUEUE_CONCURRENCY && dlQueue.length > 0) {
+    const job = dlQueue.shift();
+    dlActiveWorkers++;
+    job
+      .jobFn()
+      .then(job.resolve, job.reject)
+      .finally(() => {
+        dlActiveWorkers--;
+        processDlQueue();
+      });
+  }
+}
+
+function enqueueDownloadJob(jobFn) {
+  return new Promise((resolve, reject) => {
+    dlQueue.push({ jobFn, resolve, reject });
+    processDlQueue();
+  });
+}
+
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(YTDLP_PATH, args);
@@ -1245,6 +1324,11 @@ function runYtDlp(args) {
     proc.on("close", (code) => {
       if (code === 0) resolve();
       else {
+        // Log stderr MENTAH ke console (keliatan di Railway Logs) supaya
+        // gampang di-debug -- pesan yang dikirim ke WhatsApp sengaja
+        // disederhanain (lihat friendlyDlError), jadi tanpa ini kita gak
+        // bisa lihat detail teknis aslinya dari luar server.
+        console.error("[yt-dlp] gagal, stderr mentah:\n" + stderr);
         const err = new Error(
           `yt-dlp keluar dengan kode ${code}\n${stderr.slice(-800)}`,
         );
@@ -1343,6 +1427,11 @@ async function downloadMediaFromUrl(url, mode) {
     path.dirname(ffmpegPath),
     "--max-filesize",
     DL_MAX_FILESIZE,
+    // Jeda kecil (detik) antar request internal yt-dlp -- bukan obat buat
+    // rate-limit yang udah kejadian, tapi pencegahan biar gak gampang
+    // numpuk ke 429 lagi terutama kalau banyak download YouTube beruntun.
+    "--sleep-requests",
+    "1",
     "-o",
     outputTemplate,
   ];
@@ -1386,7 +1475,16 @@ async function downloadMediaFromUrl(url, mode) {
       : [
           ...commonArgs,
           "-f",
-          "bestvideo[filesize<95M]+bestaudio[filesize<95M]/best[filesize<95M]/best",
+          // PENTING: paksa codec H.264 (avc1) + AAC (mp4a), BUKAN cuma
+          // "terbaik apa adanya". yt-dlp defaultnya sering milih VP9/AV1
+          // + Opus (kualitas oke tapi codec modern) yang cuma bisa
+          // dimainin di player berbasis browser (WA Web/Chrome), TAPI
+          // player video native di app WA HP kebanyakan cuma jamin
+          // dukung H.264+AAC -- makanya video ke-download tapi gak bisa
+          // dibuka di HP. Ada 3 tingkat fallback: avc1+mp4a gabungan,
+          // lalu avc1+mp4a pre-merged (format lama kayak 18/22), baru
+          // fallback paling akhir ke "apa aja yang penting kebentuk".
+          "bestvideo[vcodec^=avc1][filesize<95M]+bestaudio[acodec^=mp4a][filesize<95M]/best[vcodec^=avc1][filesize<95M]/best[filesize<95M]/best",
           "--merge-output-format",
           "mp4",
           url,
@@ -1428,7 +1526,19 @@ async function downloadMediaFromUrl(url, mode) {
 }
 
 async function handleDlDownload(sock, jid, url, mode) {
+  const videoId = isYoutubeUrl(url) ? extractYoutubeVideoId(url) : null;
+  const cachePath = videoId ? cachePathFor(videoId, mode) : null;
+
   try {
+    // 1. CACHE CHECK -- video (+ mode) ini udah pernah didownload sebelumnya?
+    // Kalau ya, langsung kirim file lama, gak usah hit YouTube lagi.
+    if (cachePath && fs.existsSync(cachePath)) {
+      console.log(`[dl] cache hit: ${cachePath}`);
+      const buffer = fs.readFileSync(cachePath);
+      await sendDownloadedMedia(sock, jid, buffer, mode, url, true);
+      return;
+    }
+
     await sock.sendMessage(jid, {
       text:
         mode === "audio"
@@ -1436,21 +1546,22 @@ async function handleDlDownload(sock, jid, url, mode) {
           : "⏳ Download video, tunggu ya...",
     });
 
-    const { buffer } = await downloadMediaFromUrl(url, mode);
+    // 2. Cache miss -> masuk QUEUE, biar gak numpuk proses yt-dlp jalan
+    // bersamaan kalau lagi banyak yang minta download sekaligus.
+    const { buffer } = await enqueueDownloadJob(() =>
+      downloadMediaFromUrl(url, mode),
+    );
 
-    if (mode === "audio") {
-      await sock.sendMessage(jid, {
-        audio: buffer,
-        mimetype: "audio/mpeg",
-        fileName: "audio.mp3",
-      });
-    } else {
-      await sock.sendMessage(jid, {
-        video: buffer,
-        mimetype: "video/mp4",
-        caption: `✅ Berhasil didownload.\n🔗 ${url}`,
-      });
+    // 3. Simpan ke cache (kalau ini video YouTube) buat request berikutnya.
+    if (cachePath) {
+      try {
+        fs.writeFileSync(cachePath, buffer);
+      } catch (e) {
+        console.error("[dl] gagal simpan ke cache:", e.message);
+      }
     }
+
+    await sendDownloadedMedia(sock, jid, buffer, mode, url, false);
   } catch (err) {
     console.log("=== [dl] yt-dlp gagal ===");
     console.log("message:", err.message);
@@ -1463,6 +1574,24 @@ async function handleDlDownload(sock, jid, url, mode) {
     console.log("=========================");
     await sock.sendMessage(jid, {
       text: `❌ Gagal download.\n${friendlyDlError(err)}`,
+    });
+  }
+}
+
+async function sendDownloadedMedia(sock, jid, buffer, mode, url, fromCache) {
+  if (mode === "audio") {
+    await sock.sendMessage(jid, {
+      audio: buffer,
+      mimetype: "audio/mpeg",
+      fileName: "audio.mp3",
+    });
+  } else {
+    await sock.sendMessage(jid, {
+      video: buffer,
+      mimetype: "video/mp4",
+      caption: fromCache
+        ? `✅ Berhasil didownload (dari cache).\n🔗 ${url}`
+        : `✅ Berhasil didownload.\n🔗 ${url}`,
     });
   }
 }
