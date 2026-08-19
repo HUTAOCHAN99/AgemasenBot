@@ -1206,6 +1206,23 @@ const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp";
 // bakal gagal/lambat banget dikirim lewat WhatsApp.
 const DL_MAX_FILESIZE = "95M";
 
+// URL base HTTP server "bgutil-ytdlp-pot-provider" (Proof-of-Origin Token
+// provider), kalau di-deploy sebagai service terpisah (mis. di Railway).
+// Ini yang bikin yt-dlp bisa generate token "bukti request dari browser
+// asli" tanpa perlu cookies/login akun YouTube sama sekali -- solusi buat
+// error "sign in to confirm you're not a bot" dari IP server/datacenter.
+//
+// WAJIB juga:
+//  1. Plugin Python-nya harus terinstall di server yang sama dengan
+//     binary yt-dlp: `pip install -U bgutil-ytdlp-pot-provider`
+//  2. Service HTTP provider-nya harus jalan terpisah & bisa diakses dari
+//     sini (baik di localhost kalau satu container, atau lewat Railway
+//     private networking / URL publik kalau service terpisah).
+//
+// Kalau env var ini KOSONG, fitur POT provider gak diaktifin -- bot tetap
+// jalan seperti biasa (cuma mengandalkan trik player_client di bawah).
+const YTDLP_POT_BASE_URL = process.env.YTDLP_POT_BASE_URL || "";
+
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(YTDLP_PATH, args);
@@ -1267,6 +1284,9 @@ function friendlyDlError(err) {
   if (/sign in to confirm|age.?restrict/i.test(raw)) {
     return "🔞 Video ini dibatasi umur oleh platformnya dan butuh login -- bot ini gak bisa login akun.";
   }
+  if (/bgutil.*(connection refused|econnrefused|failed to fetch|timed? ?out)/i.test(raw)) {
+    return "⚙️ POT provider (bgutil) gak bisa dihubungi dari server -- cek apakah service-nya masih jalan & YTDLP_POT_BASE_URL sudah benar.";
+  }
   if (
     /video unavailable|content isn.?t available|no longer available|this video (has been removed|is unavailable)/i.test(
       raw,
@@ -1327,18 +1347,30 @@ async function downloadMediaFromUrl(url, mode) {
     outputTemplate,
   ];
 
-  // Khusus YouTube: paksa pakai client android_vr/mweb duluan (bukan client
-  // "web" default yang paling sering kena "sign in to confirm you're not
-  // a bot" dari IP datacenter/cloud). Ini persis client yang otomatis
-  // dipilih yt-dlp waktu berhasil download dari IP rumah/residential --
-  // kalau server (mis. Railway) IP-nya kena curiga, client ini kadang
-  // masih lolos karena jalur verifikasinya beda dari client "web".
+  // Khusus YouTube: kasih tau yt-dlp cara nyelesein "signature/n challenge"
+  // (via Deno) dan token anti-bot (via POT provider). Client (android_vr,
+  // web_safari, mweb, dst) SENGAJA gak dipaksa/di-override -- terbukti dari
+  // testing, yt-dlp lebih sering berhasil kalau dibiarin milih sendiri
+  // client mana yang lolos, daripada dipaksa urutan tertentu.
   if (isYoutubeUrl(url)) {
-    commonArgs.push(
-      "--extractor-args",
-      "youtube:player_client=android_vr,mweb",
-    );
+    // Solver buat signature cipher & "n" challenge YouTube -- wajib ada,
+    // kalau nggak yt-dlp bakal buang banyak format (termasuk format yang
+    // udah dapat PO Token) dan jatuh ke format lama yang gampang 403.
+    commonArgs.push("--js-runtimes", "deno");
+    // Auto-download komponen challenge-solver terbaru dari GitHub kalau
+    // versi yang di-cache lokal ketinggalan zaman (YouTube sering ganti).
+    commonArgs.push("--remote-components", "ejs:github");
+
+    // Kalau POT provider di-set (lihat komentar YTDLP_POT_BASE_URL di
+    // atas), kasih tau yt-dlp lokasinya.
+    if (YTDLP_POT_BASE_URL) {
+      commonArgs.push(
+        "--extractor-args",
+        `youtubepot-bgutilhttp:base_url=${YTDLP_POT_BASE_URL}`,
+      );
+    }
   }
+
 
   const args =
     mode === "audio"
