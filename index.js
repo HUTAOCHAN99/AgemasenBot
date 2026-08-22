@@ -1837,33 +1837,69 @@ async function startBot() {
     // =====================
     if (/^\d+$/.test(text)) {
       const session = sessions.get(sessionKey);
+      const codeNum = parseInt(text, 10);
+      // Dihitung DULUAN (sebelum cek pending) supaya bisa dipakai sebagai
+      // fallback kalau angkanya ternyata bukan pilihan pending yang valid.
+      const codeSessionEarly = chatCodeSessions.get(jid)?.get(codeNum);
+
+      // Pending choice (pilih MP4/MP3 atau pilih karakter dari daftar) itu
+      // SENGAJA dianggap basi (expired) kalau udah lewat beberapa menit gak
+      // dijawab. Tanpa ini, pending yang gak pernah dijawab bakal nyangkut
+      // selamanya dan bikin nomor kode sesi (mis. kode 1) gak akan pernah
+      // kebaca lagi -- ini penyebab utama kasus "pilihan 1 vs kode 1 bentrok,
+      // ujung-ujungnya malah kebawa sesi lama".
+      const PENDING_TTL_MS = 5 * 60 * 1000; // 5 menit
+      if (
+        session?.pendingDlChoice &&
+        Date.now() - (session.pendingDlChoice.at || 0) > PENDING_TTL_MS
+      ) {
+        delete session.pendingDlChoice;
+      }
+      if (
+        session?.pendingTagChoices &&
+        Date.now() - (session.pendingTagChoicesAt || 0) > PENDING_TTL_MS
+      ) {
+        delete session.pendingTagChoices;
+        delete session.pendingTagChoicesAt;
+      }
 
       // Lagi nunggu pilihan MP4/MP3 dari !dl link YouTube?
       if (session?.pendingDlChoice) {
         if (text !== "1" && text !== "2") {
-          await sock.sendMessage(jid, {
-            text: "⚠️ Balas dengan *1* (MP4) atau *2* (MP3) ya.",
-          });
+          // Bukan 1/2 -> mungkin maksudnya kode sesi, bukan salah ketik.
+          // Cek dulu sebelum langsung dianggap error.
+          if (!codeSessionEarly) {
+            await sock.sendMessage(jid, {
+              text: "⚠️ Balas dengan *1* (MP4) atau *2* (MP3) ya.",
+            });
+            return;
+          }
+          delete session.pendingDlChoice; // buang, jatuhkan ke cek kode sesi di bawah
+        } else {
+          const { url } = session.pendingDlChoice;
+          sessions.delete(sessionKey);
+          await handleDlDownload(sock, jid, url, text === "1" ? "video" : "audio");
           return;
         }
-
-        const { url } = session.pendingDlChoice;
-        sessions.delete(sessionKey);
-        await handleDlDownload(sock, jid, url, text === "1" ? "video" : "audio");
-        return;
       }
 
       if (session?.pendingTagChoices) {
-        const idx = parseInt(text, 10) - 1;
+        const idx = codeNum - 1;
         const choice = session.pendingTagChoices[idx];
 
         if (!choice) {
-          await sock.sendMessage(jid, {
-            text: `⚠️ Nomor tidak valid. Pilih 1-${session.pendingTagChoices.length}.`,
-          });
-          return;
-        }
-
+          // Nomornya di luar rentang daftar pilihan -> mungkin maksudnya
+          // kode sesi yang lagi aktif, bukan salah ketik. Cek dulu sebelum
+          // langsung dianggap "nomor tidak valid".
+          if (!codeSessionEarly) {
+            await sock.sendMessage(jid, {
+              text: `⚠️ Nomor tidak valid. Pilih 1-${session.pendingTagChoices.length}.`,
+            });
+            return;
+          }
+          delete session.pendingTagChoices; // buang, jatuhkan ke cek kode sesi di bawah
+          delete session.pendingTagChoicesAt;
+        } else {
         try {
           const candidates = await fetchCandidates(choice.name);
 
@@ -1889,6 +1925,7 @@ async function startBot() {
         }
 
         return;
+        }
       }
 
       // Bukan lagi soal daftar disambiguasi milik pengirim ini -> cek apakah
@@ -1897,8 +1934,7 @@ async function startBot() {
       // yang sama boleh pakai kode punya orang lain buat lanjut (!next)
       // pencarian itu, dan ini tidak bentrok dengan kode punya pencarian
       // lain karena tiap pencarian dapat nomor kodenya sendiri-sendiri.
-      const codeNum = parseInt(text, 10);
-      const codeSession = chatCodeSessions.get(jid)?.get(codeNum);
+      const codeSession = codeSessionEarly;
 
       if (codeSession) {
         try {
@@ -2183,7 +2219,10 @@ async function startBot() {
           return;
         }
 
-        sessions.set(sessionKey, { pendingTagChoices: matches });
+        sessions.set(sessionKey, {
+          pendingTagChoices: matches,
+          pendingTagChoicesAt: Date.now(),
+        });
 
         await sock.sendMessage(jid, {
           text: buildTagChoiceList(matches),
@@ -2316,7 +2355,7 @@ async function startBot() {
 
       // Link YouTube tanpa format eksplisit -> tanya dulu MP4 atau MP3.
       if (isYoutubeUrl(url) && hint !== "mp3" && hint !== "mp4" && hint !== "audio" && hint !== "video") {
-        sessions.set(sessionKey, { pendingDlChoice: { url } });
+        sessions.set(sessionKey, { pendingDlChoice: { url, at: Date.now() } });
         await sock.sendMessage(jid, {
           text:
             "📥 *Link YouTube terdeteksi*\n\nMau download dalam bentuk apa?\n\n[1] 🎬 MP4 (Video)\n[2] 🎵 MP3 (Audio)\n\n_Balas pesan ini dengan angka 1 atau 2._",
