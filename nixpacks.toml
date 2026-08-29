@@ -1,0 +1,29 @@
+# nixpacks.toml
+#
+# Konfigurasi build custom untuk Railway (Nixpacks) supaya binary "yt-dlp"
+# ikut ke-download otomatis setiap kali project ini di-build/deploy ulang.
+#
+# Ini bagian dari setup "yt-dlp-rescue" -- lihat komentar panjang di
+# index.js (cari "Fitur: Download media dari link") untuk penjelasan
+# lengkap kenapa yt-dlp butuh di-install terpisah dari dependency npm
+# project ini.
+#
+# Setelah nambah file ini, JANGAN LUPA set environment variable di
+# Railway (tab Variables):
+#
+#   YTDLP_PATH = /app/yt-dlp
+#
+# Kalau env var ini tidak di-set, bot tetap jalan tapi fitur "!dl" akan
+# selalu gagal dengan pesan "yt-dlp tidak ditemukan di server", karena
+# bot akan coba cari command "yt-dlp" di PATH sistem (yang kosong di
+# container Railway ini) alih-alih di /app/yt-dlp.
+
+[phases.install]
+cmds = [
+  "npm ci",
+  # yt-dlp_linux = binary standalone (PyInstaller build), TIDAK butuh
+  # Python system terpisah -- paling aman buat container Railway yang
+  # base image-nya cuma Node.js.
+  "curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /app/yt-dlp",
+  "chmod a+rx /app/yt-dlp"
+]
