@@ -1557,11 +1557,22 @@ async function downloadMediaFromUrl(url, mode) {
           //     video yang paling dibatasin sekalipun, bukannya gagal
           //     total kena "Requested format is not available".
           //
+          // CATATAN: filter [filesize<95M] SENGAJA TIDAK dipakai di sini
+          // (walau versi sebelumnya ada). Filter itu cuma ngecek field
+          // "filesize" PASTI -- format yang cuma punya "filesize_approx"
+          // (kayak itag 18 pas mode SABR, ditandai simbol "\u2248" di
+          // --list-formats) bakal KETOLAK filter itu walau ukuran
+          // aslinya kecil, bikin selector gagal total ("Requested format
+          // is not available") padahal ada format yang muat. Batas
+          // ukuran file tetap ditegakkan lewat flag --max-filesize
+          // (lihat DL_MAX_FILESIZE di atas), yang otomatis
+          // mempertimbangkan filesize_approx juga.
+          //
           // 4 tingkat fallback: DASH avc1+mp4a max 720p -> progresif
           // avc1 max 720p -> apa pun max 720p (asal masih >=360p) ->
           // pamungkas "apa aja yang penting kebentuk" (kalau video-nya
           // emang cuma punya format di luar rentang itu).
-          "bestvideo[height<=720][vcodec^=avc1][filesize<95M]+bestaudio[acodec^=mp4a][filesize<95M]/best[height<=720][vcodec^=avc1][filesize<95M]/best[height<=720][height>=360][filesize<95M]/best",
+          "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=720][vcodec^=avc1]/best[height<=720][height>=360]/best",
           "--merge-output-format",
           "mp4",
           url,
