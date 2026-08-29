@@ -1237,19 +1237,21 @@ async function stickerToImageBuffer(buffer) {
 // YouTube (video/short), Bilibili, Facebook (video/reel/postingan video),
 // TikTok, Instagram, Twitter/X, dst -- semua situs yang didukung yt-dlp.
 //
-// Dukungan YouTube pakai resep dari "yt-dlp-rescue" buat 2 masalah utama:
-//   1. SABR throttle -- client "web" default YouTube sekarang cuma kasih
-//      1 format progresif 360p, MENTAH-MENTAH ngabaiin filter kualitas apa
-//      pun. Solusinya: rotasi beberapa player_client (web, android_vr,
-//      tv_downgraded) via --extractor-args, biar yt-dlp dapet katalog
-//      format DASH lengkap (144p~4K) dari client mana pun yang berhasil.
-//   2. Deteksi bot di IP cloud/datacenter (Railway/AWS/GCP dst) -- solusinya
-//      --js-runtimes node (Node.js SUDAH terinstall buat project ini
-//      sendiri, jadi gak butuh install Deno terpisah kayak versi lama) buat
-//      nyelesein signature/n challenge, plus opsional PO Token server
-//      (lihat YTDLP_POT_BASE_URL) buat kasus yang masih diblokir.
-// --force-ipv4 juga ditambahin buat cegah masalah routing IPv6 di beberapa
-// cloud provider.
+// Dukungan YouTube awalnya dibangun dari resep "yt-dlp-rescue" (Maret
+// 2026) buat 2 masalah utama: SABR throttle (client "web" default cuma
+// kasih 1 format 360p) & deteksi bot di IP cloud/datacenter. TAPI per
+// Agustus 2026, sebagian resep itu sudah basi -- lihat komentar detail di
+// bagian "Khusus YouTube" di bawah (dalam downloadMediaFromUrl) buat
+// histori kenapa override player_client dihapus.
+//
+// Yang MASIH dipakai sekarang:
+//   - --js-runtimes node (Node.js SUDAH terinstall buat project ini
+//     sendiri) buat nyelesein signature/n challenge.
+//   - --force-ipv4, cegah masalah routing IPv6 di beberapa cloud provider.
+//   - Opsional PO Token server (lihat YTDLP_POT_BASE_URL) buat kasus
+//     yang masih kena deteksi bot -- SANGAT DIREKOMENDASIKAN buat
+//     deployment cloud/server (Railway dst), karena IP datacenter jauh
+//     lebih sering diblokir YouTube dibanding IP residensial biasa.
 //
 // PENTING: ini butuh binary "yt-dlp" TERINSTALL DI SERVER, terpisah dari
 // dependency npm project ini (npm wrapper yt-dlp-exec ternyata rapuh --
@@ -1280,6 +1282,23 @@ const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp";
 //     kalau satu container, atau URL publik/private networking Railway
 //     kalau service terpisah).
 const YTDLP_POT_BASE_URL = process.env.YTDLP_POT_BASE_URL || "";
+
+// Fallback PALING GAMPANG (tapi paling gak scalable) buat kasus deteksi bot
+// "Sign in to confirm you're not a bot": --cookies-from-browser, ambil
+// cookies YouTube langsung dari browser lokal yang sudah login.
+//
+// HANYA cocok buat TESTING DI LAPTOP SENDIRI (bukan Railway/cloud server)
+// karena:
+//   - Butuh browser beneran terinstall & sudah login YouTube di MESIN YANG
+//     SAMA tempat yt-dlp jalan -- di container Railway gak ada browser.
+//   - Cookies akun pribadi kepakai buat semua request bot -- kalau bot
+//     dipakai banyak orang & sering, akun YouTube-nya sendiri yang bisa
+//     kena flag/rate-limit, bukan cuma IP server-nya.
+//   - Cookies expire & perlu login ulang di browser dari waktu ke waktu.
+//
+// Isi dengan nama browser yang dipakai: "chrome", "edge", "firefox", dst.
+// Opsional -- kosongkan (default) buat nonaktifin.
+const YTDLP_COOKIES_FROM_BROWSER = process.env.YTDLP_COOKIES_FROM_BROWSER || "";
 
 // Batas ukuran file hasil download, biar gak nyoba kirim file raksasa yang
 // bakal gagal/lambat banget dikirim lewat WhatsApp.
@@ -1452,20 +1471,26 @@ async function downloadMediaFromUrl(url, mode) {
     outputTemplate,
   ];
 
-  // Khusus YouTube (resep dari yt-dlp-rescue): client "web" default
-  // sekarang sering di-throttle YouTube ke 1 format progresif 360p doang
-  // (SABR), MENGABAIKAN filter kualitas apa pun. Fix-nya: rotasi beberapa
-  // player_client sekaligus lewat --extractor-args, biar yt-dlp nemu
-  // katalog format DASH lengkap dari client mana pun yang berhasil
-  // (gak perlu dipaksa urutan tertentu -- yt-dlp otomatis pilih yang
-  // lolos). player_skip=webpage ngurangin jumlah HTTP call ke YouTube
-  // (lebih kecil kemungkinan numpuk ke rate-limit).
+  // Khusus YouTube.
+  //
+  // CATATAN (Agustus 2026): resep asli "yt-dlp-rescue" (dibuat Maret 2026)
+  // MEMAKSA rotasi player_client=web,android_vr,tv_downgraded buat ngakalin
+  // SABR throttle yang saat itu terjadi di client "web" default. TAPI
+  // setelah dites ulang dengan yt-dlp versi terbaru (2026.08+) + PO Token
+  // provider (bgutil) yang jalan, memaksa client lama ini JUSTRU memicu
+  // "Sign in to confirm you're not a bot" -- sementara TIDAK menyertakan
+  // --extractor-args player_client sama sekali (biarin yt-dlp milih
+  // client-nya sendiri) malah berhasil mulus dapat kualitas penuh.
+  //
+  // Kesimpulannya: yt-dlp versi baru + POT provider sudah cukup pintar
+  // milih & rotasi client sendiri secara internal -- override manual di
+  // sini malah mengganggu logikanya. Makanya baris --extractor-args
+  // player_client DIHAPUS. Kalau suatu saat YouTube berubah lagi dan
+  // kualitas balik ke-throttle 360p, baru pertimbangkan nambahin
+  // override lagi -- tapi test manual dulu (yt-dlp -v URL, tanpa lewat
+  // bot) sebelum hardcode balik ke sini, karena resep lama bisa basi
+  // lagi kapan aja seiring yt-dlp/YouTube berubah.
   if (isYoutubeUrl(url)) {
-    commonArgs.push(
-      "--extractor-args",
-      "youtube:player_client=web,android_vr,tv_downgraded;player_skip=webpage",
-    );
-
     // Cegah masalah routing IPv6 yang lumayan sering kejadian di
     // beberapa cloud provider (Railway/AWS/GCP dst).
     commonArgs.push("--force-ipv4");
@@ -1485,6 +1510,12 @@ async function downloadMediaFromUrl(url, mode) {
         "--extractor-args",
         `youtubepot-bgutilhttp:base_url=${YTDLP_POT_BASE_URL}`,
       );
+    }
+
+    // Fallback cookies-from-browser (lihat komentar YTDLP_COOKIES_FROM_BROWSER
+    // di atas) -- hanya diaktifin kalau env var-nya di-set.
+    if (YTDLP_COOKIES_FROM_BROWSER) {
+      commonArgs.push("--cookies-from-browser", YTDLP_COOKIES_FROM_BROWSER);
     }
   }
 
