@@ -1545,10 +1545,23 @@ async function downloadMediaFromUrl(url, mode) {
           // dimainin di player berbasis browser (WA Web/Chrome), TAPI
           // player video native di app WA HP kebanyakan cuma jamin
           // dukung H.264+AAC -- makanya video ke-download tapi gak bisa
-          // dibuka di HP. Ada 3 tingkat fallback: avc1+mp4a gabungan,
-          // lalu avc1+mp4a pre-merged (format lama kayak 18/22), baru
-          // fallback paling akhir ke "apa aja yang penting kebentuk".
-          "bestvideo[vcodec^=avc1][filesize<95M]+bestaudio[acodec^=mp4a][filesize<95M]/best[vcodec^=avc1][filesize<95M]/best[filesize<95M]/best",
+          // dibuka di HP.
+          //
+          // Kualitas dibatasi 360p-720p (bukan "sebesar-besarnya"):
+          //   - Atas (720p): cukup buat nonton normal, gak perlu 1080p/4K
+          //     yang bikin file gede & lama diproses/dikirim ke WhatsApp.
+          //   - Bawah (360p): ini juga kebetulan pas sama batas bawah
+          //     yang masih sering YouTube kasih walau lagi mode SABR
+          //     (server cuma ngasih 1 format progresif kayak itag 18,
+          //     360p) -- jadi selector ini tetap dapet sesuatu di kasus
+          //     video yang paling dibatasin sekalipun, bukannya gagal
+          //     total kena "Requested format is not available".
+          //
+          // 4 tingkat fallback: DASH avc1+mp4a max 720p -> progresif
+          // avc1 max 720p -> apa pun max 720p (asal masih >=360p) ->
+          // pamungkas "apa aja yang penting kebentuk" (kalau video-nya
+          // emang cuma punya format di luar rentang itu).
+          "bestvideo[height<=720][vcodec^=avc1][filesize<95M]+bestaudio[acodec^=mp4a][filesize<95M]/best[height<=720][vcodec^=avc1][filesize<95M]/best[height<=720][height>=360][filesize<95M]/best",
           "--merge-output-format",
           "mp4",
           url,
