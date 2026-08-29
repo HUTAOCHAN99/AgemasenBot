@@ -465,19 +465,19 @@ Ubah stiker jadi gambar biasa (PNG). Kalau stikernya animasi, yang diambil cuma 
 
   dl: `📥 *!dl <link>*
 
-Download video/audio dari sebuah link: YouTube, Bilibili, Facebook (video/reel/postingan video), TikTok, Instagram, X/Twitter, dan situs lain yang didukung.
+Download video/audio dari sebuah link: Bilibili, Facebook (video/reel/postingan video), TikTok, Instagram, X/Twitter, dan situs lain yang didukung.
 
-*Khusus link YouTube:* nanti dikasih pilihan mau *MP4* (video) atau *MP3* (audio) -- tinggal balas angka *1* atau *2*.
+⚠️ *Link YouTube belum didukung saat ini.*
 
 *Contoh:*
 \`\`\`
-!dl https://youtu.be/xxxxxxxxxxx
-!dl https://youtu.be/xxxxxxxxxxx mp3
+!dl https://www.tiktok.com/@user/video/xxxxxxxxxxx
 !dl https://www.bilibili.com/video/xxxxxxxxxxx
 !dl https://www.facebook.com/reel/xxxxxxxxxxx
+!dl https://www.bilibili.com/video/xxxxxxxxxxx mp3
 \`\`\`
 
-Bisa langsung tambahin *mp3* atau *mp4* setelah link-nya (khusus YouTube) kalau males milih pakai angka.
+Bisa langsung tambahin *mp3* atau *mp4* setelah link-nya kalau mau override format audio/video.
 
 ⚠️ Batas ukuran file *95MB*. Postingan Facebook yang isinya cuma FOTO (bukan video) tidak didukung -- ini murni buat video/audio.`,
 };
@@ -1183,9 +1183,13 @@ async function stickerToImageBuffer(buffer) {
 
 // =====================================================
 // Fitur: Download media dari link ("!dl")
-// YouTube (video/short, pilihan MP4 atau MP3), Bilibili, Facebook
-// (video/reel/postingan video), TikTok, Instagram, Twitter/X, dst --
-// pada dasarnya semua situs yang didukung yt-dlp (1000+ situs).
+// Bilibili, Facebook (video/reel/postingan video), TikTok, Instagram,
+// Twitter/X, dst -- situs-situs non-YouTube yang didukung yt-dlp.
+//
+// CATATAN: dukungan YouTube SENGAJA dihapus dari sini (lagi dirombak
+// ulang terpisah). Kalau butuh nambahin lagi nanti, lihat riwayat git
+// untuk versi sebelumnya (deteksi URL YouTube, argumen --js-runtimes /
+// --remote-components / POT provider, cache per video ID, dst).
 //
 // PENTING: ini butuh binary "yt-dlp" TERINSTALL DI SERVER, terpisah dari
 // dependency npm project ini (npm wrapper yt-dlp-exec ternyata rapuh --
@@ -1205,70 +1209,6 @@ const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp";
 // Batas ukuran file hasil download, biar gak nyoba kirim file raksasa yang
 // bakal gagal/lambat banget dikirim lewat WhatsApp.
 const DL_MAX_FILESIZE = "95M";
-
-// URL base HTTP server "bgutil-ytdlp-pot-provider" (Proof-of-Origin Token
-// provider), kalau di-deploy sebagai service terpisah (mis. di Railway).
-// Ini yang bikin yt-dlp bisa generate token "bukti request dari browser
-// asli" tanpa perlu cookies/login akun YouTube sama sekali -- solusi buat
-// error "sign in to confirm you're not a bot" dari IP server/datacenter.
-//
-// WAJIB juga:
-//  1. Plugin Python-nya harus terinstall di server yang sama dengan
-//     binary yt-dlp: `pip install -U bgutil-ytdlp-pot-provider`
-//  2. Service HTTP provider-nya harus jalan terpisah & bisa diakses dari
-//     sini (baik di localhost kalau satu container, atau lewat Railway
-//     private networking / URL publik kalau service terpisah).
-//
-// Kalau env var ini KOSONG, fitur POT provider gak diaktifin -- bot tetap
-// jalan seperti biasa (cuma mengandalkan trik player_client di bawah).
-const YTDLP_POT_BASE_URL = process.env.YTDLP_POT_BASE_URL || "";
-
-// =====================================================
-// CACHE -- video yang sama (video ID + mode) yang sudah pernah didownload
-// disimpan di sini, biar request berikutnya (dari user yang sama atau user
-// lain) gak perlu hit YouTube lagi sama sekali. Ini juga yang paling efektif
-// nurunin resiko kena rate-limit (429)/deteksi bot, karena request ke
-// YouTube jadi jauh lebih jarang.
-//
-// Catatan: cache ini di tmpdir, jadi otomatis kosong lagi tiap kali service
-// Railway di-restart/redeploy -- itu sudah cukup, gak perlu disimpan
-// permanen selamanya.
-// =====================================================
-const DL_CACHE_DIR = path.join(os.tmpdir(), "botwa-dl-cache");
-try {
-  fs.mkdirSync(DL_CACHE_DIR, { recursive: true });
-} catch {
-  // abaikan -- kalau gagal bikin folder cache, fitur cache cuma jadi
-  // gak aktif (selalu cache-miss), bot tetap jalan normal
-}
-
-// Ambil video ID YouTube dari berbagai bentuk URL (watch?v=, youtu.be/,
-// /shorts/). Dipakai sebagai key cache. Return null kalau gagal diparse
-// (mis. link playlist tanpa ID tunggal) -- artinya cache di-skip.
-function extractYoutubeVideoId(url) {
-  try {
-    const u = new URL(url);
-    const host = u.hostname.replace(/^www\./, "");
-    if (host === "youtu.be") return u.pathname.slice(1).split("/")[0] || null;
-    if (host === "youtube.com" || host === "m.youtube.com") {
-      if (u.pathname.startsWith("/shorts/")) {
-        return u.pathname.split("/")[2] || null;
-      }
-      return u.searchParams.get("v");
-    }
-  } catch {
-    // url tidak valid
-  }
-  return null;
-}
-
-// Ekstensi hasil download sudah pasti (lihat downloadMediaFromUrl: mode
-// "video" selalu di-merge jadi .mp4, mode "audio" selalu di-extract jadi
-// .mp3), jadi nama file cache bisa ditentukan di awal tanpa nunggu hasil.
-function cachePathFor(videoId, mode) {
-  const ext = mode === "audio" ? "mp3" : "mp4";
-  return path.join(DL_CACHE_DIR, `${videoId}-${mode}.${ext}`);
-}
 
 // =====================================================
 // QUEUE -- batasin berapa banyak proses yt-dlp yang boleh jalan BERSAMAAN.
@@ -1356,20 +1296,8 @@ function friendlyDlError(err) {
   if (/private video|video is private/i.test(raw)) {
     return "🔒 Videonya bersifat privat, gak bisa diakses tanpa login.";
   }
-  // PENTING: dicek DULUAN sebelum age-restrict, karena pesan ini pola
-  // katanya mirip ("sign in to confirm...") tapi artinya beda total --
-  // ini YouTube curiga IP server-nya bot/datacenter, BUKAN video-nya
-  // dibatasi umur. Kalau ini yang muncul dan berhasil di komputer lain
-  // (residential IP), berarti memang soal reputasi IP server, bukan
-  // soal video atau butuh login akun asli.
-  if (/sign in to confirm you.?re not a bot/i.test(raw)) {
-    return "🤖 YouTube mendeteksi server bot ini sebagai traffic mencurigakan (umum terjadi di IP cloud/datacenter kayak Railway/AWS/GCP) -- ini BUKAN soal video dibatasi umur. Solusinya butuh cookies akun YouTube asli di server, atau ganti ke IP residential/proxy.";
-  }
   if (/sign in to confirm|age.?restrict/i.test(raw)) {
     return "🔞 Video ini dibatasi umur oleh platformnya dan butuh login -- bot ini gak bisa login akun.";
-  }
-  if (/bgutil.*(connection refused|econnrefused|failed to fetch|timed? ?out)/i.test(raw)) {
-    return "⚙️ POT provider (bgutil) gak bisa dihubungi dari server -- cek apakah service-nya masih jalan & YTDLP_POT_BASE_URL sudah benar.";
   }
   if (
     /video unavailable|content isn.?t available|no longer available|this video (has been removed|is unavailable)/i.test(
@@ -1400,7 +1328,7 @@ function friendlyDlError(err) {
 }
 
 // Deteksi link YouTube (termasuk youtu.be & Shorts) -- dipakai buat
-// nentuin kapan harus nanya pilihan MP4/MP3 dulu.
+// nolak link YouTube di "!dl" (dukungannya lagi dirombak ulang terpisah).
 function isYoutubeUrl(url) {
   try {
     const host = new URL(url).hostname.replace(/^www\./, "");
@@ -1412,9 +1340,8 @@ function isYoutubeUrl(url) {
 
 // mode: "video" -> MP4 (gabungan video+audio terbaik dalam batas ukuran)
 //       "audio" -> MP3 (audio-only, hasil ekstraksi)
-// Dipakai buat YouTube (pilihan) DAN situs lain (langsung mode "video"),
-// jadi generik untuk Bilibili, Facebook (video/reel/postingan video),
-// TikTok, Instagram, X/Twitter, dst -- apa pun yang didukung yt-dlp.
+// Generik untuk Bilibili, Facebook (video/reel/postingan video), TikTok,
+// Instagram, X/Twitter, dst -- situs non-YouTube yang didukung yt-dlp.
 async function downloadMediaFromUrl(url, mode) {
   const tmpDir = os.tmpdir();
   const uid = crypto.randomBytes(6).toString("hex");
@@ -1435,31 +1362,6 @@ async function downloadMediaFromUrl(url, mode) {
     "-o",
     outputTemplate,
   ];
-
-  // Khusus YouTube: kasih tau yt-dlp cara nyelesein "signature/n challenge"
-  // (via Deno) dan token anti-bot (via POT provider). Client (android_vr,
-  // web_safari, mweb, dst) SENGAJA gak dipaksa/di-override -- terbukti dari
-  // testing, yt-dlp lebih sering berhasil kalau dibiarin milih sendiri
-  // client mana yang lolos, daripada dipaksa urutan tertentu.
-  if (isYoutubeUrl(url)) {
-    // Solver buat signature cipher & "n" challenge YouTube -- wajib ada,
-    // kalau nggak yt-dlp bakal buang banyak format (termasuk format yang
-    // udah dapat PO Token) dan jatuh ke format lama yang gampang 403.
-    commonArgs.push("--js-runtimes", "deno");
-    // Auto-download komponen challenge-solver terbaru dari GitHub kalau
-    // versi yang di-cache lokal ketinggalan zaman (YouTube sering ganti).
-    commonArgs.push("--remote-components", "ejs:github");
-
-    // Kalau POT provider di-set (lihat komentar YTDLP_POT_BASE_URL di
-    // atas), kasih tau yt-dlp lokasinya.
-    if (YTDLP_POT_BASE_URL) {
-      commonArgs.push(
-        "--extractor-args",
-        `youtubepot-bgutilhttp:base_url=${YTDLP_POT_BASE_URL}`,
-      );
-    }
-  }
-
 
   const args =
     mode === "audio"
@@ -1526,19 +1428,7 @@ async function downloadMediaFromUrl(url, mode) {
 }
 
 async function handleDlDownload(sock, jid, url, mode) {
-  const videoId = isYoutubeUrl(url) ? extractYoutubeVideoId(url) : null;
-  const cachePath = videoId ? cachePathFor(videoId, mode) : null;
-
   try {
-    // 1. CACHE CHECK -- video (+ mode) ini udah pernah didownload sebelumnya?
-    // Kalau ya, langsung kirim file lama, gak usah hit YouTube lagi.
-    if (cachePath && fs.existsSync(cachePath)) {
-      console.log(`[dl] cache hit: ${cachePath}`);
-      const buffer = fs.readFileSync(cachePath);
-      await sendDownloadedMedia(sock, jid, buffer, mode, url, true);
-      return;
-    }
-
     await sock.sendMessage(jid, {
       text:
         mode === "audio"
@@ -1546,20 +1436,11 @@ async function handleDlDownload(sock, jid, url, mode) {
           : "⏳ Download video, tunggu ya...",
     });
 
-    // 2. Cache miss -> masuk QUEUE, biar gak numpuk proses yt-dlp jalan
-    // bersamaan kalau lagi banyak yang minta download sekaligus.
+    // masuk QUEUE, biar gak numpuk proses yt-dlp jalan bersamaan kalau
+    // lagi banyak yang minta download sekaligus.
     const { buffer } = await enqueueDownloadJob(() =>
       downloadMediaFromUrl(url, mode),
     );
-
-    // 3. Simpan ke cache (kalau ini video YouTube) buat request berikutnya.
-    if (cachePath) {
-      try {
-        fs.writeFileSync(cachePath, buffer);
-      } catch (e) {
-        console.error("[dl] gagal simpan ke cache:", e.message);
-      }
-    }
 
     await sendDownloadedMedia(sock, jid, buffer, mode, url, false);
   } catch (err) {
@@ -1837,69 +1718,18 @@ async function startBot() {
     // =====================
     if (/^\d+$/.test(text)) {
       const session = sessions.get(sessionKey);
-      const codeNum = parseInt(text, 10);
-      // Dihitung DULUAN (sebelum cek pending) supaya bisa dipakai sebagai
-      // fallback kalau angkanya ternyata bukan pilihan pending yang valid.
-      const codeSessionEarly = chatCodeSessions.get(jid)?.get(codeNum);
-
-      // Pending choice (pilih MP4/MP3 atau pilih karakter dari daftar) itu
-      // SENGAJA dianggap basi (expired) kalau udah lewat beberapa menit gak
-      // dijawab. Tanpa ini, pending yang gak pernah dijawab bakal nyangkut
-      // selamanya dan bikin nomor kode sesi (mis. kode 1) gak akan pernah
-      // kebaca lagi -- ini penyebab utama kasus "pilihan 1 vs kode 1 bentrok,
-      // ujung-ujungnya malah kebawa sesi lama".
-      const PENDING_TTL_MS = 5 * 60 * 1000; // 5 menit
-      if (
-        session?.pendingDlChoice &&
-        Date.now() - (session.pendingDlChoice.at || 0) > PENDING_TTL_MS
-      ) {
-        delete session.pendingDlChoice;
-      }
-      if (
-        session?.pendingTagChoices &&
-        Date.now() - (session.pendingTagChoicesAt || 0) > PENDING_TTL_MS
-      ) {
-        delete session.pendingTagChoices;
-        delete session.pendingTagChoicesAt;
-      }
-
-      // Lagi nunggu pilihan MP4/MP3 dari !dl link YouTube?
-      if (session?.pendingDlChoice) {
-        if (text !== "1" && text !== "2") {
-          // Bukan 1/2 -> mungkin maksudnya kode sesi, bukan salah ketik.
-          // Cek dulu sebelum langsung dianggap error.
-          if (!codeSessionEarly) {
-            await sock.sendMessage(jid, {
-              text: "⚠️ Balas dengan *1* (MP4) atau *2* (MP3) ya.",
-            });
-            return;
-          }
-          delete session.pendingDlChoice; // buang, jatuhkan ke cek kode sesi di bawah
-        } else {
-          const { url } = session.pendingDlChoice;
-          sessions.delete(sessionKey);
-          await handleDlDownload(sock, jid, url, text === "1" ? "video" : "audio");
-          return;
-        }
-      }
 
       if (session?.pendingTagChoices) {
-        const idx = codeNum - 1;
+        const idx = parseInt(text, 10) - 1;
         const choice = session.pendingTagChoices[idx];
 
         if (!choice) {
-          // Nomornya di luar rentang daftar pilihan -> mungkin maksudnya
-          // kode sesi yang lagi aktif, bukan salah ketik. Cek dulu sebelum
-          // langsung dianggap "nomor tidak valid".
-          if (!codeSessionEarly) {
-            await sock.sendMessage(jid, {
-              text: `⚠️ Nomor tidak valid. Pilih 1-${session.pendingTagChoices.length}.`,
-            });
-            return;
-          }
-          delete session.pendingTagChoices; // buang, jatuhkan ke cek kode sesi di bawah
-          delete session.pendingTagChoicesAt;
-        } else {
+          await sock.sendMessage(jid, {
+            text: `⚠️ Nomor tidak valid. Pilih 1-${session.pendingTagChoices.length}.`,
+          });
+          return;
+        }
+
         try {
           const candidates = await fetchCandidates(choice.name);
 
@@ -1925,7 +1755,6 @@ async function startBot() {
         }
 
         return;
-        }
       }
 
       // Bukan lagi soal daftar disambiguasi milik pengirim ini -> cek apakah
@@ -1934,7 +1763,8 @@ async function startBot() {
       // yang sama boleh pakai kode punya orang lain buat lanjut (!next)
       // pencarian itu, dan ini tidak bentrok dengan kode punya pencarian
       // lain karena tiap pencarian dapat nomor kodenya sendiri-sendiri.
-      const codeSession = codeSessionEarly;
+      const codeNum = parseInt(text, 10);
+      const codeSession = chatCodeSessions.get(jid)?.get(codeNum);
 
       if (codeSession) {
         try {
@@ -2219,10 +2049,7 @@ async function startBot() {
           return;
         }
 
-        sessions.set(sessionKey, {
-          pendingTagChoices: matches,
-          pendingTagChoicesAt: Date.now(),
-        });
+        sessions.set(sessionKey, { pendingTagChoices: matches });
 
         await sock.sendMessage(jid, {
           text: buildTagChoiceList(matches),
@@ -2353,12 +2180,11 @@ async function startBot() {
         return;
       }
 
-      // Link YouTube tanpa format eksplisit -> tanya dulu MP4 atau MP3.
-      if (isYoutubeUrl(url) && hint !== "mp3" && hint !== "mp4" && hint !== "audio" && hint !== "video") {
-        sessions.set(sessionKey, { pendingDlChoice: { url, at: Date.now() } });
+      // Dukungan download YouTube sengaja dihapus (lagi dirombak ulang) --
+      // link non-YouTube tetap jalan seperti biasa lewat yt-dlp.
+      if (isYoutubeUrl(url)) {
         await sock.sendMessage(jid, {
-          text:
-            "📥 *Link YouTube terdeteksi*\n\nMau download dalam bentuk apa?\n\n[1] 🎬 MP4 (Video)\n[2] 🎵 MP3 (Audio)\n\n_Balas pesan ini dengan angka 1 atau 2._",
+          text: "❌ Download dari YouTube belum tersedia saat ini.",
         });
         return;
       }
