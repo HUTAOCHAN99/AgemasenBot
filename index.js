@@ -19,10 +19,24 @@ const sharp = require("sharp");
 
 // =====================================================
 // Session per pengguna (bukan per chat/grup)
-// key -> { tag, pool: [post,...], lastId }
+// key -> { tag, pool: [post,...], lastId, lastUsed }
 // pool = sisa kandidat yang belum ditampilkan ke user ini
+//
+// EXPIRY: tiap session punya `lastUsed` (timestamp), di-update setiap kali
+// session itu dipakai/dibuat (!img, !next, ketik kode sesi). Session yang
+// sudah 24 jam TIDAK dipakai sama sekali akan otomatis dibuang lewat
+// sweepExpiredSessions() -- lihat setInterval di bawah. Ini rolling per
+// session (bukan reset serentak semua sesi tiap 24 jam sejak bot nyala),
+// jadi sesi yang masih aktif dipakai gak akan hilang tiba-tiba.
 // =====================================================
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 jam
 const sessions = new Map();
+
+// Tandain session baru saja dipakai/dibuat -- reset hitungan 24 jamnya.
+function touchSession(session) {
+  session.lastUsed = Date.now();
+  return session;
+}
 
 // =====================================================
 // Kode sesi per-chat (BUKAN per-pengirim)
@@ -55,6 +69,44 @@ function assignSessionCode(jid, session) {
 
   return next;
 }
+
+// Buang semua session yang sudah 24 jam TIDAK disentuh (lihat SESSION_TTL_MS
+// & touchSession di atas). Dijalanin berkala lewat setInterval (lihat bawah
+// startBot), bukan cuma sekali pas start, supaya sesi lama otomatis kebuang
+// walau bot jalan berhari-hari tanpa restart.
+function sweepExpiredSessions() {
+  const now = Date.now();
+
+  // 1. Sesi utama (key = per-pengirim). pendingTagChoices juga ikut kena
+  // sweep di sini karena disimpan di Map yang sama.
+  for (const [key, session] of sessions) {
+    if (now - (session.lastUsed || 0) > SESSION_TTL_MS) {
+      sessions.delete(key);
+    }
+  }
+
+  // 2. Kode sesi per-chat. Objeknya reference yang sama dengan di atas,
+  // jadi cukup cek `lastUsed` yang sama juga -- kalau sudah expired,
+  // buang entry kodenya, dan kalau map kode chat itu jadi kosong, buang
+  // sekalian mapnya (chatNextCode dibiarin jalan terus, aman kalau
+  // kepakai lagi nanti -- cuma nomor urut kode, bukan data sensitif).
+  for (const [jid, codeMap] of chatCodeSessions) {
+    for (const [code, session] of codeMap) {
+      if (now - (session.lastUsed || 0) > SESSION_TTL_MS) {
+        codeMap.delete(code);
+      }
+    }
+    if (codeMap.size === 0) chatCodeSessions.delete(jid);
+  }
+}
+
+// Jalanin sweep tiap 1 jam (bukan cuma sekali pas start). Ditaruh di scope
+// modul -- BUKAN di dalam startBot() -- karena startBot() bisa dipanggil
+// ulang tiap kali bot reconnect; kalau interval-nya ditaruh di dalam sana,
+// tiap reconnect bakal numpuk interval baru (leak). `unref()` dipakai
+// supaya interval ini gak nahan proses Node tetap hidup kalau semua kerjaan
+// lain sudah selesai (mis. pas dites via `node -e`, bukan lewat startBot).
+setInterval(sweepExpiredSessions, 60 * 60 * 1000).unref();
 
 // Safebooru's dapi menolak permintaan "limit" di atas 100 dalam satu request,
 // jadi buat ambil SEMUA post (tanpa batas), kita harus paging pakai "pid"
@@ -256,11 +308,11 @@ _Reply pesan ini dengan nomor urut karakter untuk melihat gambar_`;
 async function searchAndSendImage(sock, jid, sessionKey, tag, candidates) {
   const post = pickRandom(candidates);
 
-  const session = {
+  const session = touchSession({
     tag,
     pool: candidates,
     lastId: post.id,
-  };
+  });
 
   // Objek session yang sama dipakai baik di `sessions` (buat pemiliknya,
   // dipakai untuk "!next" ketik teks) maupun di `chatCodeSessions` (buat
@@ -465,19 +517,18 @@ Ubah stiker jadi gambar biasa (PNG). Kalau stikernya animasi, yang diambil cuma 
 
   dl: `📥 *!dl <link>*
 
-Download video/audio dari sebuah link: Bilibili, Facebook (video/reel/postingan video), TikTok, Instagram, X/Twitter, dan situs lain yang didukung.
-
-⚠️ *Link YouTube belum didukung saat ini.*
+Download video/audio dari sebuah link: YouTube, Bilibili, Facebook (video/reel/postingan video), TikTok, Instagram, X/Twitter, dan situs lain yang didukung.
 
 *Contoh:*
 \`\`\`
+!dl https://youtu.be/xxxxxxxxxxx
+!dl https://youtu.be/xxxxxxxxxxx mp3
 !dl https://www.tiktok.com/@user/video/xxxxxxxxxxx
 !dl https://www.bilibili.com/video/xxxxxxxxxxx
 !dl https://www.facebook.com/reel/xxxxxxxxxxx
-!dl https://www.bilibili.com/video/xxxxxxxxxxx mp3
 \`\`\`
 
-Bisa langsung tambahin *mp3* atau *mp4* setelah link-nya kalau mau override format audio/video.
+Bisa langsung tambahin *mp3* atau *mp4* setelah link-nya kalau mau override format audio/video (default: video).
 
 ⚠️ Batas ukuran file *95MB*. Postingan Facebook yang isinya cuma FOTO (bukan video) tidak didukung -- ini murni buat video/audio.`,
 };
@@ -1183,13 +1234,22 @@ async function stickerToImageBuffer(buffer) {
 
 // =====================================================
 // Fitur: Download media dari link ("!dl")
-// Bilibili, Facebook (video/reel/postingan video), TikTok, Instagram,
-// Twitter/X, dst -- situs-situs non-YouTube yang didukung yt-dlp.
+// YouTube (video/short), Bilibili, Facebook (video/reel/postingan video),
+// TikTok, Instagram, Twitter/X, dst -- semua situs yang didukung yt-dlp.
 //
-// CATATAN: dukungan YouTube SENGAJA dihapus dari sini (lagi dirombak
-// ulang terpisah). Kalau butuh nambahin lagi nanti, lihat riwayat git
-// untuk versi sebelumnya (deteksi URL YouTube, argumen --js-runtimes /
-// --remote-components / POT provider, cache per video ID, dst).
+// Dukungan YouTube pakai resep dari "yt-dlp-rescue" buat 2 masalah utama:
+//   1. SABR throttle -- client "web" default YouTube sekarang cuma kasih
+//      1 format progresif 360p, MENTAH-MENTAH ngabaiin filter kualitas apa
+//      pun. Solusinya: rotasi beberapa player_client (web, android_vr,
+//      tv_downgraded) via --extractor-args, biar yt-dlp dapet katalog
+//      format DASH lengkap (144p~4K) dari client mana pun yang berhasil.
+//   2. Deteksi bot di IP cloud/datacenter (Railway/AWS/GCP dst) -- solusinya
+//      --js-runtimes node (Node.js SUDAH terinstall buat project ini
+//      sendiri, jadi gak butuh install Deno terpisah kayak versi lama) buat
+//      nyelesein signature/n challenge, plus opsional PO Token server
+//      (lihat YTDLP_POT_BASE_URL) buat kasus yang masih diblokir.
+// --force-ipv4 juga ditambahin buat cegah masalah routing IPv6 di beberapa
+// cloud provider.
 //
 // PENTING: ini butuh binary "yt-dlp" TERINSTALL DI SERVER, terpisah dari
 // dependency npm project ini (npm wrapper yt-dlp-exec ternyata rapuh --
@@ -1205,6 +1265,21 @@ async function stickerToImageBuffer(buffer) {
 // convert ke MP3 tanpa butuh ffmpeg sistem.
 // =====================================================
 const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp";
+
+// URL base HTTP server "bgutil-ytdlp-pot-provider" (Proof-of-Origin Token
+// provider), KALAU mau di-deploy sebagai service terpisah (mis. di
+// Railway) buat kasus deteksi bot yang masih lolos walau sudah pakai
+// client rotation + --js-runtimes node.
+//
+// Opsional -- kalau env var ini KOSONG (default), fitur ini gak diaktifin
+// dan bot tetap jalan cuma mengandalkan client rotation. Kalau mau aktifin:
+//  1. Plugin Python-nya harus terinstall di server yang sama dengan
+//     binary yt-dlp: `pip install -U bgutil-ytdlp-pot-provider`
+//  2. Service HTTP provider-nya harus jalan terpisah & bisa diakses dari
+//     sini, lalu isi env var ini dengan URL-nya (mis. http://127.0.0.1:4416
+//     kalau satu container, atau URL publik/private networking Railway
+//     kalau service terpisah).
+const YTDLP_POT_BASE_URL = process.env.YTDLP_POT_BASE_URL || "";
 
 // Batas ukuran file hasil download, biar gak nyoba kirim file raksasa yang
 // bakal gagal/lambat banget dikirim lewat WhatsApp.
@@ -1296,8 +1371,20 @@ function friendlyDlError(err) {
   if (/private video|video is private/i.test(raw)) {
     return "🔒 Videonya bersifat privat, gak bisa diakses tanpa login.";
   }
+  // PENTING: dicek DULUAN sebelum age-restrict, karena pesan ini pola
+  // katanya mirip ("sign in to confirm...") tapi artinya beda total --
+  // ini YouTube curiga IP server-nya bot/datacenter, BUKAN video-nya
+  // dibatasi umur. Kalau ini yang muncul terus-terusan meski sudah pakai
+  // client rotation (lihat komentar downloadMediaFromUrl), coba aktifin
+  // PO Token server (YTDLP_POT_BASE_URL).
+  if (/sign in to confirm you.?re not a bot/i.test(raw)) {
+    return "🤖 YouTube mendeteksi server bot ini sebagai traffic mencurigakan (umum terjadi di IP cloud/datacenter kayak Railway/AWS/GCP) -- ini BUKAN soal video dibatasi umur. Coba lagi beberapa saat, atau aktifin PO Token server (env var YTDLP_POT_BASE_URL) buat solusi lebih permanen.";
+  }
   if (/sign in to confirm|age.?restrict/i.test(raw)) {
     return "🔞 Video ini dibatasi umur oleh platformnya dan butuh login -- bot ini gak bisa login akun.";
+  }
+  if (/bgutil.*(connection refused|econnrefused|failed to fetch|timed? ?out)/i.test(raw)) {
+    return "⚙️ POT provider (bgutil) gak bisa dihubungi dari server -- cek apakah service-nya masih jalan & YTDLP_POT_BASE_URL sudah benar.";
   }
   if (
     /video unavailable|content isn.?t available|no longer available|this video (has been removed|is unavailable)/i.test(
@@ -1328,7 +1415,8 @@ function friendlyDlError(err) {
 }
 
 // Deteksi link YouTube (termasuk youtu.be & Shorts) -- dipakai buat
-// nolak link YouTube di "!dl" (dukungannya lagi dirombak ulang terpisah).
+// nambahin argumen khusus YouTube (client rotation, dst -- lihat
+// downloadMediaFromUrl) di "!dl".
 function isYoutubeUrl(url) {
   try {
     const host = new URL(url).hostname.replace(/^www\./, "");
@@ -1340,8 +1428,9 @@ function isYoutubeUrl(url) {
 
 // mode: "video" -> MP4 (gabungan video+audio terbaik dalam batas ukuran)
 //       "audio" -> MP3 (audio-only, hasil ekstraksi)
-// Generik untuk Bilibili, Facebook (video/reel/postingan video), TikTok,
-// Instagram, X/Twitter, dst -- situs non-YouTube yang didukung yt-dlp.
+// Generik untuk YouTube (video/short), Bilibili, Facebook (video/reel/
+// postingan video), TikTok, Instagram, X/Twitter, dst -- semua situs yang
+// didukung yt-dlp. YouTube dapet argumen tambahan (lihat di bawah).
 async function downloadMediaFromUrl(url, mode) {
   const tmpDir = os.tmpdir();
   const uid = crypto.randomBytes(6).toString("hex");
@@ -1362,6 +1451,42 @@ async function downloadMediaFromUrl(url, mode) {
     "-o",
     outputTemplate,
   ];
+
+  // Khusus YouTube (resep dari yt-dlp-rescue): client "web" default
+  // sekarang sering di-throttle YouTube ke 1 format progresif 360p doang
+  // (SABR), MENGABAIKAN filter kualitas apa pun. Fix-nya: rotasi beberapa
+  // player_client sekaligus lewat --extractor-args, biar yt-dlp nemu
+  // katalog format DASH lengkap dari client mana pun yang berhasil
+  // (gak perlu dipaksa urutan tertentu -- yt-dlp otomatis pilih yang
+  // lolos). player_skip=webpage ngurangin jumlah HTTP call ke YouTube
+  // (lebih kecil kemungkinan numpuk ke rate-limit).
+  if (isYoutubeUrl(url)) {
+    commonArgs.push(
+      "--extractor-args",
+      "youtube:player_client=web,android_vr,tv_downgraded;player_skip=webpage",
+    );
+
+    // Cegah masalah routing IPv6 yang lumayan sering kejadian di
+    // beberapa cloud provider (Railway/AWS/GCP dst).
+    commonArgs.push("--force-ipv4");
+
+    // Solver signature/n challenge YouTube -- pakai runtime "node" (SUDAH
+    // terinstall buat project ini sendiri, jadi TIDAK butuh install Deno
+    // terpisah). --remote-components auto-download komponen solver
+    // terbaru dari GitHub kalau versi cache lokal ketinggalan zaman.
+    commonArgs.push("--js-runtimes", "node");
+    commonArgs.push("--remote-components", "ejs:github");
+
+    // Kalau POT provider di-set (lihat komentar YTDLP_POT_BASE_URL di
+    // atas), kasih tau yt-dlp lokasinya -- ini buat kasus deteksi bot
+    // yang masih lolos walau sudah pakai client rotation di atas.
+    if (YTDLP_POT_BASE_URL) {
+      commonArgs.push(
+        "--extractor-args",
+        `youtubepot-bgutilhttp:base_url=${YTDLP_POT_BASE_URL}`,
+      );
+    }
+  }
 
   const args =
     mode === "audio"
@@ -1714,12 +1839,28 @@ async function startBot() {
 
     // =====================
     // Balasan angka untuk memilih karakter dari daftar disambiguasi
-    // (hanya diproses kalau memang sedang ada daftar pending untuk user ini)
+    // ATAU untuk lanjut (!next) pakai kode sesi.
+    //
+    // KEDUANYA sama-sama "ketik angka" jadi wajib dibedakan biar gak
+    // bentrok satu sama lain:
+    //   - Pilihan karakter: HARUS reply (quote) ke pesan daftar tag-nya
+    //     (dicek lewat ctx.stanzaId === session.promptMsgId). Ini juga
+    //     yang bikin gak ke-trigger cuma gara-gara kebetulan session milik
+    //     pengirim ini masih ada pendingTagChoices lama yang belum expired.
+    //   - Kode sesi: ketik angka POLOS (bukan reply ke daftar tag), dicek
+    //     ke chatCodeSessions seperti biasa.
     // =====================
     if (/^\d+$/.test(text)) {
       const session = sessions.get(sessionKey);
+      const ctx = msg.message?.extendedTextMessage?.contextInfo;
+      const isReplyToTagPrompt =
+        session?.pendingTagChoices &&
+        ctx?.stanzaId &&
+        session.promptMsgId &&
+        ctx.stanzaId === session.promptMsgId;
 
-      if (session?.pendingTagChoices) {
+      if (isReplyToTagPrompt) {
+        touchSession(session);
         const idx = parseInt(text, 10) - 1;
         const choice = session.pendingTagChoices[idx];
 
@@ -1757,9 +1898,9 @@ async function startBot() {
         return;
       }
 
-      // Bukan lagi soal daftar disambiguasi milik pengirim ini -> cek apakah
-      // angka ini KODE SESI pencarian yang lagi aktif di chat ini. Kode sesi
-      // ini scope-nya per-chat (bukan per-pengirim), jadi siapa pun di grup
+      // Bukan reply ke daftar disambiguasi -> cek apakah angka ini KODE
+      // SESI pencarian yang lagi aktif di chat ini. Kode sesi ini
+      // scope-nya per-chat (bukan per-pengirim), jadi siapa pun di grup
       // yang sama boleh pakai kode punya orang lain buat lanjut (!next)
       // pencarian itu, dan ini tidak bentrok dengan kode punya pencarian
       // lain karena tiap pencarian dapat nomor kodenya sendiri-sendiri.
@@ -1767,6 +1908,7 @@ async function startBot() {
       const codeSession = chatCodeSessions.get(jid)?.get(codeNum);
 
       if (codeSession) {
+        touchSession(codeSession);
         try {
           // pool habis -> refill otomatis dari tag yang sama
           if (codeSession.pool.length === 0) {
@@ -1809,7 +1951,18 @@ async function startBot() {
       }
 
       // angka tanpa daftar pending & bukan kode sesi yang aktif -> biarkan
-      // lewat, bukan command
+      // lewat, bukan command. TAPI kalau ternyata dia sebenarnya PUNYA
+      // daftar tag pending (cuma gak reply pesannya), kasih tau caranya
+      // biar gak bingung kenapa gak ada respons sama sekali.
+      if (session?.pendingTagChoices) {
+        await sock.sendMessage(jid, {
+          text:
+            "⚠️ Masih ada daftar karakter yang belum dipilih.\n\n" +
+            "➡️ Buat *pilih karakter*: reply pesan daftarnya, lalu ketik nomor urutnya.\n" +
+            "➡️ Buat *lanjut sesi lain* pakai kode: ketik kodenya langsung tanpa reply.",
+        });
+        return;
+      }
     }
 
     // =====================
@@ -2049,11 +2202,18 @@ async function startBot() {
           return;
         }
 
-        sessions.set(sessionKey, { pendingTagChoices: matches });
+        const pendingSession = touchSession({ pendingTagChoices: matches });
+        sessions.set(sessionKey, pendingSession);
 
-        await sock.sendMessage(jid, {
+        const sentMsg = await sock.sendMessage(jid, {
           text: buildTagChoiceList(matches),
         });
+        // Simpan ID pesan daftar tag ini, dipakai buat mastiin nanti angka
+        // balasan BENERAN nge-reply pesan ini (bukan sekadar ketik angka
+        // polos) -- lihat pengecekan `ctx.stanzaId` di handler balasan
+        // angka. Ini yang bikin gak bentrok sama kode sesi (!next pakai
+        // angka juga, tapi tanpa reply).
+        pendingSession.promptMsgId = sentMsg?.key?.id || null;
       } catch (err) {
         console.log(err);
         await sock.sendMessage(jid, {
@@ -2074,6 +2234,8 @@ async function startBot() {
         await sendCommandDetail(sock, jid, "next");
         return;
       }
+
+      touchSession(session);
 
       try {
         // pool habis -> refill otomatis dari tag yang sama
@@ -2180,15 +2342,9 @@ async function startBot() {
         return;
       }
 
-      // Dukungan download YouTube sengaja dihapus (lagi dirombak ulang) --
-      // link non-YouTube tetap jalan seperti biasa lewat yt-dlp.
-      if (isYoutubeUrl(url)) {
-        await sock.sendMessage(jid, {
-          text: "❌ Download dari YouTube belum tersedia saat ini.",
-        });
-        return;
-      }
-
+      // Link YouTube ikut alur sama seperti situs lain -- argumen khusus
+      // (client rotation, force-ipv4, dst) ditangani otomatis di dalam
+      // downloadMediaFromUrl(), gak perlu logic tambahan di sini.
       const mode = hint === "mp3" || hint === "audio" ? "audio" : "video";
       await handleDlDownload(sock, jid, url, mode);
       return;
