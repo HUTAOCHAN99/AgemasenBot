@@ -8,22 +8,34 @@
 # lengkap kenapa yt-dlp butuh di-install terpisah dari dependency npm
 # project ini.
 #
-# Setelah nambah file ini, JANGAN LUPA set environment variable di
-# Railway (tab Variables):
+# CATATAN (setelah sesi debug Agustus 2026): ternyata di runtime Railway
+# yang dipakai project ini, "yt-dlp" SUDAH ketemu otomatis lewat PATH
+# sistem (/usr/local/bin/yt-dlp) tanpa perlu YTDLP_PATH di-set sama
+# sekali -- kemungkinan environment base Node.js Railway-nya sendiri
+# sudah include Python + yt-dlp. Baris curl download ke /app/yt-dlp di
+# bawah TETAP dipertahankan sebagai fallback/jaga-jaga (gak ngerusak apa
+# pun kalau ternyata gak kepakai), tapi kalau kamu mau extra pasti, boleh
+# cek dulu lewat Railway Shell: `which yt-dlp` -- kalau ketemu di
+# /usr/local/bin/yt-dlp, YTDLP_PATH gak perlu di-set di Variables sama
+# sekali (biarin default "yt-dlp" bareword).
+#
+# Kalau ternyata di kamu /usr/local/bin/yt-dlp TIDAK ketemu (beda dari
+# hasil debug kita), baru WAJIB set di Railway (tab Variables):
 #
 #   YTDLP_PATH = /app/yt-dlp
-#
-# Kalau env var ini tidak di-set, bot tetap jalan tapi fitur "!dl" akan
-# selalu gagal dengan pesan "yt-dlp tidak ditemukan di server", karena
-# bot akan coba cari command "yt-dlp" di PATH sistem (yang kosong di
-# container Railway ini) alih-alih di /app/yt-dlp.
 
 [phases.install]
 cmds = [
   "npm ci",
   # yt-dlp_linux = binary standalone (PyInstaller build), TIDAK butuh
   # Python system terpisah -- paling aman buat container Railway yang
-  # base image-nya cuma Node.js.
+  # base image-nya cuma Node.js. Fallback/jaga-jaga (lihat catatan di
+  # atas soal /usr/local/bin/yt-dlp).
   "curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o /app/yt-dlp",
-  "chmod a+rx /app/yt-dlp"
+  "chmod a+rx /app/yt-dlp",
+  # WAJIB: plugin PO Token provider (sisi yt-dlp). Tanpa ini, walau
+  # server bgutil di service `pot-server` sudah jalan sempurna, yt-dlp
+  # TIDAK akan tau cara "ngobrol" ke server itu (PO Token Providers:
+  # none) -- ini akar masalah yang kita temukan lewat debug panjang.
+  "pip install --break-system-packages -U bgutil-ytdlp-pot-provider"
 ]

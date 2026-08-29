@@ -1473,24 +1473,30 @@ async function downloadMediaFromUrl(url, mode) {
 
   // Khusus YouTube.
   //
-  // CATATAN (Agustus 2026): resep asli "yt-dlp-rescue" (dibuat Maret 2026)
-  // MEMAKSA rotasi player_client=web,android_vr,tv_downgraded buat ngakalin
-  // SABR throttle yang saat itu terjadi di client "web" default. TAPI
-  // setelah dites ulang dengan yt-dlp versi terbaru (2026.08+) + PO Token
-  // provider (bgutil) yang jalan, memaksa client lama ini JUSTRU memicu
-  // "Sign in to confirm you're not a bot" -- sementara TIDAK menyertakan
-  // --extractor-args player_client sama sekali (biarin yt-dlp milih
-  // client-nya sendiri) malah berhasil mulus dapat kualitas penuh.
+  // CATATAN (Agustus 2026, update ke-2): sempat dihapus sama sekali (lihat
+  // histori komentar di atas), TAPI ternyata di IP Railway (datacenter),
+  // client default yang dipilih otomatis yt-dlp (visionos) kena
+  // LOGIN_REQUIRED walau PO Token sudah valid -- beda dari test di IP
+  // residensial yang mulus tanpa override apa pun.
   //
-  // Kesimpulannya: yt-dlp versi baru + POT provider sudah cukup pintar
-  // milih & rotasi client sendiri secara internal -- override manual di
-  // sini malah mengganggu logikanya. Makanya baris --extractor-args
-  // player_client DIHAPUS. Kalau suatu saat YouTube berubah lagi dan
-  // kualitas balik ke-throttle 360p, baru pertimbangkan nambahin
-  // override lagi -- tapi test manual dulu (yt-dlp -v URL, tanpa lewat
-  // bot) sebelum hardcode balik ke sini, karena resep lama bisa basi
-  // lagi kapan aja seiring yt-dlp/YouTube berubah.
+  // Ditest manual satu-satu langsung di container Railway:
+  //   - default/tanpa override (visionos)  -> LOGIN_REQUIRED
+  //   - android_vr                          -> GVS PO Token gak didukung
+  //                                             provider bgutil sama sekali
+  //                                             (semua format di-skip)
+  //   - web (+ POT provider yang valid)     -> BERHASIL, download penuh
+  //
+  // Jadi "web" dipasang eksplisit lagi -- BUKAN rotasi banyak client kayak
+  // resep asli, cuma satu client yang sudah terbukti cocok dipasangkan
+  // dengan bgutil POT provider. Kalau nanti kualitas hasil download-nya
+  // masih suka mentok di format rendah (SABR throttle web client), baru
+  // pertimbangkan nambahin visitor_data atau POT context lain -- tapi
+  // jangan buru-buru rotasi ke client lain lagi tanpa test manual dulu,
+  // karena provider bgutil ini spesifik cuma dukung PO Token buat
+  // keluarga client "web" (web, mweb, web_safari, tv), bukan mobile/VR.
   if (isYoutubeUrl(url)) {
+    commonArgs.push("--extractor-args", "youtube:player_client=web");
+
     // Cegah masalah routing IPv6 yang lumayan sering kejadian di
     // beberapa cloud provider (Railway/AWS/GCP dst).
     commonArgs.push("--force-ipv4");
