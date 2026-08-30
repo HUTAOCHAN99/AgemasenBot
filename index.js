@@ -1311,21 +1311,54 @@ const DL_MAX_FILESIZE = "95M";
 // (429) atau bikin server kehabisan resource. Dengan queue, cuma
 // DL_QUEUE_CONCURRENCY job yang jalan bersamaan, sisanya ngantre giliran.
 // =====================================================
-const DL_QUEUE_CONCURRENCY = Number(process.env.DL_QUEUE_CONCURRENCY) || 2;
+// Diturunkan dari 2 -> 1 secara default. Ini BUKAN sekadar soal resource
+// server, tapi soal jatah request ke IP Railway: 2 proses yt-dlp jalan
+// bersamaan = 2x lipat request (player info, manifest, video bytes, dst)
+// yang "memukul" YouTube dalam waktu yang sama, jauh lebih gampang bikin
+// IP itu kena 429 dibanding kalau request-nya dijalankan satu-satu.
+const DL_QUEUE_CONCURRENCY = Number(process.env.DL_QUEUE_CONCURRENCY) || 1;
+
+// Jeda MINIMAL (ms) antara satu job !dl SELESAI dan job berikutnya MULAI.
+// Beda dari "--sleep-requests" (itu jeda antar request DI DALAM satu
+// proses yt-dlp) -- ini jeda ANTAR JOB, biar burst permintaan !dl dari
+// banyak user beruntun gak numpuk jadi banyak request ke YouTube dalam
+// detik yang sama. Bisa dituning lewat env var DL_QUEUE_COOLDOWN_MS.
+const DL_QUEUE_COOLDOWN_MS = Number(process.env.DL_QUEUE_COOLDOWN_MS) || 4000;
+
 let dlActiveWorkers = 0;
+let dlLastJobFinishedAt = 0;
 const dlQueue = [];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runQueuedJob(job) {
+  // Tunggu sisa cooldown dari job SEBELUMNYA (kalau ada) sebelum job ini
+  // mulai nembak yt-dlp/YouTube.
+  const elapsed = Date.now() - dlLastJobFinishedAt;
+  const remaining = DL_QUEUE_COOLDOWN_MS - elapsed;
+  if (dlLastJobFinishedAt > 0 && remaining > 0) {
+    await sleep(remaining);
+  }
+
+  try {
+    const result = await job.jobFn();
+    job.resolve(result);
+  } catch (err) {
+    job.reject(err);
+  } finally {
+    dlLastJobFinishedAt = Date.now();
+    dlActiveWorkers--;
+    processDlQueue();
+  }
+}
 
 function processDlQueue() {
   while (dlActiveWorkers < DL_QUEUE_CONCURRENCY && dlQueue.length > 0) {
     const job = dlQueue.shift();
     dlActiveWorkers++;
-    job
-      .jobFn()
-      .then(job.resolve, job.reject)
-      .finally(() => {
-        dlActiveWorkers--;
-        processDlQueue();
-      });
+    runQueuedJob(job);
   }
 }
 
@@ -1334,6 +1367,28 @@ function enqueueDownloadJob(jobFn) {
     dlQueue.push({ jobFn, resolve, reject });
     processDlQueue();
   });
+}
+
+// =====================================================
+// PER-USER COOLDOWN untuk "!dl" -- ini yang paling sering jadi penyebab
+// beruntunnya request ke YouTube dalam waktu singkat: satu user spam
+// "!dl" berkali-kali (misal nyoba link yang gagal, terus di-retry manual
+// terus-terusan). Tanpa ini, tiap percobaan langsung masuk queue dan
+// nembak yt-dlp lagi. Dengan ini, user yang sama harus nunggu jeda
+// DL_USER_COOLDOWN_MS sebelum permintaan !dl berikutnya diproses.
+// =====================================================
+const DL_USER_COOLDOWN_MS = Number(process.env.DL_USER_COOLDOWN_MS) || 15000;
+const dlLastRequestByUser = new Map();
+
+function checkDlUserCooldown(jid) {
+  const now = Date.now();
+  const last = dlLastRequestByUser.get(jid) || 0;
+  const remaining = DL_USER_COOLDOWN_MS - (now - last);
+  if (remaining > 0) {
+    return remaining;
+  }
+  dlLastRequestByUser.set(jid, now);
+  return 0;
 }
 
 function runYtDlp(args) {
@@ -1398,6 +1453,16 @@ function friendlyDlError(err) {
   // PO Token server (YTDLP_POT_BASE_URL).
   if (/sign in to confirm you.?re not a bot/i.test(raw)) {
     return "🤖 YouTube mendeteksi server bot ini sebagai traffic mencurigakan (umum terjadi di IP cloud/datacenter kayak Railway/AWS/GCP) -- ini BUKAN soal video dibatasi umur. Coba lagi beberapa saat, atau aktifin PO Token server (env var YTDLP_POT_BASE_URL) buat solusi lebih permanen.";
+  }
+  // PENTING: ini beda dari kasus "sign in to confirm..." di atas. Kode
+  // 429 / "Too Many Requests" adalah THROTTLE berbasis VOLUME REQUEST
+  // dari IP ini, dicek TERPISAH dari validitas PO Token -- POT cuma
+  // membuktikan origin/identitas request, bukan tiket buat lewatin
+  // kuota. Kalau ini yang sering muncul walau POT sudah valid, benerin
+  // di sisi VOLUME (turunin DL_QUEUE_CONCURRENCY, naikkan
+  // DL_QUEUE_COOLDOWN_MS / DL_USER_COOLDOWN_MS), bukan di sisi POT lagi.
+  if (/429|too many requests|http error 429/i.test(raw)) {
+    return "🚦 Kena rate-limit (HTTP 429) dari platform aslinya -- ini soal VOLUME request dari server ini dalam waktu singkat, beda dari deteksi bot, dan PO Token TIDAK menyelesaikan ini. Coba lagi beberapa menit lagi; kalau sering terjadi, kurangi frekuensi/concurrency !dl (lihat DL_QUEUE_CONCURRENCY, DL_QUEUE_COOLDOWN_MS, DL_USER_COOLDOWN_MS).";
   }
   if (/sign in to confirm|age.?restrict/i.test(raw)) {
     return "🔞 Video ini dibatasi umur oleh platformnya dan butuh login -- bot ini gak bisa login akun.";
@@ -1466,6 +1531,18 @@ async function downloadMediaFromUrl(url, mode) {
     // rate-limit yang udah kejadian, tapi pencegahan biar gak gampang
     // numpuk ke 429 lagi terutama kalau banyak download YouTube beruntun.
     "--sleep-requests",
+    "1",
+    // PENTING: batasi retry bawaan yt-dlp (default 10x untuk masing-masing
+    // kategori ini!). Kalau satu video gagal (misal kena 429 sekali),
+    // retry default akan langsung nembak ulang YouTube 10x beruntun DALAM
+    // SATU proses -- ini yang paling sering bikin IP makin cepat dianggap
+    // abusive dan makin lama kena blokir. Lebih baik gagal cepat dan biar
+    // user coba lagi manual nanti, daripada retry membabi buta.
+    "--retries",
+    "2",
+    "--fragment-retries",
+    "2",
+    "--extractor-retries",
     "1",
     "-o",
     outputTemplate,
@@ -1613,7 +1690,110 @@ async function downloadMediaFromUrl(url, mode) {
   }
 }
 
+// =====================================================
+// FALLBACK: third-party YouTube download API (opsional, berbayar).
+//
+// KENAPA INI ADA: yt-dlp self-hosted di IP datacenter (Railway dst) bisa
+// tetap kena bot-detection/rate-limit walau sudah pakai PO Token + client
+// rotation, KARENA masalahnya seringkali di reputasi IP itu sendiri
+// (dibahas panjang di histori komentar YTDLP_POT_BASE_URL di atas).
+//
+// Provider pihak ketiga ("YouTube downloader API") biasanya sudah punya
+// infrastruktur sendiri (proxy residensial, IP rotation, dsb) buat
+// nanganin masalah itu -- jadi beban bot-detection/rate-limit dipindah
+// ke server MEREKA, bukan server kita. Konsekuensinya: BERBAYAR (biasanya
+// per-GB bandwidth), jadi ini dipasang sebagai FALLBACK -- yt-dlp gratis
+// tetap dicoba duluan, API ini cuma dipanggil kalau yt-dlp gagal.
+//
+// Pola API umum dipakai provider-provider ini (submit job -> poll status
+// -> dapat link download langsung) -- CONTOH nyata dari provider Vid
+// Kraken (vidkraken.com/docs), tapi kalau kamu pakai provider lain
+// (RapidAPI listing, dst), sesuaikan nama field JSON di bawah dengan
+// dokumentasi provider itu, karena tiap provider beda-beda.
+//
+// Env var yang dibutuhkan (kosongkan semua buat nonaktifin fallback ini):
+//   THIRD_PARTY_DL_API_KEY   -- API key/token dari provider
+//   THIRD_PARTY_DL_BASE_URL  -- base URL API, mis. https://vidkraken.com/api/v2
+const THIRD_PARTY_DL_API_KEY = process.env.THIRD_PARTY_DL_API_KEY || "";
+const THIRD_PARTY_DL_BASE_URL = process.env.THIRD_PARTY_DL_BASE_URL || "";
+const THIRD_PARTY_DL_ENABLED = Boolean(
+  THIRD_PARTY_DL_API_KEY && THIRD_PARTY_DL_BASE_URL,
+);
+
+// Berapa lama nunggu polling status job sebelum nyerah (ms).
+const THIRD_PARTY_DL_POLL_TIMEOUT_MS = 90000;
+const THIRD_PARTY_DL_POLL_INTERVAL_MS = 3000;
+
+async function downloadViaThirdPartyApi(url, mode) {
+  const format = mode === "audio" ? "mp3" : "1080";
+
+  // 1) Submit job download.
+  const submitRes = await axios.post(
+    `${THIRD_PARTY_DL_BASE_URL}/download`,
+    { url, format },
+    {
+      headers: { Authorization: `Bearer ${THIRD_PARTY_DL_API_KEY}` },
+      timeout: 15000,
+    },
+  );
+
+  const jobId = submitRes.data.jobId;
+  if (!jobId) {
+    throw new Error("Provider pihak ketiga tidak mengembalikan jobId.");
+  }
+
+  // 2) Poll status sampai selesai (COMPLETED) atau gagal/timeout.
+  const startedAt = Date.now();
+  let downloadUrl = null;
+
+  while (Date.now() - startedAt < THIRD_PARTY_DL_POLL_TIMEOUT_MS) {
+    await sleep(THIRD_PARTY_DL_POLL_INTERVAL_MS);
+
+    const statusRes = await axios.get(
+      `${THIRD_PARTY_DL_BASE_URL}/download/${jobId}`,
+      {
+        headers: { Authorization: `Bearer ${THIRD_PARTY_DL_API_KEY}` },
+        timeout: 15000,
+      },
+    );
+
+    const status = statusRes.data.status;
+    if (status === "COMPLETED") {
+      downloadUrl = statusRes.data.downloadUrl;
+      break;
+    }
+    if (status === "FAILED" || status === "ERROR") {
+      throw new Error(
+        `Provider pihak ketiga gagal memproses: ${statusRes.data.errorCode || status}`,
+      );
+    }
+    // status lain (IN_QUEUE/PROCESSING dst) -> lanjut polling.
+  }
+
+  if (!downloadUrl) {
+    throw new Error("Provider pihak ketiga timeout, job tidak selesai tepat waktu.");
+  }
+
+  // 3) Ambil file mentahnya dari link hasil.
+  const fileRes = await axios.get(downloadUrl, {
+    responseType: "arraybuffer",
+    timeout: 60000,
+  });
+
+  return { buffer: Buffer.from(fileRes.data) };
+}
+
 async function handleDlDownload(sock, jid, url, mode) {
+  const cooldownRemaining = checkDlUserCooldown(jid);
+  if (cooldownRemaining > 0) {
+    await sock.sendMessage(jid, {
+      text: `⏳ Tunggu ${Math.ceil(
+        cooldownRemaining / 1000,
+      )} detik lagi sebelum minta download berikutnya ya (biar server gak spam request ke platform aslinya dan malah kena rate-limit).`,
+    });
+    return;
+  }
+
   try {
     await sock.sendMessage(jid, {
       text:
@@ -1624,9 +1804,25 @@ async function handleDlDownload(sock, jid, url, mode) {
 
     // masuk QUEUE, biar gak numpuk proses yt-dlp jalan bersamaan kalau
     // lagi banyak yang minta download sekaligus.
-    const { buffer } = await enqueueDownloadJob(() =>
-      downloadMediaFromUrl(url, mode),
-    );
+    let result;
+    try {
+      result = await enqueueDownloadJob(() => downloadMediaFromUrl(url, mode));
+    } catch (ytdlpErr) {
+      // Fallback ke API pihak ketiga (kalau dikonfigurasi) SAAT yt-dlp
+      // gagal -- paling relevan buat kasus 429/bot-detection yang gagal
+      // diselesaikan sendiri oleh server ini. Kalau fallback tidak
+      // dikonfigurasi (THIRD_PARTY_DL_ENABLED false), lempar lagi error
+      // aslinya seperti biasa.
+      if (!THIRD_PARTY_DL_ENABLED) {
+        throw ytdlpErr;
+      }
+      console.log(
+        "[dl] yt-dlp gagal, coba fallback ke API pihak ketiga:",
+        ytdlpErr.message,
+      );
+      result = await downloadViaThirdPartyApi(url, mode);
+    }
+    const { buffer } = result;
 
     await sendDownloadedMedia(sock, jid, buffer, mode, url, false);
   } catch (err) {
