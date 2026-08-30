@@ -134,6 +134,16 @@ function getSessionKey(msg) {
   return participant ? `${jid}::${participant}` : jid;
 }
 
+// Pesan error yang lebih jelas kalau penyebabnya timeout ke Safebooru
+// (biasa terjadi pada tag yang post-nya sangat banyak) supaya user tahu
+// ini bukan tag yang salah, cuma perlu dicoba lagi.
+function errorReplyText(err) {
+  if (err?.code === "ECONNABORTED" || /timeout/i.test(err?.message || "")) {
+    return "⏱️ Server gambar lambat merespons. Coba lagi ya.";
+  }
+  return "Terjadi kesalahan.";
+}
+
 function buildCaption(post, karakterLabel, { isNext = false, code } = {}) {
   const link = `https://safebooru.org/index.php?page=post&s=view&id=${post.id}`;
 
@@ -152,13 +162,60 @@ ${continueLine}
 🔁 Ketik *!id ${post.id}* untuk lihat gambar ini lagi kapan saja`;
 }
 
+// Kasih timeout eksplisit per-request. Tanpa ini, satu request yang
+// menggantung bisa bikin keseluruhan pencarian terasa "diam" lama sebelum
+// akhirnya gagal.
+const SAFEBOORU_TIMEOUT_MS = 15000;
+// Tag populer (mis. "umamusume" -- yang justru paling sering jadi PILIHAN
+// NOMOR 1 di daftar disambiguasi, karena daftar itu diurutkan dari count
+// terbesar) bisa punya ribuan post -> puluhan/ratusan request berurutan ke
+// Safebooru per pencarian, jadi lebih rawan sesekali timeout/gangguan
+// jaringan di tengah jalan. Daripada langsung gagal total dan bikin user
+// dapat "Terjadi kesalahan.", tiap halaman yang gagal dicoba ulang dulu
+// beberapa kali (dengan jeda) sebelum benar-benar menyerah.
+const SAFEBOORU_MAX_RETRIES = 3;
+const SAFEBOORU_RETRY_DELAY_MS = 1000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Wrapper axios.get dengan retry otomatis kalau kena timeout/error jaringan.
+// Error non-jaringan (mis. 4xx dari server) tidak di-retry, langsung dilempar.
+async function fetchWithRetry(url, config) {
+  let lastErr;
+
+  for (let attempt = 1; attempt <= SAFEBOORU_MAX_RETRIES; attempt++) {
+    try {
+      return await axios.get(url, config);
+    } catch (err) {
+      lastErr = err;
+
+      const isNetworkIssue =
+        err.code === "ECONNABORTED" ||
+        err.code === "ETIMEDOUT" ||
+        err.code === "ECONNRESET" ||
+        !err.response; // request tidak pernah dapat balasan sama sekali
+
+      if (!isNetworkIssue || attempt === SAFEBOORU_MAX_RETRIES) throw err;
+
+      console.log(
+        `[safebooru] percobaan ${attempt} gagal (${err.code || err.message}), coba lagi...`,
+      );
+      await sleep(SAFEBOORU_RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  throw lastErr;
+}
+
 async function fetchCandidates(tag) {
   const url = "https://safebooru.org/index.php";
   const all = [];
   let pid = 0;
 
   while (true) {
-    const res = await axios.get(url, {
+    const res = await fetchWithRetry(url, {
       params: {
         page: "dapi",
         s: "post",
@@ -168,6 +225,7 @@ async function fetchCandidates(tag) {
         pid,
         tags: tag,
       },
+      timeout: SAFEBOORU_TIMEOUT_MS,
     });
 
     if (!Array.isArray(res.data) || res.data.length === 0) break;
@@ -217,7 +275,7 @@ async function fetchMatchingTags(query) {
   let pid = 0;
 
   while (true) {
-    const res = await axios.get(url, {
+    const res = await fetchWithRetry(url, {
       params: {
         page: "dapi",
         s: "tag",
@@ -232,6 +290,7 @@ async function fetchMatchingTags(query) {
       // transform can throw or hand us something unpredictable.
       responseType: "text",
       transformResponse: (data) => data,
+      timeout: SAFEBOORU_TIMEOUT_MS,
     });
 
     let tags;
@@ -2812,7 +2871,7 @@ async function startBot() {
         } catch (err) {
           console.log(err);
           await sock.sendMessage(jid, {
-            text: "Terjadi kesalahan.",
+            text: errorReplyText(err),
           });
         }
 
@@ -2864,7 +2923,7 @@ async function startBot() {
         } catch (err) {
           console.log(err);
           await sock.sendMessage(jid, {
-            text: "Terjadi kesalahan.",
+            text: errorReplyText(err),
           });
         }
 
@@ -3138,7 +3197,7 @@ async function startBot() {
       } catch (err) {
         console.log(err);
         await sock.sendMessage(jid, {
-          text: "Terjadi kesalahan.",
+          text: errorReplyText(err),
         });
       }
 
@@ -3192,7 +3251,7 @@ async function startBot() {
       } catch (err) {
         console.log(err);
         await sock.sendMessage(jid, {
-          text: "Terjadi kesalahan.",
+          text: errorReplyText(err),
         });
       }
 
