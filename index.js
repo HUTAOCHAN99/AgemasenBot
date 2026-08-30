@@ -1807,6 +1807,13 @@ const REALESRGAN_TIMEOUT_MS =
   Number(process.env.REALESRGAN_TIMEOUT_MS) || 120000; // 2 menit
 const HD_QUEUE_CONCURRENCY = Number(process.env.HD_QUEUE_CONCURRENCY) || 1;
 const HD_TMP_DIR = process.env.HD_TMP_DIR || path.join(__dirname, "tmp");
+// Mesin yang dipakai "!hd" -- default "sharp" (CATATAN Agustus 2026: binary
+// Real-ESRGAN TIDAK ter-install di server ini -- nixpacks.toml cuma nyiapin
+// yt-dlp, gak ada langkah download Real-ESRGAN -- jadi "!hd" pasti gagal
+// "executable tidak ditemukan" kalau tetap dipaksa pakai realesrgan). Ganti
+// ke "realesrgan" via env var HD_ENGINE cuma kalau binary + model-nya sudah
+// beneran di-install manual di server.
+const HD_ENGINE = (process.env.HD_ENGINE || "sharp").toLowerCase();
 
 let hdActiveWorkers = 0;
 const hdQueue = [];
@@ -2022,6 +2029,75 @@ async function upscaleImageWithRealEsrgan(inputBuffer, scale) {
     fs.rm(inputPath, { force: true }, () => {});
     fs.rm(outputPath, { force: true }, () => {});
   }
+}
+
+// =====================================================
+// Mesin "sharp" -- fallback tanpa Real-ESRGAN (ditambahkan Agustus 2026)
+// -----------------------------------------------------
+// Real-ESRGAN (ncnn-vulkan) butuh binary + file model terpisah yang berat
+// buat di-setup di Railway (apalagi tanpa GPU/Vulkan) -- makanya "!hd"
+// selalu gagal "executable tidak ditemukan". Jalur ini pakai "sharp" yang
+// SUDAH jadi dependency project ini, TANPA proses/binary eksternal apa pun:
+// lebar & tinggi gambar dikali scale yang PERSIS SAMA (jadi rasio/bentuk
+// gambar aslinya tetap terjaga, gak ada distorsi), lalu ditajamkan pakai
+// filter sharpen biar hasilnya gak blur.
+//
+// Ini BUKAN AI super resolution beneran (gak "mengarang" detail baru kayak
+// Real-ESRGAN) -- cuma resize berkualitas tinggi + penajaman biasa. Tapi
+// itu sudah cukup buat kebutuhan "yang penting gak blur" tanpa install
+// apa pun tambahan. Validasi ukuran file & batas dimensi hasil TETAP sama
+// persis kayak jalur Real-ESRGAN, biar konsisten.
+// =====================================================
+async function upscaleImageWithSharp(inputBuffer, scale) {
+  if (inputBuffer.length > REALESRGAN_MAX_INPUT_MB * 1024 * 1024) {
+    throw new Error(
+      `Ukuran gambar melebihi batas ${REALESRGAN_MAX_INPUT_MB}MB.`,
+    );
+  }
+
+  let metadata;
+  try {
+    metadata = await sharp(inputBuffer).metadata();
+  } catch {
+    throw new Error("Gambar tidak valid atau corrupt.");
+  }
+
+  const { width, height } = metadata;
+
+  if (!width || !height) {
+    throw new Error("Gagal membaca dimensi gambar.");
+  }
+
+  const targetWidth = Math.round(width * scale);
+  const targetHeight = Math.round(height * scale);
+
+  if (
+    targetWidth > REALESRGAN_MAX_OUTPUT_DIMENSION ||
+    targetHeight > REALESRGAN_MAX_OUTPUT_DIMENSION
+  ) {
+    throw new Error(
+      `Resolusi hasil upscale (${targetWidth}x${targetHeight}) melebihi ` +
+        `batas ${REALESRGAN_MAX_OUTPUT_DIMENSION}px. Coba gambar yang lebih ` +
+        `kecil atau scale yang lebih rendah.`,
+    );
+  }
+
+  const outputBuffer = await sharp(inputBuffer)
+    .resize(targetWidth, targetHeight, {
+      fit: "fill", // target sudah proporsional (dikali scale yang sama), jadi aman
+      kernel: sharp.kernel.lanczos3, // kernel resize paling tajam yang didukung sharp
+    })
+    .sharpen({ sigma: 1.2 }) // penajaman tambahan biar hasil upscale gak keliatan blur
+    .png()
+    .toBuffer();
+
+  if (outputBuffer.length > REALESRGAN_MAX_OUTPUT_MB * 1024 * 1024) {
+    throw new Error(
+      `Hasil upscale melebihi batas ukuran ${REALESRGAN_MAX_OUTPUT_MB}MB.`,
+    );
+  }
+
+  return outputBuffer;
 }
 
 // teks bisa "atas|bawah" (dua baris) atau cuma "teks" (satu baris di bawah)
@@ -2299,10 +2375,15 @@ async function startBot() {
         });
       }
 
+      const engineLabel =
+        HD_ENGINE === "realesrgan"
+          ? "🤖 AI Super Resolution"
+          : "✨ Upscale + Penajaman";
+
       try {
         const resultBuffer = await enqueueHdJob(async () => {
           await sock.sendMessage(jid, {
-            text: `⏳ Memproses gambar...\n\n🤖 AI Super Resolution\n📐 Scale: ${scale}x`,
+            text: `⏳ Memproses gambar...\n\n${engineLabel}\n📐 Scale: ${scale}x`,
           });
 
           const inputBuffer = await downloadGifBuffer(
@@ -2310,12 +2391,19 @@ async function startBot() {
             source.refKey,
           );
 
-          return upscaleImageWithRealEsrgan(inputBuffer, scale);
+          return HD_ENGINE === "realesrgan"
+            ? upscaleImageWithRealEsrgan(inputBuffer, scale)
+            : upscaleImageWithSharp(inputBuffer, scale);
         });
+
+        const successLine =
+          HD_ENGINE === "realesrgan"
+            ? "✨ Gambar berhasil di-upscale menggunakan AI."
+            : "✨ Gambar berhasil di-upscale & dipertajam.";
 
         await sock.sendMessage(jid, {
           image: resultBuffer,
-          caption: `✅ Berhasil!\n\n✨ Gambar berhasil di-upscale menggunakan AI.\n📐 Scale: ${scale}x`,
+          caption: `✅ Berhasil!\n\n${successLine}\n📐 Scale: ${scale}x`,
         });
       } catch (err) {
         console.log("=== [!hd] gagal ===");
