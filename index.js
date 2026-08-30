@@ -404,6 +404,7 @@ Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti
 ┃ 📥 *DOWNLOAD MEDIA*
 ┗━━━━━━━━━━━━━━━┛
 ▸ !dl
+▸ !dlr
 
 ┏━━━━━━━━━━━━━━━┓
 ┃ 🖼️ *AI UPSCALE*
@@ -524,7 +525,7 @@ Ubah stiker jadi gambar biasa (PNG). Kalau stikernya animasi, yang diambil cuma 
 
 Download video/audio dari sebuah link: YouTube, Bilibili, Facebook (video/reel/postingan video), TikTok, Instagram, X/Twitter, dan situs lain yang didukung.
 
-Kalau link-nya ternyata postingan *foto* (carousel Instagram, atau slideshow foto+musik TikTok), bot otomatis kirim semua fotonya satu-satu, plus musiknya (kalau ada) di akhir.
+Kalau link-nya ternyata postingan *foto* (carousel Instagram, atau slideshow foto+musik TikTok), bot otomatis kirim semua fotonya satu-satu, plus musiknya (kalau ada) di akhir. Atau pakai *!dlr* langsung kalau sudah tau link-nya foto/carousel.
 
 *Contoh:*
 \`\`\`
@@ -538,7 +539,21 @@ Kalau link-nya ternyata postingan *foto* (carousel Instagram, atau slideshow fot
 
 Bisa langsung tambahin *mp3* atau *mp4* setelah link-nya kalau mau override format audio/video (default: video).
 
-⚠️ Batas ukuran file *95MB*. Postingan Facebook yang isinya cuma FOTO (bukan video) tidak didukung -- ini murni buat video/audio.`,
+⚠️ Batas ukuran file *95MB*.`,
+
+  dlr: `📷 *!dlr <link>*
+
+Download khusus postingan *foto/carousel* -- Instagram carousel (beberapa foto digeser) atau TikTok mode foto+musik/slideshow. Semua foto dikirim satu-satu sesuai urutan aslinya, terus musiknya (kalau ada) di akhir.
+
+Beda dari *!dl*: langsung ambil jalur foto tanpa nyoba download video dulu -- lebih cepat kalau kamu sudah tau link-nya carousel/slideshow foto (untuk video/reel biasa, tetap pakai *!dl*).
+
+*Contoh:*
+\`\`\`
+!dlr https://www.instagram.com/p/xxxxxxxxxxx
+!dlr https://www.tiktok.com/@user/video/xxxxxxxxxxx
+\`\`\`
+
+⚠️ Batas ukuran file *95MB* per foto. Postingan Facebook yang isinya cuma FOTO (bukan video) tidak didukung -- ini murni buat Instagram/TikTok.`,
 };
 
 
@@ -1837,16 +1852,12 @@ async function tryDownloadGalleryAudio(url) {
   }
 }
 
-// Orkestrasi jalur foto, dipanggil dari catch block handleDlDownload.
-// Return true kalau berhasil kirim minimal 1 foto (artinya user SUDAH
-// dapet respons, pemanggil gak perlu nampilin pesan error generik lagi)
-// -- return false kalau ternyata bukan postingan foto juga (gak ada foto
-// ketemu), biar pemanggil lanjut ke pesan error biasa.
-async function tryHandleAsPhotoPost(sock, jid, url) {
-  await sock.sendMessage(jid, {
-    text: "🖼️ Sepertinya ini postingan foto, bukan video. Coba download fotonya...",
-  });
-
+// Inti kirim galeri foto + musik latar (kalau ada) -- dipakai BARENG oleh
+// 2 pemanggil: tryHandleAsPhotoPost (fallback otomatis dari "!dl") dan
+// handleDlrDownload ("!dlr", command khusus foto/carousel). Return true
+// kalau berhasil kirim minimal 1 foto, false kalau ternyata gak ada foto
+// yang bisa diambil dari link ini sama sekali.
+async function sendPhotoGallery(sock, jid, url) {
   let buffers;
   try {
     const result = await enqueueDownloadJob(() =>
@@ -1854,7 +1865,7 @@ async function tryHandleAsPhotoPost(sock, jid, url) {
     );
     buffers = result.buffers;
   } catch (err) {
-    console.log("[dl][foto] Gagal download foto juga:", err.message || err);
+    console.log("[dl][foto] Gagal download foto:", err.message || err);
     return false;
   }
 
@@ -1882,6 +1893,52 @@ async function tryHandleAsPhotoPost(sock, jid, url) {
   }
 
   return true;
+}
+
+// Dipanggil dari catch block handleDlDownload sebagai fallback OTOMATIS
+// kalau "!dl" biasa ternyata kena link foto/carousel. Return true kalau
+// berhasil kirim minimal 1 foto (artinya user SUDAH dapet respons,
+// pemanggil gak perlu nampilin pesan error generik lagi) -- return false
+// kalau ternyata bukan postingan foto juga, biar pemanggil lanjut ke
+// pesan error biasa.
+async function tryHandleAsPhotoPost(sock, jid, url) {
+  await sock.sendMessage(jid, {
+    text: "🖼️ Sepertinya ini postingan foto, bukan video. Coba download fotonya...",
+  });
+
+  return sendPhotoGallery(sock, jid, url);
+}
+
+// "!dlr <link>" -- command KHUSUS foto/carousel/slideshow, langsung ambil
+// jalur foto tanpa nyoba jalur video dulu (beda dari "!dl" yang nyoba
+// video dulu baru fallback ke foto kalau gagal). Berguna kalau user sudah
+// tau link-nya carousel/slideshow, biar gak buang waktu nunggu percobaan
+// video yang pasti gagal duluan.
+async function handleDlrDownload(sock, jid, url) {
+  try {
+    await sock.sendMessage(jid, {
+      text: "⏳ Download foto/carousel, tunggu ya...",
+    });
+
+    const sent = await sendPhotoGallery(sock, jid, url);
+
+    if (!sent) {
+      await sock.sendMessage(jid, {
+        text:
+          "❌ Gagal download foto.\n\n" +
+          "Gak ada foto yang bisa diambil dari link ini -- pastikan ini " +
+          "beneran link carousel/slideshow foto (kalau ini video, pakai " +
+          "!dl saja).",
+      });
+    }
+  } catch (err) {
+    console.log("=== [dlr] gagal ===");
+    console.log(err.message || err);
+    console.log("===================");
+    await sock.sendMessage(jid, {
+      text: "❌ Gagal download foto.\n\nSilakan coba lagi atau cek link-nya.",
+    });
+  }
 }
 
 async function handleDlDownload(sock, jid, url, mode) {
@@ -3154,6 +3211,33 @@ async function startBot() {
       // downloadMediaFromUrl(), gak perlu logic tambahan di sini.
       const mode = hint === "mp3" || hint === "audio" ? "audio" : "video";
       await handleDlDownload(sock, jid, url, mode);
+      return;
+    }
+
+    // =====================
+    // !dlr <link> -- khusus foto/carousel/slideshow (Instagram carousel,
+    // TikTok mode foto+musik). Beda dari "!dl": langsung ambil jalur foto
+    // tanpa nyoba video dulu.
+    // =====================
+    if (text === "!dlr" || text.startsWith("!dlr ")) {
+      const rest = text.slice(4).trim();
+      const urlMatch = rest.match(/https?:\/\/\S+/i);
+
+      if (!urlMatch) {
+        await sendCommandDetail(sock, jid, "dlr");
+        return;
+      }
+
+      const url = urlMatch[0];
+
+      try {
+        new URL(url); // validasi cepat, lempar kalau bukan URL valid
+      } catch {
+        await sock.sendMessage(jid, { text: "❌ Link tidak valid." });
+        return;
+      }
+
+      await handleDlrDownload(sock, jid, url);
       return;
     }
 
