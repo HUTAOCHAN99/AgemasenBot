@@ -524,6 +524,8 @@ Ubah stiker jadi gambar biasa (PNG). Kalau stikernya animasi, yang diambil cuma 
 
 Download video/audio dari sebuah link: YouTube, Bilibili, Facebook (video/reel/postingan video), TikTok, Instagram, X/Twitter, dan situs lain yang didukung.
 
+Kalau link-nya ternyata postingan *foto* (carousel Instagram, atau slideshow foto+musik TikTok), bot otomatis kirim semua fotonya satu-satu, plus musiknya (kalau ada) di akhir.
+
 *Contoh:*
 \`\`\`
 !dl https://youtu.be/xxxxxxxxxxx
@@ -531,6 +533,7 @@ Download video/audio dari sebuah link: YouTube, Bilibili, Facebook (video/reel/p
 !dl https://www.tiktok.com/@user/video/xxxxxxxxxxx
 !dl https://www.bilibili.com/video/xxxxxxxxxxx
 !dl https://www.facebook.com/reel/xxxxxxxxxxx
+!dl https://www.instagram.com/p/xxxxxxxxxxx
 \`\`\`
 
 Bisa langsung tambahin *mp3* atau *mp4* setelah link-nya kalau mau override format audio/video (default: video).
@@ -1667,9 +1670,17 @@ async function downloadMediaFromUrl(url, mode) {
       .filter((f) => f.startsWith(`dl-${uid}`));
 
     if (files.length === 0) {
-      throw new Error(
+      // yt-dlp selesai TANPA error (exit code 0) tapi gak ada file yang
+      // dihasilkan -- pola ini paling sering kejadian pas link-nya
+      // postingan FOTO (carousel Instagram / slideshow TikTok), bukan
+      // video. Ditandai lewat properti ini biar handleDlDownload bisa
+      // otomatis nyoba jalur foto (lihat tryHandleAsPhotoPost) sebelum
+      // nyerah dan nampilin error ke user.
+      const err = new Error(
         "File hasil download tidak ditemukan. Mungkin link-nya tidak mengandung video/audio (mis. postingan berupa foto saja), atau ukurannya melebihi batas 95MB.",
       );
+      err.possiblyPhotoOnly = true;
+      throw err;
     }
 
     const outputPath = path.join(tmpDir, files[0]);
@@ -1690,6 +1701,174 @@ async function downloadMediaFromUrl(url, mode) {
       // abaikan -- ini cuma usaha bersih-bersih tmp, bukan hal kritis
     }
   }
+}
+
+// =====================================================
+// Fitur: download foto/carousel/slideshow lewat "!dl" (Agustus 2026)
+// -----------------------------------------------------
+// Dipicu OTOMATIS dari handleDlDownload kalau downloadMediaFromUrl gagal
+// dengan err.possiblyPhotoOnly (lihat komentar di sana) -- artinya
+// link-nya kemungkinan besar carousel foto Instagram atau slideshow
+// foto+musik TikTok, BUKAN video biasa.
+//
+// Beda utama dari jalur video/audio: pakai "--yes-playlist" (BUKAN
+// "--no-playlist" yang sengaja dipasang di downloadMediaFromUrl) --
+// soalnya carousel/slideshow foto justru DIWAKILI yt-dlp sebagai
+// "playlist" berisi 1 entry per foto. "%(playlist_index)03d" di nama
+// file dipakai biar urutan foto yang dikirim ke user PERSIS sama kayak
+// urutan aslinya di postingan (padding 3 digit biar sort string = sort
+// angka, "001" < "002" < ... < "010").
+// =====================================================
+async function downloadImageGalleryFromUrl(url) {
+  const tmpDir = os.tmpdir();
+  const uid = crypto.randomBytes(6).toString("hex");
+  const outputTemplate = path.join(
+    tmpDir,
+    `dlimg-${uid}-%(playlist_index)03d.%(ext)s`,
+  );
+
+  const args = [
+    "--yes-playlist",
+    "--ffmpeg-location",
+    path.dirname(ffmpegPath),
+    "--max-filesize",
+    DL_MAX_FILESIZE,
+    "--sleep-requests",
+    "1",
+    "-o",
+    outputTemplate,
+    url,
+  ];
+
+  try {
+    await runYtDlp(args);
+
+    const imageExtRe = /\.(jpe?g|png|webp|heic|heif)$/i;
+    const files = fs
+      .readdirSync(tmpDir)
+      .filter((f) => f.startsWith(`dlimg-${uid}-`) && imageExtRe.test(f))
+      .sort();
+
+    if (files.length === 0) {
+      throw new Error("Tidak ada foto yang bisa diunduh dari link ini.");
+    }
+
+    const buffers = files.map((f) => fs.readFileSync(path.join(tmpDir, f)));
+    return { buffers };
+  } finally {
+    try {
+      for (const f of fs.readdirSync(tmpDir)) {
+        if (f.startsWith(`dlimg-${uid}-`)) {
+          fs.rm(path.join(tmpDir, f), { force: true }, () => {});
+        }
+      }
+    } catch {
+      // abaikan -- ini cuma usaha bersih-bersih tmp, bukan hal kritis
+    }
+  }
+}
+
+// Best-effort ambil musik latar postingan foto (relevan buat TikTok mode
+// foto+musik/slideshow -- carousel foto Instagram biasa gak punya ini).
+// SENGAJA gak boleh bikin keseluruhan fitur foto gagal kalau musiknya
+// gak ketemu/gak ada -- error di sini cuma di-log & return null, gak
+// pernah dilempar ke pemanggil (foto-fotonya tetap harus terkirim walau
+// musiknya gagal/gak ada).
+async function tryDownloadGalleryAudio(url) {
+  const tmpDir = os.tmpdir();
+  const uid = crypto.randomBytes(6).toString("hex");
+  const outputTemplate = path.join(tmpDir, `dlimgaudio-${uid}.%(ext)s`);
+
+  const args = [
+    "--no-playlist",
+    "--ffmpeg-location",
+    path.dirname(ffmpegPath),
+    "--max-filesize",
+    DL_MAX_FILESIZE,
+    "-x",
+    "--audio-format",
+    "mp3",
+    "--audio-quality",
+    "5",
+    "-o",
+    outputTemplate,
+    url,
+  ];
+
+  try {
+    await runYtDlp(args);
+
+    const files = fs
+      .readdirSync(tmpDir)
+      .filter((f) => f.startsWith(`dlimgaudio-${uid}`) && f.endsWith(".mp3"));
+
+    if (files.length === 0) return null;
+
+    return fs.readFileSync(path.join(tmpDir, files[0]));
+  } catch (err) {
+    console.log(
+      "[dl][foto] Gak berhasil ambil musik latar (dilewati, bukan fatal):",
+      err.message || err,
+    );
+    return null;
+  } finally {
+    try {
+      for (const f of fs.readdirSync(tmpDir)) {
+        if (f.startsWith(`dlimgaudio-${uid}`)) {
+          fs.rm(path.join(tmpDir, f), { force: true }, () => {});
+        }
+      }
+    } catch {
+      // abaikan
+    }
+  }
+}
+
+// Orkestrasi jalur foto, dipanggil dari catch block handleDlDownload.
+// Return true kalau berhasil kirim minimal 1 foto (artinya user SUDAH
+// dapet respons, pemanggil gak perlu nampilin pesan error generik lagi)
+// -- return false kalau ternyata bukan postingan foto juga (gak ada foto
+// ketemu), biar pemanggil lanjut ke pesan error biasa.
+async function tryHandleAsPhotoPost(sock, jid, url) {
+  await sock.sendMessage(jid, {
+    text: "🖼️ Sepertinya ini postingan foto, bukan video. Coba download fotonya...",
+  });
+
+  let buffers;
+  try {
+    const result = await enqueueDownloadJob(() =>
+      downloadImageGalleryFromUrl(url),
+    );
+    buffers = result.buffers;
+  } catch (err) {
+    console.log("[dl][foto] Gagal download foto juga:", err.message || err);
+    return false;
+  }
+
+  for (let i = 0; i < buffers.length; i++) {
+    await sock.sendMessage(jid, {
+      image: buffers[i],
+      caption:
+        i === 0
+          ? `✅ Berhasil didownload (${buffers.length} foto).\n🔗 ${url}`
+          : undefined,
+    });
+  }
+
+  // Musik latar (kalau ada) dikirim TERAKHIR, setelah semua foto -- biar
+  // urutan pesan di chat rapi: foto-foto dulu baru musiknya.
+  const audioBuffer = await enqueueDownloadJob(() =>
+    tryDownloadGalleryAudio(url),
+  );
+  if (audioBuffer) {
+    await sock.sendMessage(jid, {
+      audio: audioBuffer,
+      mimetype: "audio/mpeg",
+      fileName: "musik.mp3",
+    });
+  }
+
+  return true;
 }
 
 async function handleDlDownload(sock, jid, url, mode) {
@@ -1730,6 +1909,15 @@ async function handleDlDownload(sock, jid, url, mode) {
     if (isYoutubeUrl(url) && isRateLimitOrBotDetectionError(err.stderr)) {
       registerYtdlpRateLimitFailure();
     }
+
+    // Kemungkinan postingan foto (carousel Instagram / slideshow foto+musik
+    // TikTok) -- yt-dlp jalan sukses tapi emang gak ada video/audio buat
+    // di-download lewat jalur biasa. Coba jalur foto dulu sebelum nyerah.
+    if (err.possiblyPhotoOnly) {
+      const handled = await tryHandleAsPhotoPost(sock, jid, url);
+      if (handled) return;
+    }
+
     console.log("=== [dl] yt-dlp gagal ===");
     console.log("message:", err.message);
     if (err.stderr) {
