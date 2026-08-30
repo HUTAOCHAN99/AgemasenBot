@@ -2472,6 +2472,32 @@ async function startBot() {
     }
 
     // =====================
+    // !dlstatus -- cek status backoff rate-limit YouTube langsung dari
+    // WhatsApp, gak perlu buka Railway Logs buat tau kondisinya.
+    // =====================
+    if (text === "!dlstatus") {
+      const remainingMs = getYtdlpBackoffRemainingMs();
+      if (remainingMs > 0) {
+        await sock.sendMessage(jid, {
+          text:
+            `⏳ Lagi backoff (kena rate-limit YouTube). ` +
+            `Sisa waktu tunggu: ~${formatDurationId(remainingMs)}.\n` +
+            `Bot bakal otomatis coba lagi setelah waktu itu lewat -- ` +
+            `!dl YouTube bakal ditolak dulu sementara ini biar gak nambah beban ke IP-nya.`,
+        });
+      } else {
+        await sock.sendMessage(jid, {
+          text:
+            "✅ Gak lagi kena backoff. !dl YouTube seharusnya bisa dicoba normal.\n" +
+            "(Catatan: ini status TERAKHIR YANG TERCATAT dari percobaan sebelumnya -- " +
+            "kalau dari deploy terakhir belum ada yang pernah nyoba !dl sama sekali, " +
+            "status ini belum tentu mencerminkan kondisi IP yang sebenarnya.)",
+        });
+      }
+      return;
+    }
+
+    // =====================
     // !dl <link> [mp3|mp4]
     // =====================
     if (text === "!dl" || text.startsWith("!dl ")) {
