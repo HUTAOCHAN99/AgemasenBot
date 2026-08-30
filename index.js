@@ -1290,6 +1290,12 @@ async function stickerToImageBuffer(buffer) {
 // convert ke MP3 tanpa butuh ffmpeg sistem.
 // =====================================================
 const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp";
+// Binary "gallery-dl" -- TERPISAH dari yt-dlp, dipakai KHUSUS buat jalur
+// foto/carousel/slideshow ("!dl" fallback foto & "!dlr"). yt-dlp TERBUKTI
+// gak reliable buat foto Instagram/TikTok (lihat komentar panjang di
+// downloadGalleryFromUrl di bawah) -- gallery-dl dirancang khusus buat
+// gambar/galeri jadi jauh lebih cocok buat kasus ini.
+const GALLERYDL_PATH = process.env.GALLERYDL_PATH || "gallery-dl";
 
 // URL base HTTP server "bgutil-ytdlp-pot-provider" (Proof-of-Origin Token
 // provider), KALAU mau di-deploy sebagai service terpisah (mis. di
@@ -1732,123 +1738,117 @@ async function downloadMediaFromUrl(url, mode) {
 }
 
 // =====================================================
-// Fitur: download foto/carousel/slideshow lewat "!dl" (Agustus 2026)
+// Fitur: download foto/carousel/slideshow ("!dl" fallback foto & "!dlr")
+// -- Agustus 2026, migrasi dari yt-dlp ke gallery-dl
 // -----------------------------------------------------
-// Dipicu OTOMATIS dari handleDlDownload kalau downloadMediaFromUrl gagal
-// dengan err.possiblyPhotoOnly (lihat komentar di sana) -- artinya
-// link-nya kemungkinan besar carousel foto Instagram atau slideshow
-// foto+musik TikTok, BUKAN video biasa.
+// PENTING (kenapa BUKAN pakai yt-dlp lagi): sempat dicoba pakai yt-dlp
+// dulu (--yes-playlist dst), TAPI ternyata itu bukan cuma soal argumen
+// yang kurang tepat -- yt-dlp memang gak reliable buat narik foto
+// carousel Instagram. ini KONFIRMASI dari laporan resmi di GitHub
+// yt-dlp (issue #12439, "Cannot retrieve Instagram post data ... Cannot
+// download images") yang DITUTUP oleh maintainer-nya sebagai "invalid"
+// -- bukan bug yang bakal diperbaiki, karena yt-dlp emang dirancang buat
+// video, formatnya maksa nyari "video formats" bahkan buat slide yang
+// isinya cuma gambar, makanya error "No video formats found!".
 //
-// Beda utama dari jalur video/audio: pakai "--yes-playlist" (BUKAN
-// "--no-playlist" yang sengaja dipasang di downloadMediaFromUrl) --
-// soalnya carousel/slideshow foto justru DIWAKILI yt-dlp sebagai
-// "playlist" berisi 1 entry per foto. "%(playlist_index)03d" di nama
-// file dipakai biar urutan foto yang dikirim ke user PERSIS sama kayak
-// urutan aslinya di postingan (padding 3 digit biar sort string = sort
-// angka, "001" < "002" < ... < "010").
+// "gallery-dl" (proyek terpisah, TERPISAH dari yt-dlp) didesain khusus
+// buat gambar/galeri, dan resmi dukung Instagram (Posts/Reels) & TikTok
+// (termasuk mode foto+musik/slideshow, ditambahkan Feb 2025) tanpa
+// masalah "no video formats" itu -- makanya jalur foto sekarang pindah
+// ke sini, TERPISAH dari runYtDlp/downloadMediaFromUrl yang tetap pakai
+// yt-dlp buat video/audio biasa.
+//
+// Beda dari jalur video: pakai folder tujuan UNIK per job (lewat "-D",
+// override total struktur folder bawaan gallery-dl per situs/user) biar
+// gampang baca balik semua file hasil download tanpa perlu tebak-tebak
+// nama file. Foto & musik latar (kalau ada, khusus TikTok slideshow)
+// ke-download dalam SATU proses gallery-dl yang sama -- gak perlu 2 kali
+// panggil kayak versi yt-dlp dulu.
 // =====================================================
-async function downloadImageGalleryFromUrl(url) {
-  const tmpDir = os.tmpdir();
+function runGalleryDl(args) {
+  return new Promise((resolve, reject) => {
+    let proc;
+
+    try {
+      proc = spawn(GALLERYDL_PATH, args);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+
+    let stderr = "";
+
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    proc.on("error", (err) => {
+      if (err.code === "ENOENT") {
+        reject(
+          new Error(
+            `gallery-dl tidak ditemukan di server. Install dulu ` +
+              `(\`pip install -U gallery-dl\`) lalu pastikan ada di PATH, ` +
+              `atau set env var GALLERYDL_PATH ke lokasi binary-nya.`,
+          ),
+        );
+        return;
+      }
+      reject(err);
+    });
+    proc.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        console.error("[gallery-dl] gagal, stderr mentah:\n" + stderr);
+        const err = new Error(
+          `gallery-dl keluar dengan kode ${code}\n${stderr.slice(-800)}`,
+        );
+        err.stderr = stderr;
+        reject(err);
+      }
+    });
+  });
+}
+
+async function downloadGalleryFromUrl(url) {
   const uid = crypto.randomBytes(6).toString("hex");
-  const outputTemplate = path.join(
-    tmpDir,
-    `dlimg-${uid}-%(playlist_index)03d.%(ext)s`,
-  );
+  const jobDir = path.join(os.tmpdir(), `dlgallery-${uid}`);
+  fs.mkdirSync(jobDir, { recursive: true });
 
   const args = [
-    "--yes-playlist",
-    "--ffmpeg-location",
-    path.dirname(ffmpegPath),
-    "--max-filesize",
-    DL_MAX_FILESIZE,
-    "--sleep-requests",
-    "1",
-    "-o",
-    outputTemplate,
+    "-D",
+    jobDir, // simpan SEMUA file langsung di folder ini, gak usah nested per situs/user
+    "--no-mtime",
     url,
   ];
 
   try {
-    await runYtDlp(args);
+    await runGalleryDl(args);
 
+    const allFiles = fs.readdirSync(jobDir).sort();
     const imageExtRe = /\.(jpe?g|png|webp|heic|heif)$/i;
-    const files = fs
-      .readdirSync(tmpDir)
-      .filter((f) => f.startsWith(`dlimg-${uid}-`) && imageExtRe.test(f))
-      .sort();
+    const audioExtRe = /\.(mp3|m4a|aac|ogg)$/i;
 
-    if (files.length === 0) {
+    const imageFiles = allFiles.filter((f) => imageExtRe.test(f));
+    const audioFiles = allFiles.filter((f) => audioExtRe.test(f));
+
+    if (imageFiles.length === 0) {
       throw new Error("Tidak ada foto yang bisa diunduh dari link ini.");
     }
 
-    const buffers = files.map((f) => fs.readFileSync(path.join(tmpDir, f)));
-    return { buffers };
-  } finally {
-    try {
-      for (const f of fs.readdirSync(tmpDir)) {
-        if (f.startsWith(`dlimg-${uid}-`)) {
-          fs.rm(path.join(tmpDir, f), { force: true }, () => {});
-        }
-      }
-    } catch {
-      // abaikan -- ini cuma usaha bersih-bersih tmp, bukan hal kritis
-    }
-  }
-}
-
-// Best-effort ambil musik latar postingan foto (relevan buat TikTok mode
-// foto+musik/slideshow -- carousel foto Instagram biasa gak punya ini).
-// SENGAJA gak boleh bikin keseluruhan fitur foto gagal kalau musiknya
-// gak ketemu/gak ada -- error di sini cuma di-log & return null, gak
-// pernah dilempar ke pemanggil (foto-fotonya tetap harus terkirim walau
-// musiknya gagal/gak ada).
-async function tryDownloadGalleryAudio(url) {
-  const tmpDir = os.tmpdir();
-  const uid = crypto.randomBytes(6).toString("hex");
-  const outputTemplate = path.join(tmpDir, `dlimgaudio-${uid}.%(ext)s`);
-
-  const args = [
-    "--no-playlist",
-    "--ffmpeg-location",
-    path.dirname(ffmpegPath),
-    "--max-filesize",
-    DL_MAX_FILESIZE,
-    "-x",
-    "--audio-format",
-    "mp3",
-    "--audio-quality",
-    "5",
-    "-o",
-    outputTemplate,
-    url,
-  ];
-
-  try {
-    await runYtDlp(args);
-
-    const files = fs
-      .readdirSync(tmpDir)
-      .filter((f) => f.startsWith(`dlimgaudio-${uid}`) && f.endsWith(".mp3"));
-
-    if (files.length === 0) return null;
-
-    return fs.readFileSync(path.join(tmpDir, files[0]));
-  } catch (err) {
-    console.log(
-      "[dl][foto] Gak berhasil ambil musik latar (dilewati, bukan fatal):",
-      err.message || err,
+    const imageBuffers = imageFiles.map((f) =>
+      fs.readFileSync(path.join(jobDir, f)),
     );
-    return null;
-  } finally {
-    try {
-      for (const f of fs.readdirSync(tmpDir)) {
-        if (f.startsWith(`dlimgaudio-${uid}`)) {
-          fs.rm(path.join(tmpDir, f), { force: true }, () => {});
-        }
-      }
-    } catch {
-      // abaikan
+
+    let audioBuffer = null;
+    let audioExt = null;
+    if (audioFiles.length > 0) {
+      audioExt = path.extname(audioFiles[0]).slice(1).toLowerCase();
+      audioBuffer = fs.readFileSync(path.join(jobDir, audioFiles[0]));
     }
+
+    return { imageBuffers, audioBuffer, audioExt };
+  } finally {
+    fs.rm(jobDir, { recursive: true, force: true }, () => {});
   }
 }
 
@@ -1858,37 +1858,42 @@ async function tryDownloadGalleryAudio(url) {
 // kalau berhasil kirim minimal 1 foto, false kalau ternyata gak ada foto
 // yang bisa diambil dari link ini sama sekali.
 async function sendPhotoGallery(sock, jid, url) {
-  let buffers;
+  let imageBuffers, audioBuffer, audioExt;
   try {
     const result = await enqueueDownloadJob(() =>
-      downloadImageGalleryFromUrl(url),
+      downloadGalleryFromUrl(url),
     );
-    buffers = result.buffers;
+    imageBuffers = result.imageBuffers;
+    audioBuffer = result.audioBuffer;
+    audioExt = result.audioExt;
   } catch (err) {
     console.log("[dl][foto] Gagal download foto:", err.message || err);
     return false;
   }
 
-  for (let i = 0; i < buffers.length; i++) {
+  for (let i = 0; i < imageBuffers.length; i++) {
     await sock.sendMessage(jid, {
-      image: buffers[i],
+      image: imageBuffers[i],
       caption:
         i === 0
-          ? `✅ Berhasil didownload (${buffers.length} foto).\n🔗 ${url}`
+          ? `✅ Berhasil didownload (${imageBuffers.length} foto).\n🔗 ${url}`
           : undefined,
     });
   }
 
-  // Musik latar (kalau ada) dikirim TERAKHIR, setelah semua foto -- biar
-  // urutan pesan di chat rapi: foto-foto dulu baru musiknya.
-  const audioBuffer = await enqueueDownloadJob(() =>
-    tryDownloadGalleryAudio(url),
-  );
+  // Musik latar (kalau ada -- khusus TikTok slideshow) dikirim TERAKHIR,
+  // setelah semua foto -- biar urutan pesan di chat rapi.
   if (audioBuffer) {
+    const mimetypeByExt = {
+      mp3: "audio/mpeg",
+      m4a: "audio/mp4",
+      aac: "audio/aac",
+      ogg: "audio/ogg",
+    };
     await sock.sendMessage(jid, {
       audio: audioBuffer,
-      mimetype: "audio/mpeg",
-      fileName: "musik.mp3",
+      mimetype: mimetypeByExt[audioExt] || "audio/mp4",
+      fileName: `musik.${audioExt || "mp3"}`,
     });
   }
 
