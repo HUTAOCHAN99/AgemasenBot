@@ -1297,6 +1297,62 @@ const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp";
 // gambar/galeri jadi jauh lebih cocok buat kasus ini.
 const GALLERYDL_PATH = process.env.GALLERYDL_PATH || "gallery-dl";
 
+// Cookies buat gallery-dl (khusus Instagram) -- sejak pertengahan 2025,
+// Instagram makin agresif maksa login bahkan buat postingan PUBLIK kalau
+// request-nya datang tanpa cookies/sesi yang valid. Tanpa ini,
+// gallery-dl bakal kena redirect ke halaman login ("HTTP redirect to
+// login page") dan gagal total, walau link-nya postingan publik biasa.
+//
+// Cara siapin:
+//   1. Login ke instagram.com di browser BIASA (Chrome/Firefox) pakai
+//      akun mana aja (disaranin akun "buangan", BUKAN akun utama --
+//      cookies ini dipakai bareng buat SEMUA request bot, jadi kalau
+//      akunnya kena flag, semua fitur foto IG ikut kena).
+//   2. Export cookies-nya ke format Netscape (cookies.txt) pakai
+//      extension browser, mis. "Get cookies.txt LOCALLY" (Chrome) atau
+//      "cookies.txt" (Firefox).
+//   3. Upload file hasil export itu ke server (mis. taruh di repo project
+//      -- TAPI JANGAN commit ke git public, tambahin ke .gitignore --
+//      atau upload manual ke Railway lewat volume/shell).
+//   4. Set env var ini (di Railway tab Variables) ke path file-nya, mis.
+//      GALLERYDL_COOKIES_FILE=/app/instagram-cookies.txt
+//
+// Opsional -- kalau kosong (default), gallery-dl jalan tanpa cookies
+// (bakal gagal khusus buat Instagram, TikTok biasanya masih OK tanpa
+// ini). Cookies expire dari waktu ke waktu (biasanya beberapa
+// minggu/bulan) -- kalau tiba-tiba mulai gagal lagi dengan pesan yang
+// sama, kemungkinan besar cookies-nya sudah kadaluarsa, tinggal ulangi
+// langkah export di atas.
+const GALLERYDL_COOKIES_FILE = process.env.GALLERYDL_COOKIES_FILE || "";
+
+// Alternatif dari GALLERYDL_COOKIES_FILE di atas -- LEBIH SIMPEL setup-nya
+// (gak perlu extension browser & export manual), tapi TRADE-OFF-nya
+// password akun IG kesimpen di server (env var) dan gallery-dl login
+// sendiri lewat script setiap kali dipanggil -- pola ini lebih gampang
+// bikin Instagram curiga & minta verifikasi tambahan ("Suspicious Login
+// Attempt" / checkpoint / 2FA) dibanding pakai cookies dari sesi browser
+// asli.
+//
+// WAJIB pakai akun "buangan", BUKAN akun IG utama/pribadi -- akun ini
+// dipakai bareng buat SEMUA request bot, jadi paling rawan kena
+// flag/suspend duluan kalau bot dipakai banyak orang & sering.
+//
+// Kalau KEDUANYA (cookies file & username/password) diisi, cookies file
+// yang menang (lihat downloadGalleryFromUrl) -- keduanya gak dipakai
+// bareng.
+//
+// Cara pakai: isi 2 env var ini di Railway (tab Variables):
+//   GALLERYDL_INSTAGRAM_USERNAME = username akun buangan
+//   GALLERYDL_INSTAGRAM_PASSWORD = password akun buangan
+//
+// Kosongkan (default) buat nonaktifin -- gallery-dl jalan tanpa
+// autentikasi Instagram sama sekali (bakal gagal khusus Instagram, lihat
+// komentar GALLERYDL_COOKIES_FILE di atas soal kenapa).
+const GALLERYDL_INSTAGRAM_USERNAME =
+  process.env.GALLERYDL_INSTAGRAM_USERNAME || "";
+const GALLERYDL_INSTAGRAM_PASSWORD =
+  process.env.GALLERYDL_INSTAGRAM_PASSWORD || "";
+
 // URL base HTTP server "bgutil-ytdlp-pot-provider" (Proof-of-Origin Token
 // provider), KALAU mau di-deploy sebagai service terpisah (mis. di
 // Railway) buat kasus deteksi bot yang masih lolos walau sudah pakai
@@ -1818,8 +1874,30 @@ async function downloadGalleryFromUrl(url) {
     "-D",
     jobDir, // simpan SEMUA file langsung di folder ini, gak usah nested per situs/user
     "--no-mtime",
-    url,
   ];
+
+  // Kalau cookies Instagram udah disiapin (lihat komentar panjang di
+  // GALLERYDL_COOKIES_FILE), pakai buat semua request -- ini yang
+  // nyelesein error "HTTP redirect to login page" khusus Instagram.
+  // TikTok gak butuh ini, tapi gak masalah dikasih bareng karena
+  // gallery-dl cuma make cookies yang cocok domain-nya per situs.
+  //
+  // Cookies file diprioritaskan di atas username/password kalau DUA-
+  // duanya keisi -- lebih stabil karena gak nge-trigger login script
+  // baru tiap kali dipanggil (lihat komentar GALLERYDL_INSTAGRAM_USERNAME
+  // soal kenapa itu lebih rawan checkpoint).
+  if (GALLERYDL_COOKIES_FILE) {
+    args.push("--cookies", GALLERYDL_COOKIES_FILE);
+  } else if (GALLERYDL_INSTAGRAM_USERNAME && GALLERYDL_INSTAGRAM_PASSWORD) {
+    args.push(
+      "--username",
+      GALLERYDL_INSTAGRAM_USERNAME,
+      "--password",
+      GALLERYDL_INSTAGRAM_PASSWORD,
+    );
+  }
+
+  args.push(url);
 
   try {
     await runGalleryDl(args);
