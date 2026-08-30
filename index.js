@@ -1374,7 +1374,7 @@ function registerYtdlpSuccess() {
 // sendiri (private/geo-restricted/dll -- itu gak ada hubungannya sama
 // kondisi IP, jadi gak perlu bikin bot ikut "diam").
 function isRateLimitOrBotDetectionError(raw) {
-  return /HTTP Error 429|Too Many Requests|sign in to confirm you.?re not a bot/i.test(
+  return /HTTP Error 429|Too Many Requests|sign in to confirm you.?re not a bot|Only images are available|Missing required Visitor Data/i.test(
     raw || "",
   );
 }
@@ -1521,7 +1521,17 @@ async function downloadMediaFromUrl(url, mode) {
 
   const commonArgs = [
     "--no-playlist",
-    "--no-warnings",
+    // CATATAN: --no-warnings SENGAJA TIDAK dipakai (walau dulu ada). Flag
+    // itu nyembunyiin baris WARNING dari stderr yang ditangkap bot --
+    // termasuk baris "HTTP Error 429" dan info PO Token yang JUSTRU jadi
+    // sinyal utama buat sistem backoff otomatis (lihat
+    // isRateLimitOrBotDetectionError) ndeteksi rate-limit. Tanpa warning
+    // ini, bot cuma lihat baris ERROR generik ("Requested format is not
+    // available") tanpa tau AKAR masalahnya rate-limit atau bukan -- jadi
+    // backoff otomatis gak pernah kepicu walau sebenarnya lagi kena 429.
+    // Baris WARNING ini cuma masuk ke console.log (Railway Logs), TIDAK
+    // ikut dikirim ke user WhatsApp (itu tetap lewat friendlyDlError),
+    // jadi aman gak bikin pesan ke user jadi berantakan.
     "--ffmpeg-location",
     path.dirname(ffmpegPath),
     "--max-filesize",
