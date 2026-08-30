@@ -1661,7 +1661,20 @@ async function downloadMediaFromUrl(url, mode) {
         ];
 
   try {
-    await runYtDlp(args);
+    try {
+      await runYtDlp(args);
+    } catch (err) {
+      // Instagram (carousel foto) khususnya SERING keluar exit code 1
+      // (BUKAN 0 dengan file kosong seperti kasus di bawah) dengan pesan
+      // literal "No video formats found!" per slide -- ini juga tanda
+      // postingan foto, bukan cuma pola "sukses tapi file kosong".
+      // Ditandai sama kayak di bawah biar handleDlDownload otomatis
+      // nyoba jalur foto (tryHandleAsPhotoPost).
+      if (/No video formats found/i.test(err.stderr || err.message || "")) {
+        err.possiblyPhotoOnly = true;
+      }
+      throw err;
+    }
 
     // Nama file pastinya baru ketahuan setelah yt-dlp selesai (ekstensi
     // ditentukan otomatis olehnya), jadi dicari lewat prefix uid ini.
