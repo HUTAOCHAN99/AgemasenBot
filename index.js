@@ -209,35 +209,77 @@ async function fetchWithRetry(url, config) {
   throw lastErr;
 }
 
-async function fetchCandidates(tag) {
+// Ambil SATU halaman post untuk sebuah tag dari Safebooru (maks 100 post).
+// Dulu `fetchCandidates` narik SEMUA halaman sekaligus sebelum bisa kirim 1
+// gambar pun -- buat tag populer (yang justru sering jadi pilihan [1] di
+// daftar disambiguasi, karena diurutkan dari count terbesar) itu bisa puluhan
+// request berurutan sebelum user dapat balasan, jadi rawan timeout/gagal.
+// Sekarang narik per halaman aja (lazy), baru nambah halaman lagi kalau
+// stok di pool session sudah habis (lihat loadMoreCandidates).
+async function fetchCandidatesPage(tag, pid) {
   const url = "https://safebooru.org/index.php";
-  const all = [];
-  let pid = 0;
 
-  while (true) {
-    const res = await fetchWithRetry(url, {
-      params: {
-        page: "dapi",
-        s: "post",
-        q: "index",
-        json: 1,
-        limit: API_PAGE_SIZE,
-        pid,
-        tags: tag,
-      },
-      timeout: SAFEBOORU_TIMEOUT_MS,
-    });
+  const res = await fetchWithRetry(url, {
+    params: {
+      page: "dapi",
+      s: "post",
+      q: "index",
+      json: 1,
+      limit: API_PAGE_SIZE,
+      pid,
+      tags: tag,
+    },
+    timeout: SAFEBOORU_TIMEOUT_MS,
+  });
 
-    if (!Array.isArray(res.data) || res.data.length === 0) break;
+  const data = Array.isArray(res.data) ? res.data : [];
+  const posts = data.filter((p) => p.file_url);
+  const isLastPage = data.length < API_PAGE_SIZE;
 
-    all.push(...res.data);
+  return { posts, isLastPage };
+}
 
-    if (res.data.length < API_PAGE_SIZE) break; // halaman terakhir, tidak perlu lanjut
+// Isi ulang `session.pool` dengan post-post BARU (belum pernah dikirim di
+// session ini -- dicek lewat `session.seenIds`) dengan narik halaman
+// berikutnya satu-satu, berhenti begitu dapat minimal 1 post baru. Kalau
+// sampai halaman terakhir Safebooru tetap nggak dapat apa-apa, berarti
+// semua gambar untuk tag ini sudah habis (atau memang tidak ada sama
+// sekali kalau ini pemanggilan pertama).
+//
+// Return true kalau pool berhasil terisi (ada gambar baru buat dikirim),
+// false kalau sudah benar-benar habis / tidak ada gambar.
+async function loadMoreCandidates(session) {
+  while (!session.noMorePages) {
+    const { posts, isLastPage } = await fetchCandidatesPage(
+      session.tag,
+      session.pid,
+    );
 
-    pid++;
+    session.pid++;
+    if (isLastPage) session.noMorePages = true;
+
+    const fresh = posts.filter((p) => !session.seenIds.has(String(p.id)));
+    if (fresh.length > 0) {
+      session.pool.push(...fresh);
+      return true;
+    }
   }
 
-  return all.filter((p) => p.file_url);
+  return false;
+}
+
+// Bikin session baru buat pencarian tag baru (dipakai tiap kali user mulai
+// pencarian: !img langsung, hasil disambiguasi tunggal, atau pilih dari
+// daftar disambiguasi). pool masih kosong -> caller wajib panggil
+// loadMoreCandidates() setelah ini sebelum kirim gambar pertama.
+function newCandidateSession(tag) {
+  return {
+    tag,
+    pool: [],
+    seenIds: new Set(),
+    pid: 0,
+    noMorePages: false,
+  };
 }
 
 // Safebooru's s=tag&q=index endpoint ignores json=1 and always replies with
@@ -362,16 +404,17 @@ _Reply pesan ini dengan nomor urut karakter untuk melihat gambar_`;
 }
 
 // Eksekusi pencarian gambar untuk satu tag final (dipakai oleh !img langsung
-// maupun setelah user memilih dari daftar disambiguasi), lalu simpan pool
-// untuk !next dan kirim gambar pertama.
-async function searchAndSendImage(sock, jid, sessionKey, tag, candidates) {
-  const post = pickRandom(candidates);
+// maupun setelah user memilih dari daftar disambiguasi), lalu simpan session
+// (pool + progres paging) untuk !next dan kirim gambar pertama.
+//
+// `candidateSession` HARUS sudah dibuat lewat newCandidateSession() dan
+// pool-nya sudah diisi minimal 1 post lewat loadMoreCandidates() sebelum
+// fungsi ini dipanggil.
+async function searchAndSendImage(sock, jid, sessionKey, tag, candidateSession) {
+  const post = pickRandom(candidateSession);
+  candidateSession.lastId = post.id;
 
-  const session = touchSession({
-    tag,
-    pool: candidates,
-    lastId: post.id,
-  });
+  const session = touchSession(candidateSession);
 
   // Objek session yang sama dipakai baik di `sessions` (buat pemiliknya,
   // dipakai untuk "!next" ketik teks) maupun di `chatCodeSessions` (buat
@@ -393,14 +436,22 @@ async function searchAndSendImage(sock, jid, sessionKey, tag, candidates) {
   });
 }
 
-function pickRandom(pool) {
-  const idx = Math.floor(Math.random() * pool.length);
-  const [post] = pool.splice(idx, 1);
+// Ambil 1 post random dari pool session, keluarkan dari pool, dan tandai
+// ID-nya di `seenIds` supaya post yang sama tidak pernah dipilih lagi
+// selama session ini masih hidup (baik dari pool sekarang maupun dari
+// halaman-halaman baru yang di-load belakangan lewat loadMoreCandidates).
+function pickRandom(session) {
+  const idx = Math.floor(Math.random() * session.pool.length);
+  const [post] = session.pool.splice(idx, 1);
+  session.seenIds.add(String(post.id));
   return post;
 }
 
 async function downloadImage(fileUrl) {
-  const image = await axios.get(fileUrl, { responseType: "arraybuffer" });
+  const image = await fetchWithRetry(fileUrl, {
+    responseType: "arraybuffer",
+    timeout: SAFEBOORU_TIMEOUT_MS,
+  });
   return Buffer.from(image.data);
 }
 
@@ -2829,6 +2880,31 @@ async function startBot() {
     //     pengirim ini masih ada pendingTagChoices lama yang belum expired.
     //   - Kode sesi: ketik angka POLOS (bukan reply ke daftar tag), dicek
     //     ke chatCodeSessions seperti biasa.
+    // Dipakai oleh "!next" dan lanjut-pakai-kode-sesi: pool session ini
+    // kosong (semua post yang sudah di-load sudah pernah dikirim), jadi
+    // coba ambil halaman berikutnya dari Safebooru. Kalau ternyata SEMUA
+    // halaman untuk tag ini sudah habis (berarti user sudah lihat semua
+    // gambar yang ada), siklus direset dari awal (boleh muncul ulang)
+    // supaya user tetap dapat gambar, bukan mentok dead-end.
+    async function refillPool(session) {
+      if (session.pool.length > 0) return true;
+
+      if (await loadMoreCandidates(session)) return true;
+
+      session.seenIds.clear();
+      session.pid = 0;
+      session.noMorePages = false;
+
+      if (await loadMoreCandidates(session)) {
+        await sock.sendMessage(jid, {
+          text: "🔁 Semua gambar untuk tag ini sudah pernah ditampilkan. Mulai ulang dari awal ya.",
+        });
+        return true;
+      }
+
+      return false; // tag ini memang tidak punya gambar sama sekali
+    }
+
     // =====================
     if (/^\d+$/.test(text)) {
       const session = sessions.get(sessionKey);
@@ -2852,9 +2928,10 @@ async function startBot() {
         }
 
         try {
-          const candidates = await fetchCandidates(choice.name);
+          const candidateSession = newCandidateSession(choice.name);
+          const hasCandidates = await loadMoreCandidates(candidateSession);
 
-          if (candidates.length === 0) {
+          if (!hasCandidates) {
             await sock.sendMessage(jid, {
               text: "❌ Gambar untuk karakter ini tidak ditemukan.",
             });
@@ -2866,7 +2943,7 @@ async function startBot() {
             jid,
             sessionKey,
             choice.name,
-            candidates,
+            candidateSession,
           );
         } catch (err) {
           console.log(err);
@@ -2890,19 +2967,16 @@ async function startBot() {
       if (codeSession) {
         touchSession(codeSession);
         try {
-          // pool habis -> refill otomatis dari tag yang sama
-          if (codeSession.pool.length === 0) {
-            codeSession.pool = await fetchCandidates(codeSession.tag);
+          const ok = await refillPool(codeSession);
 
-            if (codeSession.pool.length === 0) {
-              await sock.sendMessage(jid, {
-                text: "❌ Tidak ada gambar lain untuk tag ini.",
-              });
-              return;
-            }
+          if (!ok) {
+            await sock.sendMessage(jid, {
+              text: "❌ Tidak ada gambar lain untuk tag ini.",
+            });
+            return;
           }
 
-          const post = pickRandom(codeSession.pool);
+          const post = pickRandom(codeSession);
           codeSession.lastId = post.id;
 
           const buffer = await downloadImage(post.file_url);
@@ -3152,10 +3226,11 @@ async function startBot() {
       }
 
       try {
-        const candidates = await fetchCandidates(tag);
+        const directSession = newCandidateSession(tag);
+        const hasDirectHit = await loadMoreCandidates(directSession);
 
-        if (candidates.length > 0) {
-          await searchAndSendImage(sock, jid, sessionKey, tag, candidates);
+        if (hasDirectHit) {
+          await searchAndSendImage(sock, jid, sessionKey, tag, directSession);
           return;
         }
 
@@ -3171,13 +3246,22 @@ async function startBot() {
 
         if (matches.length === 1) {
           // cuma ada 1 kandidat, langsung pakai tanpa nanya
-          const only = await fetchCandidates(matches[0].name);
+          const onlySession = newCandidateSession(matches[0].name);
+          const hasOnly = await loadMoreCandidates(onlySession);
+
+          if (!hasOnly) {
+            await sock.sendMessage(jid, {
+              text: "❌ Gambar tidak ditemukan.",
+            });
+            return;
+          }
+
           await searchAndSendImage(
             sock,
             jid,
             sessionKey,
             matches[0].name,
-            only,
+            onlySession,
           );
           return;
         }
@@ -3218,19 +3302,16 @@ async function startBot() {
       touchSession(session);
 
       try {
-        // pool habis -> refill otomatis dari tag yang sama
-        if (session.pool.length === 0) {
-          session.pool = await fetchCandidates(session.tag);
+        const ok = await refillPool(session);
 
-          if (session.pool.length === 0) {
-            await sock.sendMessage(jid, {
-              text: "❌ Tidak ada gambar lain untuk tag ini.",
-            });
-            return;
-          }
+        if (!ok) {
+          await sock.sendMessage(jid, {
+            text: "❌ Tidak ada gambar lain untuk tag ini.",
+          });
+          return;
         }
 
-        const post = pickRandom(session.pool);
+        const post = pickRandom(session);
         session.lastId = post.id;
 
         const buffer = await downloadImage(post.file_url);
