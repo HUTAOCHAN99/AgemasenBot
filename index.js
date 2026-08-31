@@ -667,16 +667,16 @@ Beda dari *!dl*: langsung ambil jalur foto tanpa nyoba download video dulu -- le
 };
 
 
-// Ukuran banner !menu, rasio 16:9. "cover" = crop biar penuh tanpa distorsi
-// (bagian tengah gambar yang dipertahankan), bukan sekadar di-squeeze.
+// Ukuran banner !menu, tetap full image tanpa crop.
+// Gunakan fit "contain" agar seluruh gambar terlihat dan tidak terpotong.
 const MENU_BANNER_WIDTH = 1280;
 const MENU_BANNER_HEIGHT = 720; // 1280:720 = 16:9
 
 async function toMenuBanner(buffer) {
   return sharp(buffer)
     .resize(MENU_BANNER_WIDTH, MENU_BANNER_HEIGHT, {
-      fit: "cover",
-      position: "attention", // fokus crop ke area paling "menarik" (biasanya wajah/subjek)
+      fit: "contain",
+      background: { r: 0, g: 0, b: 0, alpha: 1 },
     })
     .jpeg({ quality: 85 })
     .toBuffer();
@@ -1057,6 +1057,59 @@ function runFfmpeg(args) {
     });
   });
 }
+
+// WhatsApp punya batas ukuran ketat buat stiker WEBP -- animasi maksimal
+// sekitar 500KB. Lewat dari situ, WA nolak KIRIM ULANG/forward stiker itu
+// dengan pesan "can't send this sticker because it's too large", dan bahkan
+// SEBELUM ditolak pun animasinya sering cuma tampil diam (frame pertama
+// doang) pas pertama kali diterima -- persis gejala yang kelihatan dari
+// bot ini. ffmpeg dengan "-preset default" tanpa "-quality" di-set (default
+// 75) dan tanpa batas ukuran sama sekali gampang ngasilin file di atas itu
+// buat GIF sumber yang lumayan panjang/detail.
+const STICKER_MAX_BYTES = 500 * 1024;
+
+// Tangga kualitas buat stiker ANIMASI: dicoba dari kualitas terbaik dulu,
+// makin turun (quality, fps, dan durasi maksimal dipangkas bareng) sampai
+// hasilnya muat di bawah STICKER_MAX_BYTES. Stiker STATIS (isStill) jarang
+// sekali kebesaran (cuma 1 frame), jadi cukup 1 percobaan kualitas tinggi.
+const ANIMATED_QUALITY_LADDER = [
+  { quality: 75, fps: 12, duration: 10 },
+  { quality: 60, fps: 10, duration: 8 },
+  { quality: 45, fps: 10, duration: 6 },
+  { quality: 35, fps: 8, duration: 5 },
+  { quality: 25, fps: 8, duration: 4 },
+];
+const STILL_QUALITY_LADDER = [{ quality: 90, fps: null, duration: null }];
+
+// `buildArgs(step)` harus mengembalikan array argumen ffmpeg lengkap untuk
+// satu percobaan encode, memakai `step.quality` / `step.fps` /
+// `step.duration`. Dipanggil berulang dengan step yang makin "murah" dari
+// tangga kualitas sampai file outputnya <= STICKER_MAX_BYTES, atau sampai
+// tangganya habis (dalam hal itu, hasil terkecil yang didapat tetap
+// dikembalikan -- mendingan dikirim & mungkin gagal daripada bot diam).
+async function runFfmpegUnderSizeLimit(buildArgs, outputPath, isStill) {
+  const ladder = isStill ? STILL_QUALITY_LADDER : ANIMATED_QUALITY_LADDER;
+  let buffer = null;
+
+  for (let i = 0; i < ladder.length; i++) {
+    const step = ladder[i];
+    await runFfmpeg(buildArgs(step));
+    buffer = fs.readFileSync(outputPath);
+
+    if (buffer.length <= STICKER_MAX_BYTES) return buffer;
+
+    const isLastStep = i === ladder.length - 1;
+    console.log(
+      `⚠️ Stiker ${Math.round(buffer.length / 1024)}KB > batas WA (~${STICKER_MAX_BYTES / 1024}KB)` +
+        (isLastStep
+          ? ", sudah di kualitas paling rendah, tetap dikirim apa adanya."
+          : ", coba render ulang dengan kualitas lebih rendah..."),
+    );
+  }
+
+  return buffer;
+}
+
 
 // Ambil buffer media dari sebuah "message content" (msg.message ATAU
 // contextInfo.quotedMessage). Dipecah jadi dua kategori karena sekarang
@@ -2599,46 +2652,52 @@ async function gifToTextSticker(inputBuffer, memeText, isStill = false) {
     // atasnya. "format=rgba" WAJIB: GIF sumber biasanya tidak punya
     // channel alpha, jadi kalau langsung di-pad warna "transparan" itu
     // malah dianggap hitam solid oleh encoder.
-    const bgFilters = [
-      "format=rgba",
-      "scale=512:512:force_original_aspect_ratio=decrease",
-      "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
-      ...(isStill ? [] : ["fps=12"]),
-    ];
+    const buildArgs = (step) => {
+      const bgFilters = [
+        "format=rgba",
+        "scale=512:512:force_original_aspect_ratio=decrease",
+        "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
+        ...(isStill || !step.fps ? [] : [`fps=${step.fps}`]),
+      ];
 
-    const filterComplex =
-      `[0:v]${bgFilters.join(",")}[bg];` +
-      `[bg][1:v]overlay=0:0:format=auto[vout]`;
+      const filterComplex =
+        `[0:v]${bgFilters.join(",")}[bg];` +
+        `[bg][1:v]overlay=0:0:format=auto[vout]`;
 
-    const args = [
-      "-y",
-      "-i",
-      inputPath,
-      "-i",
-      overlayPath,
-      "-filter_complex",
-      filterComplex,
-      "-map",
-      "[vout]",
-      "-vcodec",
-      "libwebp",
-      "-pix_fmt",
-      "yuva420p", // paksa encoder ikut simpan channel alpha
-      "-loop",
-      "0",
-      "-preset",
-      "default",
-      "-an",
-      "-fps_mode",
-      "cfr",
-      "-t",
-      "10", // batas durasi stiker WA
-      outputPath,
-    ];
+      const args = [
+        "-y",
+        "-i",
+        inputPath,
+        "-i",
+        overlayPath,
+        "-filter_complex",
+        filterComplex,
+        "-map",
+        "[vout]",
+        "-vcodec",
+        "libwebp",
+        "-pix_fmt",
+        "yuva420p", // paksa encoder ikut simpan channel alpha
+        "-loop",
+        "0",
+        "-preset",
+        "default",
+        "-quality",
+        String(step.quality),
+        "-compression_level",
+        "6", // paling pelan tapi paling kecil hasilnya -- worth it, bot yang nunggu bukan user
+        "-an",
+        "-fps_mode",
+        "cfr",
+      ];
 
-    await runFfmpeg(args);
+      if (!isStill && step.duration) args.push("-t", String(step.duration)); // batas durasi stiker WA
 
-    return fs.readFileSync(outputPath);
+      args.push(outputPath);
+      return args;
+    };
+
+    return await runFfmpegUnderSizeLimit(buildArgs, outputPath, isStill);
   } finally {
     fs.rm(inputPath, { force: true }, () => {});
     fs.rm(overlayPath, { force: true }, () => {});
@@ -2662,38 +2721,44 @@ async function mediaToSticker(inputBuffer, isStill = false) {
   fs.writeFileSync(inputPath, inputBuffer);
 
   try {
-    const filters = [
-      "format=rgba",
-      "scale=512:512:force_original_aspect_ratio=decrease",
-      "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
-      ...(isStill ? [] : ["fps=12"]),
-    ];
+    const buildArgs = (step) => {
+      const filters = [
+        "format=rgba",
+        "scale=512:512:force_original_aspect_ratio=decrease",
+        "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
+        ...(isStill || !step.fps ? [] : [`fps=${step.fps}`]),
+      ];
 
-    const args = [
-      "-y",
-      "-i",
-      inputPath,
-      "-vf",
-      filters.join(","),
-      "-vcodec",
-      "libwebp",
-      "-pix_fmt",
-      "yuva420p",
-      "-loop",
-      "0",
-      "-preset",
-      "default",
-      "-an",
-      "-fps_mode",
-      "cfr",
-      "-t",
-      "10",
-      outputPath,
-    ];
+      const args = [
+        "-y",
+        "-i",
+        inputPath,
+        "-vf",
+        filters.join(","),
+        "-vcodec",
+        "libwebp",
+        "-pix_fmt",
+        "yuva420p",
+        "-loop",
+        "0",
+        "-preset",
+        "default",
+        "-quality",
+        String(step.quality),
+        "-compression_level",
+        "6",
+        "-an",
+        "-fps_mode",
+        "cfr",
+      ];
 
-    await runFfmpeg(args);
+      if (!isStill && step.duration) args.push("-t", String(step.duration));
 
-    return fs.readFileSync(outputPath);
+      args.push(outputPath);
+      return args;
+    };
+
+    return await runFfmpegUnderSizeLimit(buildArgs, outputPath, isStill);
   } finally {
     fs.rm(inputPath, { force: true }, () => {});
     fs.rm(outputPath, { force: true }, () => {});
