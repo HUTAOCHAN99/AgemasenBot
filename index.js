@@ -23,6 +23,7 @@ const sharp = require("sharp");
 const {
   handleTsundereChat,
   sweepExpiredTsundereChats,
+  forgetGroqChat,
 } = require("./agemasenTsundere");
 
 // =====================================================
@@ -568,6 +569,13 @@ Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti
 ▸ !hd
 
 ┏━━━━━━━━━━━━━━━┓
+┃ 💬 *CHAT AI*
+┗━━━━━━━━━━━━━━━┛
+▸ Tag aku (@AgemasenBot) buat ngobrol
+▸ Atau reply pesanku buat lanjut obrolan
+▸ !lupain
+
+┏━━━━━━━━━━━━━━━┓
 ┃ ⚙️ *LAIN-LAIN*
 ┗━━━━━━━━━━━━━━━┛
 ▸ !ping
@@ -710,6 +718,12 @@ Beda dari *!dl*: langsung ambil jalur foto tanpa nyoba download video dulu -- le
 \`\`\`
 
 ⚠️ Batas ukuran file *95MB* per foto. Postingan Facebook yang isinya cuma FOTO (bukan video) tidak didukung -- ini murni buat Instagram/TikTok.`,
+
+  lupain: `🧠 *!lupain*
+
+Hapus ingatan obrolan chat AI (tsundere) kamu sama bot -- bot bakal "lupa" semua percakapan sebelumnya dan mulai dari nol lagi.
+
+Command pencarian gambar (!img/!next/!id) TIDAK kepengaruh, ini cuma buat ingatan obrolan chat AI-nya doang.`,
 };
 
 
@@ -2927,6 +2941,19 @@ async function startBot() {
     // =====================
     if (text === "!ping") {
       await sock.sendMessage(jid, { text: "🏓 Pong!" });
+      return;
+    }
+
+    // =====================
+    // !lupain -- reset ingatan obrolan chat AI (tsundere) buat pengirim ini
+    // =====================
+    if (text === "!lupain") {
+      const had = forgetGroqChat(sessionKey);
+      await sock.sendMessage(jid, {
+        text: had
+          ? "Hmph, oke... sudah aku lupain semua obrolan kita. Mulai dari nol lagi ya. 😤"
+          : "Lho, kita kan belum pernah ngobrol apa-apa. Gak ada yang perlu dilupain, dasar. 🙄",
+      });
       return;
     }
 

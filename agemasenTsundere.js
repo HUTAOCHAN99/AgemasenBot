@@ -15,6 +15,8 @@
 //   GROQ_MODEL    -- opsional, default "llama-3.3-70b-versatile"
 // =====================================================
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
@@ -26,16 +28,104 @@ const GROQ_TIMEOUT_MS = 20000;
 // sendiri-sendiri, bukan campur sama orang lain di grup yang sama.
 const GROQ_CHAT_HISTORY_LIMIT = 12; // jumlah pesan (user+bot) yang disimpan
 const GROQ_CHAT_TTL_MS = 24 * 60 * 60 * 1000; // 24 jam, sama kayak sesi gambar
-const groqChats = new Map(); // sessionKey -> { history: [{role,content}], lastUsed }
+const groqChats = new Map(); // sessionKey -> { history, lastUsed, sentMsgIds }
+
+// Berapa banyak ID pesan balasan bot yang diingat per sesi -- dipakai buat
+// deteksi "user reply ke pesan bot" (lihat isReplyToBotMessage). Gak perlu
+// banyak-banyak, cukup nampung beberapa balasan terakhir.
+const SENT_MSG_ID_LIMIT = 20;
+
+// =====================================================
+// Persistensi riwayat chat ke disk (file JSON)
+//
+// Sebelumnya riwayat cuma disimpan di memory (Map) -- artinya begitu bot
+// restart/crash/redeploy, SEMUA obrolan & konteksnya hilang total. Sekarang
+// riwayat ditulis ke file JSON tiap kali ada perubahan (di-debounce biar
+// gak nulis disk tiap 1 pesan), dan dibaca lagi saat bot start.
+//
+// CATATAN buat deploy di Railway: ini nolong kalau bot cuma restart/crash
+// biasa (container yang sama), TAPI kalau Railway redeploy dari awal TANPA
+// Volume yang di-mount ke folder `data/`, isi file ini bakal ikut hilang
+// juga (filesystem-nya dibuat ulang dari image). Kalau mau riwayat beneran
+// awet lintas deploy, tinggal mount Railway Volume ke path DATA_DIR di
+// bawah (atau override lewat env var GROQ_HISTORY_FILE).
+// =====================================================
+const DATA_DIR = path.join(__dirname, "data");
+const HISTORY_FILE =
+  process.env.GROQ_HISTORY_FILE || path.join(DATA_DIR, "tsundere_history.json");
+const SAVE_DEBOUNCE_MS = 3000;
+let saveTimer = null;
+
+function loadHistoryFromDisk() {
+  try {
+    const raw = fs.readFileSync(HISTORY_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    for (const [key, chat] of Object.entries(parsed)) {
+      groqChats.set(key, {
+        history: Array.isArray(chat.history) ? chat.history : [],
+        lastUsed: chat.lastUsed || Date.now(),
+        sentMsgIds: Array.isArray(chat.sentMsgIds) ? chat.sentMsgIds : [],
+      });
+    }
+    console.log(
+      `[groq tsundere] riwayat chat dimuat dari disk (${groqChats.size} sesi).`,
+    );
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      console.log("[groq tsundere] gagal load riwayat dari disk:", err.message);
+    }
+    // File belum ada (ENOENT) itu normal buat first run -- gak perlu log error.
+  }
+}
+
+function writeHistoryToDiskNow() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const plain = Object.fromEntries(groqChats);
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(plain), "utf8");
+  } catch (err) {
+    console.log("[groq tsundere] gagal simpan riwayat ke disk:", err.message);
+  }
+}
+
+// Debounce: kalau ada banyak pesan numpuk dalam waktu dekat, gak perlu
+// nulis file tiap kali -- cukup tulis sekali beberapa detik setelah
+// perubahan TERAKHIR berhenti.
+function scheduleSaveHistory() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(writeHistoryToDiskNow, SAVE_DEBOUNCE_MS);
+  saveTimer.unref?.();
+}
+
+// Pastikan riwayat sempat ke-flush ke disk kalau proses dimatikan (mis.
+// Railway restart/redeploy yang ngirim SIGTERM), bukan cuma pas debounce
+// timer kebetulan sempat jalan.
+function flushHistoryOnExit() {
+  if (saveTimer) clearTimeout(saveTimer);
+  writeHistoryToDiskNow();
+}
+process.on("SIGTERM", flushHistoryOnExit);
+process.on("SIGINT", flushHistoryOnExit);
+
+loadHistoryFromDisk();
 
 function getGroqChat(sessionKey) {
   let chat = groqChats.get(sessionKey);
   if (!chat) {
-    chat = { history: [], lastUsed: Date.now() };
+    chat = { history: [], lastUsed: Date.now(), sentMsgIds: [] };
     groqChats.set(sessionKey, chat);
   }
   chat.lastUsed = Date.now();
   return chat;
+}
+
+// Buang riwayat obrolan 1 sesi (dipanggil dari command "!lupain" di
+// index.js). Return true kalau memang ada yang dibuang, false kalau sesi
+// itu memang belum punya riwayat sama sekali.
+function forgetGroqChat(sessionKey) {
+  const had = groqChats.delete(sessionKey);
+  if (had) scheduleSaveHistory();
+  return had;
 }
 
 // Dipanggil dari sweep berkala index.js (lihat sweepExpiredSessions) supaya
@@ -43,11 +133,14 @@ function getGroqChat(sessionKey) {
 // session pencarian gambar.
 function sweepExpiredTsundereChats() {
   const now = Date.now();
+  let changed = false;
   for (const [key, chat] of groqChats) {
     if (now - (chat.lastUsed || 0) > GROQ_CHAT_TTL_MS) {
       groqChats.delete(key);
+      changed = true;
     }
   }
+  if (changed) scheduleSaveHistory();
 }
 
 // Ambil nomor polos dari sebuah JID, buang device-id (":12") dan domain
@@ -88,6 +181,42 @@ function isBotMentioned(sock, msg) {
     const n = jidNumber(j);
     return (botIdNumber && n === botIdNumber) || (botLidNumber && n === botLidNumber);
   });
+}
+
+// Cek apakah pesan ini adalah REPLY ke salah satu balasan tsundere
+// SEBELUMNYA dari bot di sesi (sessionKey) yang sama. Ini yang bikin
+// obrolan bisa "dilanjut" cuma dengan reply -- gak wajib nge-tag bot lagi
+// tiap kali mau lanjut ngobrol, selama masih reply ke pesan bot.
+//
+// Dicek lewat ctx.stanzaId (ID pesan yang di-reply) dibandingkan sama
+// daftar ID pesan yang PERNAH dikirim bot buat sesi ini (chat.sentMsgIds,
+// lihat rememberSentMsgId). Pola ini sama seperti yang dipakai buat
+// "kode sesi" (!next / promptMsgId) di index.js.
+function isReplyToBotMessage(chat, msg) {
+  if (!chat || !chat.sentMsgIds?.length) return false;
+
+  const ctx =
+    msg.message?.extendedTextMessage?.contextInfo ||
+    msg.message?.imageMessage?.contextInfo ||
+    msg.message?.videoMessage?.contextInfo ||
+    msg.message?.documentMessage?.contextInfo;
+
+  const stanzaId = ctx?.stanzaId;
+  if (!stanzaId) return false;
+
+  return chat.sentMsgIds.includes(stanzaId);
+}
+
+// Simpan ID pesan balasan tsundere yang baru dikirim, biar bisa dideteksi
+// nanti kalau user reply ke pesan itu (lihat isReplyToBotMessage). Cuma
+// nyimpen beberapa ID terakhir (SENT_MSG_ID_LIMIT) supaya gak numpuk terus.
+function rememberSentMsgId(chat, msgId) {
+  if (!msgId) return;
+  chat.sentMsgIds = chat.sentMsgIds || [];
+  chat.sentMsgIds.push(msgId);
+  if (chat.sentMsgIds.length > SENT_MSG_ID_LIMIT) {
+    chat.sentMsgIds.splice(0, chat.sentMsgIds.length - SENT_MSG_ID_LIMIT);
+  }
 }
 
 // Persona AgemasenBot: tsundere -- jawabannya kedengaran judes/ketus di
@@ -174,6 +303,10 @@ async function askGroqTsundere(chat, userText, senderName) {
     chat.history.splice(0, chat.history.length - GROQ_CHAT_HISTORY_LIMIT);
   }
 
+  // Simpan perubahan riwayat ke disk (debounced) supaya konteks obrolan ini
+  // gak hilang kalau bot restart sebelum sempat dipakai lagi.
+  scheduleSaveHistory();
+
   return reply;
 }
 
@@ -185,11 +318,27 @@ async function askGroqTsundere(chat, userText, senderName) {
 //
 // Return true kalau pesan ini DITANGANI oleh fitur tsundere (supaya
 // index.js tahu harus `return` dan gak lanjut ke pengecekan lain), false
-// kalau tidak relevan (bot tidak di-tag, atau teksnya command "!...").
+// kalau tidak relevan (bot tidak di-tag & bukan reply ke bot, atau teksnya
+// command "!...").
+//
+// Trigger-nya SEKARANG ada 2 cara (boleh salah satu):
+//   1. Nge-tag bot (@AgemasenBot) -- seperti sebelumnya.
+//   2. REPLY ke pesan balasan tsundere sebelumnya dari bot -- supaya
+//      obrolan bisa dilanjut natural kayak chat WhatsApp beneran, tanpa
+//      harus nge-tag ulang tiap kali mau lanjut.
 // =====================================================
 async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
   if (text.startsWith("!")) return false;
-  if (!isBotMentioned(sock, msg)) return false;
+
+  // Ambil chat yang SUDAH ADA (kalau ada) tanpa bikin entry baru dulu --
+  // dipakai buat cek "reply ke bot". Kalau langsung pakai getGroqChat() di
+  // sini, tiap pesan biasa (yang bukan buat bot) bakal bikin entry kosong
+  // numpuk sia-sia di memory & di file.
+  const existingChat = groqChats.get(sessionKey);
+
+  const mentioned = isBotMentioned(sock, msg);
+  const repliedToBot = isReplyToBotMessage(existingChat, msg);
+  if (!mentioned && !repliedToBot) return false;
 
   const cleanText = text.replace(/@\d+/g, "").trim();
   const senderName = msg.pushName || "";
@@ -198,7 +347,11 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
   try {
     await sock.sendPresenceUpdate("composing", jid);
     const reply = await askGroqTsundere(chat, cleanText, senderName);
-    await sock.sendMessage(jid, { text: reply }, { quoted: msg });
+    const sentMsg = await sock.sendMessage(jid, { text: reply }, { quoted: msg });
+    // Ingat ID pesan ini supaya kalau user reply ke pesan ini nanti, bot
+    // tau harus lanjut obrolan (lihat isReplyToBotMessage di atas).
+    rememberSentMsgId(chat, sentMsg?.key?.id);
+    scheduleSaveHistory();
   } catch (err) {
     console.log("[groq tsundere] gagal:", err.message || err);
     const isConfigError = /GROQ_API_KEY/.test(err.message || "");
@@ -219,8 +372,10 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
 module.exports = {
   handleTsundereChat,
   sweepExpiredTsundereChats,
+  forgetGroqChat,
   // Di-export juga kalau-kalau index.js atau test butuh akses langsung.
   isBotMentioned,
+  isReplyToBotMessage,
   askGroqTsundere,
   getGroqChat,
 };
