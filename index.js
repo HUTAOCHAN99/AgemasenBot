@@ -1154,7 +1154,8 @@ async function runFfmpegUnderSizeLimit(buildArgs, outputPath, isStill) {
 
     const isLastStep = i === ladder.length - 1;
     console.log(
-      `⚠️ Stiker ${Math.round(buffer.length / 1024)}KB > batas WA (~${STICKER_MAX_BYTES / 1024}KB)` +
+      `⚠️ [tangga ${i + 1}/${ladder.length}: q=${step.quality} fps=${step.fps ?? "-"} dur=${step.duration ?? "-"}s size=${step.size || 512}] ` +
+        `Stiker ${Math.round(buffer.length / 1024)}KB > batas WA (~${STICKER_MAX_BYTES / 1024}KB)` +
         (isLastStep
           ? ", sudah di kualitas paling rendah, tetap dikirim apa adanya."
           : ", coba render ulang dengan kualitas lebih rendah..."),
