@@ -455,32 +455,66 @@ async function downloadImage(fileUrl) {
   return Buffer.from(image.data);
 }
 
-// Ambil SATU gambar acak dari 1 halaman hasil safebooru saja (tanpa paging
-// SEMUA halaman kayak fetchCandidates) -- dipakai cuma buat hiasan !menu,
-// jadi cukup cepat & ringan tiap kali user ketik !menu.
+// Kategori orientasi yang BOLEH dipakai sebagai banner !menu. Portrait
+// (tinggi > lebar) SENGAJA tidak boleh: banner di-crop paksa ke kanvas
+// 16:9 (lihat toMenuBanner), jadi sumber portrait bakal ke-crop parah dan
+// motong bagian penting gambarnya. Tiga kategori di bawah beririsan pas di
+// batasnya jadi nutupin seluruh rentang >= 0.95 tanpa ada celah:
+//   - Square         : 0.95 <= ratio <= 1.05
+//   - Landscape       : 1.05 <  ratio <= 1.5
+//   - Landscape Wide  : ratio > 1.5
+function isBannerEligible(width, height) {
+  if (!width || !height) return false;
+  const ratio = width / height;
+  return ratio >= 0.95; // < 0.95 = portrait, ditolak
+}
+
+// Ambil SATU gambar acak yang ORIENTASINYA cocok buat banner !menu
+// (landscape/square -- lihat isBannerEligible) -- dipakai cuma buat hiasan
+// !menu, jadi cukup cepat & ringan tiap kali user ketik !menu. Gambar
+// portrait DILEWATI dan dicari gambar lain (bukan langsung dipakai apa
+// adanya), makanya narik beberapa halaman kalau perlu sampai nemu
+// setidaknya beberapa kandidat yang layak, atau sampai halamannya habis.
 async function fetchRandomImageForHelp(tag) {
+  const MAX_PAGES = 3;
+  const eligible = [];
+
   try {
-    const res = await axios.get("https://safebooru.org/index.php", {
-      params: {
-        page: "dapi",
-        s: "post",
-        q: "index",
-        json: 1,
-        limit: API_PAGE_SIZE,
-        tags: tag,
-      },
-    });
+    for (let pid = 0; pid < MAX_PAGES; pid++) {
+      const res = await axios.get("https://safebooru.org/index.php", {
+        params: {
+          page: "dapi",
+          s: "post",
+          q: "index",
+          json: 1,
+          limit: API_PAGE_SIZE,
+          pid,
+          tags: tag,
+        },
+      });
 
-    const posts = Array.isArray(res.data)
-      ? res.data.filter((p) => p.file_url)
-      : [];
-    if (posts.length === 0) return null;
+      const data = Array.isArray(res.data) ? res.data : [];
+      if (data.length === 0) break; // gak ada hasil sama sekali / halaman habis
 
-    return posts[Math.floor(Math.random() * posts.length)];
+      for (const p of data) {
+        if (p.file_url && isBannerEligible(Number(p.width), Number(p.height))) {
+          eligible.push(p);
+        }
+      }
+
+      // Ini cuma hiasan, gak perlu nyisir semua halaman sampai abis --
+      // begitu kandidat udah cukup buat dipilih acak, berhenti.
+      if (eligible.length >= API_PAGE_SIZE) break;
+      if (data.length < API_PAGE_SIZE) break; // halaman terakhir
+    }
   } catch (err) {
     console.log(`⚠️ Gagal ambil gambar hiasan !menu ("${tag}"):`, err.message);
     return null;
   }
+
+  if (eligible.length === 0) return null;
+
+  return eligible[Math.floor(Math.random() * eligible.length)];
 }
 
 // Tag khusus buat gambar hiasan di !menu.
@@ -667,16 +701,16 @@ Beda dari *!dl*: langsung ambil jalur foto tanpa nyoba download video dulu -- le
 };
 
 
-// Ukuran banner !menu, tetap full image tanpa crop.
-// Gunakan fit "contain" agar seluruh gambar terlihat dan tidak terpotong.
+// Ukuran banner !menu, rasio 16:9. "cover" = crop biar penuh tanpa distorsi
+// (bagian tengah gambar yang dipertahankan), bukan sekadar di-squeeze.
 const MENU_BANNER_WIDTH = 1280;
 const MENU_BANNER_HEIGHT = 720; // 1280:720 = 16:9
 
 async function toMenuBanner(buffer) {
   return sharp(buffer)
     .resize(MENU_BANNER_WIDTH, MENU_BANNER_HEIGHT, {
-      fit: "contain",
-      background: { r: 0, g: 0, b: 0, alpha: 1 },
+      fit: "cover",
+      position: "attention", // fokus crop ke area paling "menarik" (biasanya wajah/subjek)
     })
     .jpeg({ quality: 85 })
     .toBuffer();
