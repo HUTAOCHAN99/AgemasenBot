@@ -701,16 +701,20 @@ Beda dari *!dl*: langsung ambil jalur foto tanpa nyoba download video dulu -- le
 };
 
 
-// Ukuran banner !menu, rasio 16:9. "cover" = crop biar penuh tanpa distorsi
-// (bagian tengah gambar yang dipertahankan), bukan sekadar di-squeeze.
-const MENU_BANNER_WIDTH = 1280;
-const MENU_BANNER_HEIGHT = 720; // 1280:720 = 16:9
+// Batas ukuran banner !menu (cuma buat jaga-jaga biar filenya gak
+// kegedean/ngirim gambar mentah beresolusi tinggi). BUKAN kanvas tetap --
+// rasio asli gambar dipertahankan (lihat toMenuBanner), gak dipaksa 16:9
+// lagi. Ini aman dipakai karena fetchRandomImageForHelp sudah menyaring
+// cuma gambar landscape/square yang lolos (lihat isBannerEligible), jadi
+// gak akan ada sumber portrait yang perlu di-crop.
+const MENU_BANNER_MAX_WIDTH = 1280;
+const MENU_BANNER_MAX_HEIGHT = 1280;
 
 async function toMenuBanner(buffer) {
   return sharp(buffer)
-    .resize(MENU_BANNER_WIDTH, MENU_BANNER_HEIGHT, {
-      fit: "cover",
-      position: "attention", // fokus crop ke area paling "menarik" (biasanya wajah/subjek)
+    .resize(MENU_BANNER_MAX_WIDTH, MENU_BANNER_MAX_HEIGHT, {
+      fit: "inside", // cuma diperkecil kalau kelewat besar, TIDAK di-crop/pad -- rasio asli tetap
+      withoutEnlargement: true, // gambar yang udah kecil gak dipaksa diperbesar
     })
     .jpeg({ quality: 85 })
     .toBuffer();
