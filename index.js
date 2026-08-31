@@ -17,6 +17,14 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
 const sharp = require("sharp");
 
+// Fitur chat AI tsundere (Groq) -- dipisah dari file ini, lihat
+// agemasenTsundere.js untuk semua logic-nya (persona, panggilan API,
+// riwayat chat, deteksi mention).
+const {
+  handleTsundereChat,
+  sweepExpiredTsundereChats,
+} = require("./agemasenTsundere");
+
 // =====================================================
 // Session per pengguna (bukan per chat/grup)
 // key -> { tag, pool: [post,...], lastId, lastUsed }
@@ -98,6 +106,10 @@ function sweepExpiredSessions() {
     }
     if (codeMap.size === 0) chatCodeSessions.delete(jid);
   }
+
+  // 3. Riwayat chat tsundere (Groq) per pengirim -- logic & Map-nya ada di
+  // agemasenTsundere.js, di sini cukup panggil sweep-nya.
+  sweepExpiredTsundereChats();
 }
 
 // Jalanin sweep tiap 1 jam (bukan cuma sekali pas start). Ditaruh di scope
@@ -3620,6 +3632,18 @@ async function startBot() {
       }
 
       await handleDlrDownload(sock, jid, url);
+      return;
+    }
+
+    // =====================
+    // AgemasenBot -- Chat AI Tsundere (Groq)
+    //
+    // Semua logic-nya ada di agemasenTsundere.js. handleTsundereChat sendiri
+    // yang ngecek apakah bot di-tag & teksnya bukan command "!..." --
+    // return true kalau pesan ini sudah ditangani (berarti kita return di
+    // sini juga), false kalau tidak relevan (lanjut ke pengecekan bawah).
+    // =====================
+    if (await handleTsundereChat(sock, msg, { jid, text, sessionKey })) {
       return;
     }
 
