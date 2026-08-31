@@ -62,9 +62,20 @@ function jidNumber(jid) {
 // tersimpan di contextInfo.mentionedJid, terlepas dari tipe pesannya
 // (extendedTextMessage untuk teks biasa, atau *Message.contextInfo kalau
 // mention-nya ada di caption gambar/video/dokumen).
+//
+// PENTING soal @lid: sejak WhatsApp rollout fitur privasi "LID" di banyak
+// grup, JID peserta (termasuk bot sendiri) bisa muncul dalam bentuk
+// "xxxx@lid" -- dan angkanya BUKAN sekadar domain beda dari nomor telepon,
+// tapi ID YANG BEDA TOTAL dari nomor telepon aslinya. Jadi kalau kita cuma
+// bandingin ke sock.user.id (selalu format @s.whatsapp.net / nomor telepon),
+// mention yang datang dalam bentuk @lid gak akan pernah match -> bot
+// dianggap "gak di-tag" padahal sudah di-tag (bot jadi diam/"bisu").
+// Baileys expose juga sock.user.lid (LID milik bot sendiri) setelah
+// konek, jadi kita cek mentionedJid terhadap KEDUA identitas itu.
 function isBotMentioned(sock, msg) {
-  const botNumber = jidNumber(sock.user?.id);
-  if (!botNumber) return false;
+  const botIdNumber = jidNumber(sock.user?.id);
+  const botLidNumber = jidNumber(sock.user?.lid);
+  if (!botIdNumber && !botLidNumber) return false;
 
   const ctx =
     msg.message?.extendedTextMessage?.contextInfo ||
@@ -73,7 +84,10 @@ function isBotMentioned(sock, msg) {
     msg.message?.documentMessage?.contextInfo;
 
   const mentioned = ctx?.mentionedJid || [];
-  return mentioned.some((j) => jidNumber(j) === botNumber);
+  return mentioned.some((j) => {
+    const n = jidNumber(j);
+    return (botIdNumber && n === botIdNumber) || (botLidNumber && n === botLidNumber);
+  });
 }
 
 // Persona AgemasenBot: tsundere -- jawabannya kedengaran judes/ketus di
