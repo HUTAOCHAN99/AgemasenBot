@@ -1133,7 +1133,20 @@ const ANIMATED_QUALITY_LADDER = [
   { quality: 25, fps: 8, duration: 4, size: 400 }, // darurat: konten diperkecil
   { quality: 20, fps: 6, duration: 3, size: 320 }, // darurat terakhir
 ];
-const STILL_QUALITY_LADDER = [{ quality: 90, fps: null, duration: null, size: 512 }];
+// Tangga kualitas buat stiker STATIS (isStill). Beda dari animasi: nomor 1
+// (quality 90, size 512) cukup buat 99% kasus karena cuma 1 frame. TAPI ada
+// jaring pengaman 2 tangga tambahan di bawahnya (size diperkecil) buat
+// jaga-jaga kalau kontennya salah kedeteksi "still" padahal sebenarnya
+// ANIMASI (mis. gara-gara flag isAnimated gak keisi -- lihat komentar di
+// pemanggil sock.sendMessage({sticker,...}) soal ini). Kalau itu terjadi,
+// TANPA jaring pengaman ini hasilnya bisa jauh di atas limit WA karena
+// filter fps/durasi juga di-skip total buat jalur "still" (lihat
+// buildArgs di gifToTextSticker/mediaToSticker).
+const STILL_QUALITY_LADDER = [
+  { quality: 90, fps: null, duration: null, size: 512 },
+  { quality: 75, fps: null, duration: null, size: 400 },
+  { quality: 60, fps: null, duration: null, size: 320 },
+];
 
 // `buildArgs(step)` harus mengembalikan array argumen ffmpeg lengkap untuk
 // satu percobaan encode, memakai `step.quality` / `step.fps` /
@@ -3174,7 +3187,17 @@ async function startBot() {
         );
         const stickerBuffer = await gifToTextSticker(gifBuffer, memeText);
 
-        await sock.sendMessage(jid, { sticker: stickerBuffer });
+        // isAnimated WAJIB diisi manual -- Baileys TIDAK auto-deteksi dari
+        // isi buffer webp-nya. Kalau ini kelewat, reply ke stiker ini nanti
+        // (mis. lewat !smeme) bakal salah dianggap "gambar diam" oleh
+        // isStillMedia(), yang berakibat fps/durasi GAK dipangkas sama
+        // sekali pas di-render ulang -> ukurannya meledak jauh di atas
+        // limit WA. !meme sumbernya selalu GIF/video (lihat findGifSource),
+        // jadi selalu animasi.
+        await sock.sendMessage(jid, {
+          sticker: stickerBuffer,
+          isAnimated: true,
+        });
       } catch (err) {
         console.log(err);
         await sock.sendMessage(jid, {
@@ -3211,13 +3234,20 @@ async function startBot() {
           source.content,
           source.refKey,
         );
+        const isStill = isStillMedia(source.content);
         const stickerBuffer = await gifToTextSticker(
           mediaBuffer,
           memeText,
-          isStillMedia(source.content),
+          isStill,
         );
 
-        await sock.sendMessage(jid, { sticker: stickerBuffer });
+        // Sama kayak di !meme: isAnimated wajib diisi manual sesuai hasil
+        // deteksi sumbernya sendiri, biar kalau stiker INI di-reply lagi
+        // nanti, klasifikasinya benar (lihat komentar di !meme).
+        await sock.sendMessage(jid, {
+          sticker: stickerBuffer,
+          isAnimated: !isStill,
+        });
       } catch (err) {
         console.log(err);
         await sock.sendMessage(jid, {
@@ -3249,12 +3279,14 @@ async function startBot() {
           source.content,
           source.refKey,
         );
-        const stickerBuffer = await mediaToSticker(
-          mediaBuffer,
-          isStillMedia(source.content),
-        );
+        const isStill = isStillMedia(source.content);
+        const stickerBuffer = await mediaToSticker(mediaBuffer, isStill);
 
-        await sock.sendMessage(jid, { sticker: stickerBuffer });
+        // Sama kayak di !meme/!smeme -- isAnimated wajib diisi manual.
+        await sock.sendMessage(jid, {
+          sticker: stickerBuffer,
+          isAnimated: !isStill,
+        });
       } catch (err) {
         console.log(err);
         await sock.sendMessage(jid, {
