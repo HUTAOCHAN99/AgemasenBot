@@ -1110,14 +1110,30 @@ const STICKER_MAX_BYTES = 500 * 1024;
 // makin turun (quality, fps, dan durasi maksimal dipangkas bareng) sampai
 // hasilnya muat di bawah STICKER_MAX_BYTES. Stiker STATIS (isStill) jarang
 // sekali kebesaran (cuma 1 frame), jadi cukup 1 percobaan kualitas tinggi.
+//
+// PENTING soal `size`: sebelum ini, tangga cuma pernah menurunkan
+// quality/fps/duration -- resolusi kontennya SELALU dipatok 512 (baru
+// di-pad transparan ke kanvas 512x512, itu wajib format WA). Masalahnya,
+// itu bukan jaminan hasil akhirnya <= STICKER_MAX_BYTES: kalau GIF sumber
+// sudah "pas-pasan" (baru muat di tangga PALING BAWAH), nambahin overlay
+// teks lewat !meme/!smeme bisa nambah ~40-50% ukuran (teks = informasi
+// visual baru yang beneran makan bit), dan waktu itu terjadi TIDAK ADA
+// tangga lagi buat diturunin -> hasil akhirnya nyeberang batas WA, animasi
+// gagal/keliatan cuma diam pas pertama diterima ("meledak"). Makanya 2
+// tangga darurat terakhir sengaja nambah `size` (konten diskalakan ke
+// kotak lebih kecil SEBELUM di-pad ke kanvas 512x512 yang tetap wajib) --
+// ini lever terakhir yang belum kepake, dan paling ampuh nurunin ukuran
+// karena langsung motong jumlah piksel yang perlu di-encode tiap frame.
 const ANIMATED_QUALITY_LADDER = [
-  { quality: 75, fps: 12, duration: 10 },
-  { quality: 60, fps: 10, duration: 8 },
-  { quality: 45, fps: 10, duration: 6 },
-  { quality: 35, fps: 8, duration: 5 },
-  { quality: 25, fps: 8, duration: 4 },
+  { quality: 75, fps: 12, duration: 10, size: 512 },
+  { quality: 60, fps: 10, duration: 8, size: 512 },
+  { quality: 45, fps: 10, duration: 6, size: 512 },
+  { quality: 35, fps: 8, duration: 5, size: 512 },
+  { quality: 25, fps: 8, duration: 4, size: 512 },
+  { quality: 25, fps: 8, duration: 4, size: 400 }, // darurat: konten diperkecil
+  { quality: 20, fps: 6, duration: 3, size: 320 }, // darurat terakhir
 ];
-const STILL_QUALITY_LADDER = [{ quality: 90, fps: null, duration: null }];
+const STILL_QUALITY_LADDER = [{ quality: 90, fps: null, duration: null, size: 512 }];
 
 // `buildArgs(step)` harus mengembalikan array argumen ffmpeg lengkap untuk
 // satu percobaan encode, memakai `step.quality` / `step.fps` /
@@ -2691,9 +2707,15 @@ async function gifToTextSticker(inputBuffer, memeText, isStill = false) {
     // channel alpha, jadi kalau langsung di-pad warna "transparan" itu
     // malah dianggap hitam solid oleh encoder.
     const buildArgs = (step) => {
+      const size = step.size || 512;
       const bgFilters = [
         "format=rgba",
-        "scale=512:512:force_original_aspect_ratio=decrease",
+        // `size` biasanya 512 (konten pas kanvas penuh). Di tangga darurat
+        // (lihat ANIMATED_QUALITY_LADDER), size diperkecil (mis. 400/320)
+        // supaya konten discale ke kotak lebih kecil DULU sebelum di-pad --
+        // kanvas akhirnya tetap wajib 512x512, tapi piksel yang perlu
+        // di-encode tiap frame jauh lebih sedikit -> ukuran file lebih kecil.
+        `scale=${size}:${size}:force_original_aspect_ratio=decrease`,
         "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
         ...(isStill || !step.fps ? [] : [`fps=${step.fps}`]),
       ];
@@ -2760,9 +2782,10 @@ async function mediaToSticker(inputBuffer, isStill = false) {
 
   try {
     const buildArgs = (step) => {
+      const size = step.size || 512;
       const filters = [
         "format=rgba",
-        "scale=512:512:force_original_aspect_ratio=decrease",
+        `scale=${size}:${size}:force_original_aspect_ratio=decrease`,
         "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000",
         ...(isStill || !step.fps ? [] : [`fps=${step.fps}`]),
       ];
