@@ -5,6 +5,7 @@ const {
   fetchLatestBaileysVersion,
   DisconnectReason,
   downloadMediaMessage,
+  jidNormalizedUser,
 } = require("@whiskeysockets/baileys");
 
 const P = require("pino");
@@ -37,6 +38,183 @@ const {
 // sweepExpiredSessions() -- lihat setInterval di bawah. Ini rolling per
 // session (bukan reset serentak semua sesi tiap 24 jam sejak bot nyala),
 // jadi sesi yang masih aktif dipakai gak akan hilang tiba-tiba.
+// =====================================================
+// Owner & saklar aktif/nonaktif bot PER GRUP
+//
+// - OWNER_NUMBER: nomor WA owner (format: kode negara + nomor, TANPA "+"
+//   dan TANPA spasi/strip. Contoh Indonesia: "6281234567890"). Wajib diisi
+//   lewat env var OWNER_NUMBER (lihat README/.env) supaya nomor pribadi
+//   gak ke-commit ke git. Kalau env var-nya kosong, fitur owner otomatis
+//   nonaktif semua (gak ada yang dianggap owner) -- aman by default.
+// - Cuma owner yang boleh pakai "!bot on" / "!bot off" / "!bot status".
+//   Saklar ini di-scope PER GRUP (per jid grup), jadi grup A bisa aktif
+//   sementara grup B nonaktif, gak saling ganggu.
+// - Kalau grup lagi dinonaktifin, bot TETAP baca semua pesan yang masuk
+//   (biar owner tetap bisa "!bot on" buat nyalain lagi), tapi buat
+//   siapa pun SELAIN owner yang ketik command ("!..."), bot cuma bales
+//   sekali "ngambek" (nge-tag owner) terus behenti -- gak ada command lain
+//   yang diproses. Owner sendiri TIDAK kena blokir ini sama sekali.
+// - State-nya ditulis ke file JSON (data/bot_state.json) supaya gak reset
+//   ke default tiap kali bot restart/redeploy. Override lokasinya lewat
+//   env var BOT_STATE_FILE kalau perlu (sama pola kayak GROQ_HISTORY_FILE
+//   di agemasenTsundere.js).
+// =====================================================
+const OWNER_NUMBER = (process.env.OWNER_NUMBER || "").replace(/\D/g, "");
+const OWNER_JID = OWNER_NUMBER ? `${OWNER_NUMBER}@s.whatsapp.net` : null;
+
+const BOT_STATE_DATA_DIR = path.join(__dirname, "data");
+const BOT_STATE_FILE =
+  process.env.BOT_STATE_FILE ||
+  path.join(BOT_STATE_DATA_DIR, "bot_state.json");
+
+// jid grup -> false (nonaktif). Grup yang gak ada di sini dianggap AKTIF
+// (default aktif), jadi file-nya cuma perlu nyimpen grup yang DIMATIKAN.
+let disabledGroups = new Set();
+
+function loadBotState() {
+  try {
+    const raw = fs.readFileSync(BOT_STATE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.disabledGroups)) {
+      disabledGroups = new Set(parsed.disabledGroups);
+    }
+  } catch {
+    // Belum ada file / rusak -> mulai dari kosong (semua grup aktif).
+    disabledGroups = new Set();
+  }
+}
+
+function saveBotState() {
+  try {
+    fs.mkdirSync(BOT_STATE_DATA_DIR, { recursive: true });
+    fs.writeFileSync(
+      BOT_STATE_FILE,
+      JSON.stringify({ disabledGroups: [...disabledGroups] }, null, 2),
+    );
+  } catch (err) {
+    console.log("Gagal nyimpen bot_state.json:", err);
+  }
+}
+
+loadBotState();
+
+// Ambil jid pengirim ASLI (bukan jid chat) -- di grup itu participant,
+// di chat pribadi ya remoteJid itu sendiri. Dinormalisasi biar gak
+// kebentur suffix ":device" atau bentuk @lid dari WhatsApp.
+function getSenderJid(msg) {
+  const raw = msg.key.participant || msg.key.remoteJid;
+  if (!raw) return null;
+  try {
+    return jidNormalizedUser(raw);
+  } catch {
+    return raw.split(":")[0];
+  }
+}
+
+function isOwnerMsg(msg) {
+  if (!OWNER_JID) return false;
+  const sender = getSenderJid(msg);
+  return sender === OWNER_JID;
+}
+
+function isBotDisabledFor(jid) {
+  return disabledGroups.has(jid);
+}
+
+// Cooldown biar bot gak spam bales "ngambek" tiap ada 1 pesan doang kalau
+// banyak orang nyoba-nyoba command di grup yang lagi dimatiin.
+const NGAMBEK_COOLDOWN_MS = 15 * 1000;
+const lastNgambekReply = new Map(); // jid -> timestamp
+
+async function sendNgambekReply(sock, jid) {
+  const now = Date.now();
+  const last = lastNgambekReply.get(jid) || 0;
+  if (now - last < NGAMBEK_COOLDOWN_MS) return;
+  lastNgambekReply.set(jid, now);
+
+  const ngambekLines = [
+    "Hmph! Aku lagi gak mau aktif, dasar. 😤",
+    "Males ah, aku lagi dimatiin. Gak mau kerja dulu sekarang. 🙄",
+    "Ish, jangan suruh-suruh aku, aku lagi nonaktif tau!",
+  ];
+  const line = ngambekLines[Math.floor(Math.random() * ngambekLines.length)];
+
+  if (!OWNER_JID) {
+    await sock.sendMessage(jid, { text: line });
+    return;
+  }
+
+  await sock.sendMessage(jid, {
+    text: `${line}\n\nKalau mau aku aktif lagi, hubungin @${OWNER_NUMBER} ya, bukan aku yang nentuin. 💢`,
+    mentions: [OWNER_JID],
+  });
+}
+
+// Handler command "!bot on / off / status" -- KHUSUS owner.
+// Return true kalau pesan ini sudah ditangani sebagai command !bot
+// (baik berhasil, ditolak karena bukan owner, dsb) -- caller harus
+// return begitu dapat true, JANGAN lanjut proses apa pun lagi.
+async function handleBotSwitchCommand(sock, msg, { jid, text }) {
+  const match = text.match(/^!bot(?:\s+(\S+))?\s*$/i);
+  if (!match) return false;
+
+  if (!isOwnerMsg(msg)) {
+    await sock.sendMessage(jid, {
+      text: "🚫 Cuma owner yang boleh atur aktif/nonaktifin aku, dasar.",
+    });
+    return true;
+  }
+
+  const sub = (match[1] || "").toLowerCase();
+  const isGroup = jid.endsWith("@g.us");
+
+  if (sub === "status" || sub === "") {
+    if (!isGroup) {
+      await sock.sendMessage(jid, {
+        text: "ℹ️ Command ini cuma buat ngatur status per GRUP. Ketik di dalam grup yang mau dicek/diatur.",
+      });
+      return true;
+    }
+    const disabled = isBotDisabledFor(jid);
+    await sock.sendMessage(jid, {
+      text: disabled
+        ? "📴 Status grup ini: NONAKTIF. Ketik *!bot on* buat nyalain lagi."
+        : "✅ Status grup ini: AKTIF. Ketik *!bot off* buat matiin.",
+    });
+    return true;
+  }
+
+  if (sub !== "on" && sub !== "off") {
+    await sock.sendMessage(jid, {
+      text: "❓ Format salah.\nGunakan:\n!bot on\n!bot off\n!bot status",
+    });
+    return true;
+  }
+
+  if (!isGroup) {
+    await sock.sendMessage(jid, {
+      text: "ℹ️ Fitur ini cuma bisa dipakai DI DALAM grup yang mau diaktif/nonaktifin (bukan chat pribadi).",
+    });
+    return true;
+  }
+
+  if (sub === "on") {
+    disabledGroups.delete(jid);
+    saveBotState();
+    await sock.sendMessage(jid, {
+      text: "✅ Yaudah, aku aktif lagi di grup ini. Bukan berarti aku seneng ya! 😳",
+    });
+  } else {
+    disabledGroups.add(jid);
+    saveBotState();
+    await sock.sendMessage(jid, {
+      text: "📴 Oke, aku nonaktif di grup ini sekarang. Kalau ada yang manggil-manggil aku juga gak bakal respon.",
+    });
+  }
+
+  return true;
+}
+
 // =====================================================
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 jam
 const sessions = new Map();
@@ -2935,6 +3113,28 @@ async function startBot() {
       msg.message.documentMessage?.caption ||
       ""
     ).trim();
+
+    // =====================
+    // !bot on / !bot off / !bot status -- KHUSUS owner, PALING ATAS
+    // supaya tetap jalan walaupun grup lagi dinonaktifin (owner harus
+    // selalu bisa nyalain lagi).
+    // =====================
+    if (await handleBotSwitchCommand(sock, msg, { jid, text })) {
+      return;
+    }
+
+    // =====================
+    // Saklar aktif/nonaktif per grup: kalau grup ini lagi DIMATIIN dan
+    // pengirimnya BUKAN owner, bot "ngambek" -- gak proses command/fitur
+    // apa pun lagi (termasuk chat AI tsundere di bawah). Owner sendiri
+    // gak kena blokir ini sama sekali.
+    // =====================
+    if (isBotDisabledFor(jid) && !isOwnerMsg(msg)) {
+      if (text.startsWith("!")) {
+        await sendNgambekReply(sock, jid);
+      }
+      return;
+    }
 
     // =====================
     // !ping
