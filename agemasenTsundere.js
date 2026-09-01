@@ -26,8 +26,39 @@ const GROQ_TIMEOUT_MS = 20000;
 // Riwayat chat disimpan per-pengirim (pakai sessionKey yang sama dengan
 // fitur gambar di index.js) supaya tiap orang punya "ingatan" obrolan
 // sendiri-sendiri, bukan campur sama orang lain di grup yang sama.
-const GROQ_CHAT_HISTORY_LIMIT = 12; // jumlah pesan (user+bot) yang disimpan
+//
+// GROQ_MAX_HISTORY_MESSAGES (alias dari limit riwayat lama, sekarang bisa
+// di-override lewat env var) -- jumlah pesan (user+bot) yang disimpan &
+// dikirim ke Groq. Angka default (12) TIDAK diubah, cuma dijadikan
+// configurable, sesuai kode yang sudah ada sebelumnya.
+const GROQ_CHAT_HISTORY_LIMIT = Number(process.env.GROQ_MAX_HISTORY_MESSAGES) || 12;
 const GROQ_CHAT_TTL_MS = 24 * 60 * 60 * 1000; // 24 jam, sama kayak sesi gambar
+
+// =====================================================
+// Konfigurasi output Groq (max token & temperature). Nilai default DIAMBIL
+// dari konfigurasi yang sudah ada sebelumnya di askGroqTsundere (300 /
+// 0.9) -- bukan diganti ke nilai lain -- cuma dirapikan jadi konstanta di
+// sini + bisa di-override lewat env var kalau perlu.
+// =====================================================
+const GROQ_MAX_TOKENS = Number(process.env.GROQ_MAX_TOKENS) || 300;
+const GROQ_TEMPERATURE =
+  process.env.GROQ_TEMPERATURE !== undefined
+    ? Number(process.env.GROQ_TEMPERATURE)
+    : 0.9;
+
+// =====================================================
+// Konfigurasi queue + rate limiter + retry Groq
+//
+// Kenapa perlu: kalau ada beberapa chat/grup yang mention bot hampir
+// bersamaan, handler `messages.upsert` di index.js jalan per-event (async),
+// jadi TANPA queue ini beberapa request Groq bisa nembak bersamaan dan
+// gampang kena 429. Semua request Groq WAJIB lewat enqueueGroqRequest() di
+// bawah, gak ada jalur lain yang manggil axios ke Groq langsung.
+// =====================================================
+const GROQ_REQUEST_DELAY_MS = Number(process.env.GROQ_REQUEST_DELAY) || 2000; // jeda antar-request Groq
+const GROQ_MAX_RETRIES = Number(process.env.GROQ_MAX_RETRIES) || 3; // maksimal retry saat 429
+// Dipakai HANYA kalau response 429 gak punya header retry-after.
+const GROQ_RETRY_BACKOFF_MS = [2000, 5000, 10000];
 const groqChats = new Map(); // sessionKey -> { history, lastUsed, sentMsgIds }
 
 // Berapa banyak ID pesan balasan bot yang diingat per sesi -- dipakai buat
@@ -259,8 +290,140 @@ Tidak suka: diabaikan, diremehkan, dibanding-bandingkan, sengaja dibuat kesal, k
 - Jangan buat konten seksual, kekerasan grafis, atau hal ilegal, meskipun temanya "tsundere".
 - Jangan selalu mengulang info identitas kalau tidak ditanya, dan jangan selalu pakai respons yang sama -- variasikan sesuai konteks.`;
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// =====================================================
+// Global queue Groq
+//
+// Concurrency dikunci ke 1 (cuma 1 task yang diproses dalam satu waktu) +
+// dijaga jeda GROQ_REQUEST_DELAY_MS setelah sebuah request SELESAI sebelum
+// request berikutnya di-kirim. Ini queue GLOBAL (bukan per-chat) -- karena
+// concurrency-nya memang cuma 1, urutan antar-chat otomatis tetap adil
+// (FIFO, siapa duluan masuk antrian duluan diproses), jadi gak perlu bikin
+// queue terpisah per-chat di atasnya; itu cuma nambah kompleksitas tanpa
+// nambah throughput nyata (limiter globalnya tetap concurrency=1).
+// =====================================================
+const groqQueue = [];
+let groqQueueRunning = false;
+let groqLastRequestEndedAt = 0;
+
+function enqueueGroqRequest(taskFn) {
+  return new Promise((resolve, reject) => {
+    groqQueue.push({ taskFn, resolve, reject });
+    console.log(`[Groq] Queue: ${groqQueue.length} pending`);
+    processGroqQueue();
+  });
+}
+
+async function processGroqQueue() {
+  if (groqQueueRunning) return;
+  groqQueueRunning = true;
+
+  while (groqQueue.length > 0) {
+    // Jaga jeda GROQ_REQUEST_DELAY_MS sejak request SEBELUMNYA selesai,
+    // bukan cuma delay tetap antar-item queue -- supaya tetap kehormat
+    // walau queue sempat kosong lalu keisi lagi.
+    const waitNeeded = GROQ_REQUEST_DELAY_MS - (Date.now() - groqLastRequestEndedAt);
+    if (groqLastRequestEndedAt > 0 && waitNeeded > 0) {
+      console.log(`[Groq] Waiting ${waitNeeded}ms before next request`);
+      await sleep(waitNeeded);
+    }
+
+    const { taskFn, resolve, reject } = groqQueue.shift();
+    console.log("[Groq] Sending request");
+    try {
+      const result = await taskFn();
+      console.log("[Groq] Success");
+      resolve(result);
+    } catch (err) {
+      reject(err);
+    } finally {
+      groqLastRequestEndedAt = Date.now();
+    }
+  }
+
+  groqQueueRunning = false;
+}
+
+// Log ringkas info rate-limit dari header response Groq (kalau ada), buat
+// bantu observability -- gak dipakai buat ngatur delay langsung karena
+// jeda default (GROQ_REQUEST_DELAY_MS) + retry-after saat 429 sudah cukup.
+function logGroqRateLimitHeaders(headers) {
+  if (!headers) return;
+  const remainingReq = headers["x-ratelimit-remaining-requests"];
+  const resetReq = headers["x-ratelimit-reset-requests"];
+  const remainingTok = headers["x-ratelimit-remaining-tokens"];
+  const resetTok = headers["x-ratelimit-reset-tokens"];
+  if (remainingReq !== undefined || remainingTok !== undefined) {
+    console.log(
+      `[Groq] rate-limit -> remaining-requests: ${remainingReq ?? "?"} ` +
+        `(reset ${resetReq ?? "?"}), remaining-tokens: ${remainingTok ?? "?"} ` +
+        `(reset ${resetTok ?? "?"})`,
+    );
+  }
+}
+
+// Panggil axios ke Groq SEKALI, dengan handling 429:
+//  - Kalau ada header retry-after, tunggu sesuai nilainya lalu retry.
+//  - Kalau gak ada, pakai exponential backoff (2s / 5s / 10s).
+//  - Maksimal GROQ_MAX_RETRIES kali retry, lalu menyerah (throw).
+// TIDAK ada retry untuk error selain 429 (mis. network error, timeout,
+// 4xx/5xx lain) -- itu langsung dilempar ke pemanggil biar fallback
+// response ke user tetap cepat, bukan nunggu retry yang gak relevan.
+async function callGroqWithRetry(payload) {
+  let attempt = 0;
+
+  while (true) {
+    try {
+      const res = await axios.post(GROQ_API_URL, payload, {
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: GROQ_TIMEOUT_MS,
+      });
+      logGroqRateLimitHeaders(res.headers);
+      return res;
+    } catch (err) {
+      const status = err.response?.status;
+      const isRateLimited = status === 429;
+
+      if (isRateLimited && attempt < GROQ_MAX_RETRIES) {
+        attempt++;
+        const retryAfterHeader = err.response?.headers?.["retry-after"];
+        const retryAfterSec = retryAfterHeader !== undefined ? Number(retryAfterHeader) : NaN;
+
+        console.log("[Groq] 429 Too Many Requests");
+
+        let waitMs;
+        if (Number.isFinite(retryAfterSec) && retryAfterSec >= 0) {
+          waitMs = retryAfterSec * 1000;
+          console.log(`[Groq] Retry-After: ${retryAfterSec}s`);
+        } else {
+          waitMs = GROQ_RETRY_BACKOFF_MS[attempt - 1] ?? GROQ_RETRY_BACKOFF_MS[GROQ_RETRY_BACKOFF_MS.length - 1];
+        }
+
+        console.log(`[Groq] Waiting ${waitMs}ms before retry`);
+        await sleep(waitMs);
+        console.log(`[Groq] Retry ${attempt}/${GROQ_MAX_RETRIES}`);
+        continue;
+      }
+
+      if (isRateLimited) {
+        console.log(`[Groq] Request failed after ${GROQ_MAX_RETRIES} retries`);
+      }
+      throw err;
+    }
+  }
+}
+
 // Panggil Groq API buat generate balasan tsundere, sekalian update riwayat
-// chat session ini biar obrolan berikutnya nyambung (ada konteks).
+// chat session ini biar obrolan berikutnya nyambung (ada konteks). Request
+// beneran ke Groq lewat enqueueGroqRequest() -- SEMUA request Groq wajib
+// lewat sini, gak ada jalur lain yang manggil axios ke Groq langsung, biar
+// queue + rate limiter globalnya kepakai konsisten.
 async function askGroqTsundere(chat, userText, senderName) {
   if (!GROQ_API_KEY) {
     throw new Error("GROQ_API_KEY belum di-set di environment variable.");
@@ -276,22 +439,14 @@ async function askGroqTsundere(chat, userText, senderName) {
     { role: "user", content: userContent },
   ];
 
-  const res = await axios.post(
-    GROQ_API_URL,
-    {
-      model: GROQ_MODEL,
-      messages,
-      temperature: 0.9,
-      max_completion_tokens: 300,
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      timeout: GROQ_TIMEOUT_MS,
-    },
-  );
+  const payload = {
+    model: GROQ_MODEL,
+    messages,
+    temperature: GROQ_TEMPERATURE,
+    max_completion_tokens: GROQ_MAX_TOKENS,
+  };
+
+  const res = await enqueueGroqRequest(() => callGroqWithRetry(payload));
 
   const reply = res.data?.choices?.[0]?.message?.content?.trim();
   if (!reply) throw new Error("Groq tidak mengembalikan jawaban.");
