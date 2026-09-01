@@ -99,10 +99,21 @@ function saveBotState() {
 loadBotState();
 
 // Ambil jid pengirim ASLI (bukan jid chat) -- di grup itu participant,
-// di chat pribadi ya remoteJid itu sendiri. Dinormalisasi biar gak
-// kebentur suffix ":device" atau bentuk @lid dari WhatsApp.
+// di chat pribadi ya remoteJid itu sendiri.
+//
+// PENTING soal @lid: WhatsApp sekarang bisa ngirim jid pengirim dalam
+// bentuk "xxxxx@lid" (Linked ID / identitas tersembunyi) bukan
+// "nomor@s.whatsapp.net", tergantung setting privasi pengirimnya --
+// walaupun itu beneran nomor yang sama. Baileys nyediain field
+// participantPn (di grup) / senderPn (di chat pribadi) yang isinya
+// SELALU jid berbasis nomor telepon asli, jadi itu yang diprioritaskan
+// biar perbandingan ke OWNER_JID gak meleset gara-gara @lid.
 function getSenderJid(msg) {
-  const raw = msg.key.participant || msg.key.remoteJid;
+  const raw =
+    msg.key.participantPn ||
+    msg.key.participant ||
+    msg.key.senderPn ||
+    msg.key.remoteJid;
   if (!raw) return null;
   try {
     return jidNormalizedUser(raw);
@@ -115,6 +126,29 @@ function isOwnerMsg(msg) {
   if (!OWNER_JID) return false;
   const sender = getSenderJid(msg);
   return sender === OWNER_JID;
+}
+
+// Command debug kecil -- biar gampang troubleshoot kalau owner check
+// meleset lagi (misal gara-gara @lid). Nunjukin jid mentah apa aja yang
+// dikirim WhatsApp buat pesan ini, dan jid mana yang akhirnya dipakai
+// bot buat nentuin siapa pengirimnya.
+async function handleWhoamiCommand(sock, msg, { jid, text }) {
+  if (text.toLowerCase() !== "!whoami") return false;
+
+  const resolved = getSenderJid(msg);
+  const lines = [
+    `🪪 *Jid terdeteksi:* ${resolved || "(gak ketemu)"}`,
+    `Owner: ${isOwnerMsg(msg) ? "✅ ya" : "❌ bukan"}`,
+    "",
+    "_Detail mentah:_",
+    `participant: ${msg.key.participant || "-"}`,
+    `participantPn: ${msg.key.participantPn || "-"}`,
+    `senderPn: ${msg.key.senderPn || "-"}`,
+    `remoteJid: ${msg.key.remoteJid || "-"}`,
+  ];
+
+  await sock.sendMessage(jid, { text: lines.join("\n") });
+  return true;
 }
 
 function isBotDisabledFor(jid) {
@@ -3113,6 +3147,15 @@ async function startBot() {
       msg.message.documentMessage?.caption ||
       ""
     ).trim();
+
+    // =====================
+    // !whoami -- debug: cek jid apa yang kedeteksi buat pengirim pesan ini
+    // (berguna kalau owner check meleset gara-gara @lid dsb). Ditaruh
+    // paling atas juga biar bisa dipakai walau grup lagi dinonaktifin.
+    // =====================
+    if (await handleWhoamiCommand(sock, msg, { jid, text })) {
+      return;
+    }
 
     // =====================
     // !bot on / !bot off / !bot status -- KHUSUS owner, PALING ATAS
