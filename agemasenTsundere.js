@@ -669,10 +669,24 @@ async function askGroqTsundere(chat, userText, senderName, imageDataUri) {
     max_completion_tokens: GROQ_MAX_TOKENS,
   };
 
+  // GROQ_VISION_MODEL (qwen/qwen3.6-27b) itu "reasoning model" -- kalau
+  // reasoning_format gak di-set, default-nya "raw" dan proses mikirnya
+  // (<think>...</think>) ikut nempel di reply.content, bikin balasan Groq
+  // isinya "chain of thought" mentah bukan jawaban final. "hidden" bikin
+  // Groq cuma balikin jawaban akhirnya aja.
+  if (imageDataUri) {
+    payload.reasoning_format = "hidden";
+  }
+
   const res = await enqueueGroqRequest(() => callGroqWithRetry(payload));
 
-  const reply = res.data?.choices?.[0]?.message?.content?.trim();
-  if (!reply) throw new Error("Groq tidak mengembalikan jawaban.");
+  const rawReply = res.data?.choices?.[0]?.message?.content?.trim();
+  if (!rawReply) throw new Error("Groq tidak mengembalikan jawaban.");
+
+  // Jaring pengaman: kalau reasoning_format "hidden" ternyata masih
+  // nyisain tag <think>...</think> (jarang, tapi bisa kejadian), buang
+  // manual biar gak ada "proses mikir" model yang ikut kekirim ke user.
+  const reply = rawReply.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() || rawReply;
 
   chat.history.push({ role: "user", content: historyContent });
   chat.history.push({ role: "assistant", content: reply });
@@ -752,7 +766,7 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
       {
         text: isConfigError
           ? "Hmph, aku belum dikasih GROQ_API_KEY sama pemilikku. Bukan salahku ya! 😤"
-          : "H-hmph! Otakku lagi ngambek gara-gara sedang malas mikir. Coba tag aku lagi nanti. 💢",
+          : "H-hmph! Otakku lagi ngambek gara-gara koneksi ke Groq gagal. Coba tag aku lagi nanti. 💢",
       },
       { quoted: msg },
     );
