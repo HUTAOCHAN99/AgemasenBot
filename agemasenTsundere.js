@@ -148,6 +148,16 @@ const GROQ_CHAT_TTL_MS = 24 * 60 * 60 * 1000; // 24 jam, sama kayak sesi gambar
 // sini + bisa di-override lewat env var kalau perlu.
 // =====================================================
 const GROQ_MAX_TOKENS = Number(process.env.GROQ_MAX_TOKENS) || 300;
+// GROQ_VISION_MODEL (qwen/qwen3.6-27b) itu REASONING model -- sebelum
+// nulis jawaban akhir, dia "mikir" dulu pakai reasoning tokens yang
+// SAMA-SAMA motong dari max_completion_tokens (walau hasil mikirnya
+// disembunyikan lewat reasoning_format:hidden, tokennya tetap kepakai).
+// Kalau budget-nya cuma GROQ_MAX_TOKENS (300, cukup buat model teks
+// biasa yang non-reasoning), gampang kejadian budget abis duluan pas
+// masih "mikir" -> jawaban akhir jadi STRING KOSONG walau request-nya
+// sendiri sukses (200 OK) -- persis gejala "Groq tidak mengembalikan
+// jawaban" yang kejadian. Kasih jatah lebih longgar khusus buat vision.
+const GROQ_VISION_MAX_TOKENS = Number(process.env.GROQ_VISION_MAX_TOKENS) || 1024;
 const GROQ_TEMPERATURE =
   process.env.GROQ_TEMPERATURE !== undefined
     ? Number(process.env.GROQ_TEMPERATURE)
@@ -698,16 +708,25 @@ async function askGroqTsundere(chat, userText, senderName, imageDataUri) {
     model: imageDataUri ? GROQ_VISION_MODEL : GROQ_MODEL,
     messages,
     temperature: GROQ_TEMPERATURE,
-    max_completion_tokens: GROQ_MAX_TOKENS,
+    max_completion_tokens: imageDataUri ? GROQ_VISION_MAX_TOKENS : GROQ_MAX_TOKENS,
   };
 
   // GROQ_VISION_MODEL (qwen/qwen3.6-27b) itu "reasoning model" -- kalau
   // reasoning_format gak di-set, default-nya "raw" dan proses mikirnya
   // (<think>...</think>) ikut nempel di reply.content, bikin balasan Groq
   // isinya "chain of thought" mentah bukan jawaban final. "hidden" bikin
-  // Groq cuma balikin jawaban akhirnya aja.
+  // Groq cuma balikin jawaban akhirnya aja (dijaga sebagai jaring
+  // pengaman terakhir).
+  //
+  // reasoning_effort: "none" MATIIN reasoning-nya sama sekali -- ini yang
+  // PALING nentuin: persona tsundere gak butuh "mikir" berat buat jawab
+  // soal gambar/chat santai, dan tanpa ini reasoning tokens bisa ngabisin
+  // max_completion_tokens duluan sebelum sempat nulis jawaban akhir
+  // (lihat catatan di GROQ_VISION_MAX_TOKENS). Efek sampingnya malah
+  // bagus: respons jadi lebih cepat juga.
   if (imageDataUri) {
     payload.reasoning_format = "hidden";
+    payload.reasoning_effort = "none";
   }
 
   const res = await enqueueGroqRequest(() =>
@@ -715,7 +734,19 @@ async function askGroqTsundere(chat, userText, senderName, imageDataUri) {
   );
 
   const rawReply = res.data?.choices?.[0]?.message?.content?.trim();
-  if (!rawReply) throw new Error("Groq tidak mengembalikan jawaban.");
+  if (!rawReply) {
+    // Diagnostik: kalau ini kejadian lagi, finish_reason "length" berarti
+    // kehabisan max_completion_tokens (reasoning makan semua jatah token
+    // sebelum sempat nulis jawaban) -- solusinya naikkin
+    // GROQ_VISION_MAX_TOKENS / GROQ_MAX_TOKENS lebih lanjut.
+    console.log(
+      "[groq tsundere] content kosong, finish_reason:",
+      res.data?.choices?.[0]?.finish_reason,
+      "usage:",
+      JSON.stringify(res.data?.usage || {}),
+    );
+    throw new Error("Groq tidak mengembalikan jawaban.");
+  }
 
   // Jaring pengaman: kalau reasoning_format "hidden" ternyata masih
   // nyisain tag <think>...</think> (jarang, tapi bisa kejadian), buang
