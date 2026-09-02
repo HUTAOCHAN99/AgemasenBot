@@ -29,6 +29,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const { downloadMediaMessage } = require("@whiskeysockets/baileys");
+const sharp = require("sharp");
 
 // =====================================================
 // Multi API-key Groq (buat handle rate limit / 429)
@@ -120,6 +121,14 @@ const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_TIMEOUT_MS = 20000;
+// Request yang nyertain gambar ke model vision (reasoning model, "mikir"
+// dulu sebelum jawab) ternyata bisa jauh lebih lama dari chat teks biasa.
+// Kalau dipaksa pakai GROQ_TIMEOUT_MS yang sama (20s), request gambar
+// sering keburu timeout duluan sebelum Groq sempat balas -> jatuh ke
+// catch di handleTsundereChat -> user cuma dapet pesan error generik,
+// padahal Groq-nya sendiri masih lagi proses. Kasih jatah waktu lebih
+// longgar khusus buat request yang ada gambarnya.
+const GROQ_VISION_TIMEOUT_MS = Number(process.env.GROQ_VISION_TIMEOUT_MS) || 45000;
 
 // Riwayat chat disimpan per-pengirim (pakai sessionKey yang sama dengan
 // fitur gambar di index.js) supaya tiap orang punya "ingatan" obrolan
@@ -385,11 +394,34 @@ function findImageForVision(msg) {
 // Download gambar (lewat Baileys) lalu encode jadi data URI base64 --
 // format persis yang diminta Groq buat image_url lokal
 // (`data:<mimetype>;base64,<data>`, lihat console.groq.com/docs/vision).
+//
+// Sebelum di-base64, gambar di-resize/kompres dulu pakai sharp. Ini
+// PENTING karena foto WhatsApp (apalagi kalau dikirim kualitas HD, atau
+// hasil forward berkali-kali) bisa berukuran beberapa MB -- giliran
+// dijadikan base64 ukurannya membengkak ~33% lagi, gampang nabrak batas
+// ukuran request Groq (400/413) atau bikin request jadi lambat & gampang
+// timeout. Resize ke maksimal 1568px di sisi terpanjang (cukup buat
+// vision model "melihat" detail gambar dengan baik, sesuai rekomendasi
+// umum vision API) + encode ulang ke JPEG kualitas 80 biasanya sudah
+// cukup mengecilkan ukuran file drastis tanpa bikin gambar jadi jelek.
 async function downloadImageAsDataUri({ content, refKey }) {
   const fakeMsg = { key: refKey, message: content };
-  const buffer = await downloadMediaMessage(fakeMsg, "buffer", {});
-  const mimetype = content.imageMessage?.mimetype || "image/jpeg";
-  return `data:${mimetype};base64,${buffer.toString("base64")}`;
+  const rawBuffer = await downloadMediaMessage(fakeMsg, "buffer", {});
+
+  try {
+    const compressed = await sharp(rawBuffer)
+      .rotate() // ikutin orientasi EXIF sebelum resize, biar gak kebalik
+      .resize({ width: 1568, height: 1568, fit: "inside", withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
+    return `data:image/jpeg;base64,${compressed.toString("base64")}`;
+  } catch (err) {
+    // Kalau gagal dikompres (format aneh, dsb), tetap coba kirim buffer
+    // aslinya apa adanya daripada gagal total.
+    console.log("[groq tsundere] gagal kompres gambar, pakai buffer asli:", err.message || err);
+    const mimetype = content.imageMessage?.mimetype || "image/jpeg";
+    return `data:${mimetype};base64,${rawBuffer.toString("base64")}`;
+  }
 }
 
 // Persona AgemasenBot: tsundere -- jawabannya kedengaran judes/ketus di
@@ -542,7 +574,7 @@ function logGroqRateLimitHeaders(headers) {
 // TIDAK ada retry untuk error selain 429 (mis. network error, timeout,
 // 4xx/5xx lain) -- itu langsung dilempar ke pemanggil biar fallback
 // response ke user tetap cepat, bukan nunggu retry yang gak relevan.
-async function callGroqWithRetry(payload) {
+async function callGroqWithRetry(payload, timeoutMs = GROQ_TIMEOUT_MS) {
   let attempt = 0;
 
   while (true) {
@@ -566,7 +598,7 @@ async function callGroqWithRetry(payload) {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
-        timeout: GROQ_TIMEOUT_MS,
+        timeout: timeoutMs,
       });
       logGroqRateLimitHeaders(res.headers);
       return res;
@@ -678,7 +710,9 @@ async function askGroqTsundere(chat, userText, senderName, imageDataUri) {
     payload.reasoning_format = "hidden";
   }
 
-  const res = await enqueueGroqRequest(() => callGroqWithRetry(payload));
+  const res = await enqueueGroqRequest(() =>
+    callGroqWithRetry(payload, imageDataUri ? GROQ_VISION_TIMEOUT_MS : GROQ_TIMEOUT_MS),
+  );
 
   const rawReply = res.data?.choices?.[0]?.message?.content?.trim();
   if (!rawReply) throw new Error("Groq tidak mengembalikan jawaban.");
@@ -759,7 +793,17 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
     rememberSentMsgId(chat, sentMsg?.key?.id);
     scheduleSaveHistory();
   } catch (err) {
-    console.log("[groq tsundere] gagal:", err.message || err);
+    // Log detail lengkap (bukan cuma err.message) -- error dari axios ke
+    // Groq seringkali cuma nyimpen "Request failed with status code 400"
+    // di message, sedangkan alasan sebenarnya (mis. gambar kegedean,
+    // format model salah, dll) ada di err.response.data. Tanpa ini,
+    // sebelumnya kita gak bisa tau kenapa persisnya chat gambar gagal.
+    console.log(
+      "[groq tsundere] gagal:",
+      err.code === "ECONNABORTED" ? "timeout" : err.message || err,
+      err.response?.status ? `status=${err.response.status}` : "",
+      err.response?.data ? JSON.stringify(err.response.data) : "",
+    );
     const isConfigError = /GROQ_API_KEY/.test(err.message || "");
     await sock.sendMessage(
       jid,
