@@ -766,7 +766,7 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
       {
         text: isConfigError
           ? "Hmph, aku belum dikasih GROQ_API_KEY sama pemilikku. Bukan salahku ya! 😤"
-          : "H-hmph! Otakku lagi ngambek gara-gara malas mikir. Coba tag aku lagi nanti. 💢",
+          : "H-hmph! Otakku lagi ngambek gara-gara lagi malas mikir. Coba tag aku lagi nanti. 💢",
       },
       { quoted: msg },
     );
