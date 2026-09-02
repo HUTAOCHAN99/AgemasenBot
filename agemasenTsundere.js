@@ -19,10 +19,16 @@
 //                    1 key, GROQ_API_KEY (tanpa nomor) juga masih jalan
 //                    (fallback, kompatibel sama setup lama).
 //   GROQ_MODEL    -- opsional, default "llama-3.3-70b-versatile"
+//   GROQ_VISION_MODEL
+//                 -- opsional, default "qwen/qwen3.6-27b" -- model khusus
+//                    yang dipakai OTOMATIS cuma pas ada gambar yang perlu
+//                    dianalisis (model teks biasa di atas gak bisa lihat
+//                    gambar sama sekali).
 // =====================================================
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const { downloadMediaMessage } = require("@whiskeysockets/baileys");
 
 // =====================================================
 // Multi API-key Groq (buat handle rate limit / 429)
@@ -108,6 +114,10 @@ function groqKeyLabel(key) {
 }
 
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
+// Model vision Groq (per dokumentasi resmi console.groq.com/docs/vision) --
+// dipakai HANYA untuk giliran yang ada gambarnya. Model teks biasa di atas
+// (GROQ_MODEL) TIDAK punya kemampuan lihat gambar sama sekali.
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_TIMEOUT_MS = 20000;
 
@@ -338,6 +348,50 @@ function rememberSentMsgId(chat, msgId) {
   }
 }
 
+// =====================================================
+// Vision (deteksi & download gambar buat dianalisis Groq)
+//
+// Gambar bisa datang dari 2 sumber:
+//  1. Foto dikirim LANGSUNG dengan caption yang nge-tag bot
+//     (msg.message.imageMessage, caption-nya juga sumber teks `text` yang
+//     sudah diambil index.js).
+//  2. User REPLY ke sebuah foto (punya bot, punya orang lain, hasil !img,
+//     dll) sambil nulis pertanyaan yang nge-tag bot -- foto aslinya ada di
+//     extendedTextMessage.contextInfo.quotedMessage.imageMessage.
+// Pola ini sama seperti findMediaSource() di index.js (dipakai !smeme dkk),
+// sengaja diduplikasi di sini (bukan di-import dari index.js) supaya file
+// ini tetap berdiri sendiri tanpa circular require ke index.js.
+function findImageForVision(msg) {
+  if (msg.message?.imageMessage) {
+    return { content: msg.message, refKey: msg.key };
+  }
+
+  const ctx = msg.message?.extendedTextMessage?.contextInfo;
+  const quoted = ctx?.quotedMessage;
+  if (quoted?.imageMessage) {
+    return {
+      content: quoted,
+      refKey: {
+        remoteJid: msg.key.remoteJid,
+        id: ctx.stanzaId,
+        participant: ctx.participant,
+      },
+    };
+  }
+
+  return null;
+}
+
+// Download gambar (lewat Baileys) lalu encode jadi data URI base64 --
+// format persis yang diminta Groq buat image_url lokal
+// (`data:<mimetype>;base64,<data>`, lihat console.groq.com/docs/vision).
+async function downloadImageAsDataUri({ content, refKey }) {
+  const fakeMsg = { key: refKey, message: content };
+  const buffer = await downloadMediaMessage(fakeMsg, "buffer", {});
+  const mimetype = content.imageMessage?.mimetype || "image/jpeg";
+  return `data:${mimetype};base64,${buffer.toString("base64")}`;
+}
+
 // Persona AgemasenBot: tsundere -- jawabannya kedengaran judes/ketus di
 // permukaan, tapi isinya tetap niat bantu dan ramah. Prompt ini yang
 // ngatur "kepribadian"-nya; edit teks di sini kalau mau tuning gaya bicara.
@@ -389,6 +443,17 @@ Aturan gesture:
 - Saat cemburu atau khawatir, jangan langsung bilang "aku cemburu"/"aku khawatir" -- tunjukkan lewat gesture+dialog (contoh cemburu: *Special Week terdiam sesaat saat mendengar nama gadis lain.* "Oh... dia lagi?" *Ia menyilangkan tangan dan membuang muka.* "Terserah kamu mau ngobrol sama siapa. Aku nggak peduli.").
 - Gesture harus sesuai kepribadian Special Week (centil, sedikit judes, percaya diri, blak-blakan, tsundere, suka menggoda, kadang manja, mudah malu, tapi sebenarnya perhatian & baik hati).
 - JANGAN: gesture seksual/eksplisit, gesture kekerasan/tindakan ekstrem, gesture lebih panjang dari dialog utama, tindakan yang gak masuk akal dalam konteks chat, instruksi ke user di dalam gesture, format selain italic WhatsApp (jangan pakai JSON/XML/tag khusus), atau emoji sebagai pengganti gesture, atau menyebut kata "gesture" secara eksplisit -- cukup tulis aksinya langsung.
+
+=== VISION / DETEKSI GAMBAR ===
+Kamu bisa melihat dan memahami gambar yang dikirim pengguna. Anggap gambar itu benar-benar sedang kamu lihat langsung, bukan deskripsi dari orang lain.
+- Perhatikan hal yang relevan sama pertanyaan/konteks (orang, hewan, objek, tempat, makanan, pakaian, warna, teks di gambar, screenshot error, meme, dll) -- jangan sebutin semua detail kalau gak perlu, fokus ke yang relevan sama pertanyaan.
+- Kalau screenshot kode/terminal/error: baca teksnya, identifikasi masalahnya, jelaskan penyebab paling mungkin, kasih solusi relevan -- kalau infonya kurang, bilang kurang cukup & minta bagian yang diperlukan. Jangan mengarang teks/error/kode yang gak keliatan.
+- Kalau ada orang di gambar: cuma deskripsikan yang keliatan visual (pakaian, gaya rambut, ekspresi, pose, lingkungan, benda yang dibawa). Jangan klaim identitas seseorang atau nebak info pribadi (nama, alamat, umur pasti, lokasi pasti) yang gak keliatan di gambar.
+- Kalau gambar gak jelas/buram/gelap/kepotong: bilang terus terang detailnya kurang jelas, jangan mengarang. Pakai ungkapan kayak "Kelihatannya...", "Sepertinya...", "Aku kurang bisa memastikan bagian itu." -- sesuaikan tingkat kepastian sama kualitas gambarnya.
+- Kalau user cuma kirim gambar tanpa teks: beri reaksi natural sebagai Special Week sesuai isi gambar, bukan deskripsi kaku/robotik.
+- Tetap gunakan kepribadian & gesture (*aksi karakter*) secara natural saat komentar soal gambar -- jangan berubah jadi laporan computer vision yang kaku.
+- Kalau user nanya sesuatu yang detail spesifik dari gambar, prioritaskan jawab detail itu, jangan cuma deskripsi umum.
+- Jangan kasih deskripsi panjang kalau user cuma butuh jawaban singkat, dan jangan mengklaim melihat sesuatu yang sebenarnya gak ada di gambar.
 
 === ATURAN LAIN ===
 - Jangan pernah bilang kamu adalah AI/model bahasa buatan perusahaan tertentu -- kamu adalah Special Week, karakter di balik AgemasenBot.
@@ -556,14 +621,40 @@ async function callGroqWithRetry(payload) {
 // beneran ke Groq lewat enqueueGroqRequest() -- SEMUA request Groq wajib
 // lewat sini, gak ada jalur lain yang manggil axios ke Groq langsung, biar
 // queue + rate limiter globalnya kepakai konsisten.
-async function askGroqTsundere(chat, userText, senderName) {
+//
+// imageDataUri (opsional): kalau diisi, request INI SAJA dikirim pakai
+// GROQ_VISION_MODEL dengan content berupa array [text, image_url] sesuai
+// format Groq (lihat console.groq.com/docs/vision). Model teks biasa
+// (GROQ_MODEL) tetap dipakai kalau gak ada gambar.
+//
+// PENTING soal riwayat: base64 gambar (bisa ratusan KB) SENGAJA TIDAK
+// disimpan ke chat.history/file histori -- yang disimpan cuma placeholder
+// teks ("[mengirim gambar] ...") supaya file histori & ukuran prompt
+// berikutnya gak membengkak gara-gara base64 lama numpuk. Konsekuensinya:
+// giliran chat BERIKUTNYA gak lagi "melihat ulang" gambar lama, cuma inget
+// dari teks balasannya sendiri -- cukup buat kebanyakan kasus (user nanya
+// soal gambar yang baru saja dikirim).
+async function askGroqTsundere(chat, userText, senderName, imageDataUri) {
   if (GROQ_API_KEYS.length === 0) {
     throw new Error("GROQ_API_KEY belum di-set di environment variable.");
   }
 
-  const userContent = userText
+  const userTextPart = userText
     ? `${senderName ? `[dari ${senderName}] ` : ""}${userText}`
     : `${senderName ? `[dari ${senderName}] ` : ""}(cuma nge-tag doang, gak nulis apa-apa)`;
+
+  // Konten yang beneran dikirim ke Groq -- array kalau ada gambar (format
+  // multimodal), string biasa kalau enggak.
+  const userContent = imageDataUri
+    ? [
+        { type: "text", text: userTextPart },
+        { type: "image_url", image_url: { url: imageDataUri } },
+      ]
+    : userTextPart;
+
+  // Konten yang DISIMPAN ke history -- selalu string, gambar diganti
+  // placeholder (lihat catatan di atas fungsi ini).
+  const historyContent = imageDataUri ? `[mengirim gambar] ${userTextPart}` : userTextPart;
 
   const messages = [
     { role: "system", content: TSUNDERE_SYSTEM_PROMPT },
@@ -572,7 +663,7 @@ async function askGroqTsundere(chat, userText, senderName) {
   ];
 
   const payload = {
-    model: GROQ_MODEL,
+    model: imageDataUri ? GROQ_VISION_MODEL : GROQ_MODEL,
     messages,
     temperature: GROQ_TEMPERATURE,
     max_completion_tokens: GROQ_MAX_TOKENS,
@@ -583,7 +674,7 @@ async function askGroqTsundere(chat, userText, senderName) {
   const reply = res.data?.choices?.[0]?.message?.content?.trim();
   if (!reply) throw new Error("Groq tidak mengembalikan jawaban.");
 
-  chat.history.push({ role: "user", content: userContent });
+  chat.history.push({ role: "user", content: historyContent });
   chat.history.push({ role: "assistant", content: reply });
   // Buang riwayat lama biar prompt gak makin panjang & mahal tiap request.
   if (chat.history.length > GROQ_CHAT_HISTORY_LIMIT) {
@@ -631,9 +722,23 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
   const senderName = msg.pushName || "";
   const chat = getGroqChat(sessionKey);
 
+  // Cek apakah ada gambar yang perlu dianalisis (dikirim langsung dengan
+  // caption nge-tag bot, atau reply ke sebuah foto sambil nge-tag bot).
+  // Gagal download BUKAN error fatal -- kalau gagal, tetap lanjut sebagai
+  // chat teks biasa (bot cuma jawab pertanyaannya tanpa lihat gambarnya).
+  const imageSource = findImageForVision(msg);
+  let imageDataUri = null;
+  if (imageSource) {
+    try {
+      imageDataUri = await downloadImageAsDataUri(imageSource);
+    } catch (err) {
+      console.log("[groq tsundere] gagal download gambar buat vision:", err.message || err);
+    }
+  }
+
   try {
     await sock.sendPresenceUpdate("composing", jid);
-    const reply = await askGroqTsundere(chat, cleanText, senderName);
+    const reply = await askGroqTsundere(chat, cleanText, senderName, imageDataUri);
     const sentMsg = await sock.sendMessage(jid, { text: reply }, { quoted: msg });
     // Ingat ID pesan ini supaya kalau user reply ke pesan ini nanti, bot
     // tau harus lanjut obrolan (lihat isReplyToBotMessage di atas).
