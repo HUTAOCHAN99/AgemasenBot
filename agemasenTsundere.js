@@ -11,14 +11,102 @@
 // pemanggilan `handleTsundereChat`), bukan di sini.
 //
 // Butuh env var:
-//   GROQ_API_KEY  -- wajib, ambil dari https://console.groq.com/keys
+//   GROQ_API_KEY_1, GROQ_API_KEY_2, dst
+//                 -- wajib (minimal 1), ambil dari https://console.groq.com/keys
+//                    Bisa dikasih lebih dari satu key (bernomor urut mulai
+//                    dari 1) biar kalau satu key kena rate limit (429),
+//                    bot otomatis pindah pakai key lain. Kalau cuma punya
+//                    1 key, GROQ_API_KEY (tanpa nomor) juga masih jalan
+//                    (fallback, kompatibel sama setup lama).
 //   GROQ_MODEL    -- opsional, default "llama-3.3-70b-versatile"
 // =====================================================
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+// =====================================================
+// Multi API-key Groq (buat handle rate limit / 429)
+//
+// Key diambil dari env var bernomor urut: GROQ_API_KEY_1, GROQ_API_KEY_2,
+// GROQ_API_KEY_3, dst -- berhenti begitu nomor berikutnya kosong. Kalau
+// gak ada satupun yang bernomor, fallback ke GROQ_API_KEY biasa (key
+// tunggal) biar setup lama yang cuma punya 1 key tetap jalan tanpa ubah
+// env var.
+//
+// Cara kerja rotasinya: tiap key punya status "cooldown" (waktu kapan dia
+// boleh dipakai lagi). Selama request masih jalan normal, key dipakai
+// gantian round-robin (biar beban kepakai merata). Begitu satu key kena
+// 429, key itu ditandai cooldown (pakai retry-after dari Groq kalau ada,
+// atau backoff default) dan request LANGSUNG dicoba lagi pakai key lain
+// yang masih available -- gak nunggu dulu, karena limit Groq itu per-key,
+// jadi key lain harusnya masih longgar. Baru kalau SEMUA key lagi
+// cooldown, bot nunggu (backoff) kayak versi key tunggal sebelumnya.
+// =====================================================
+function loadGroqApiKeys() {
+  const keys = [];
+  let i = 1;
+  while (true) {
+    const val = process.env[`GROQ_API_KEY_${i}`];
+    if (!val) break;
+    keys.push(val);
+    i++;
+  }
+  if (keys.length === 0 && process.env.GROQ_API_KEY) {
+    keys.push(process.env.GROQ_API_KEY);
+  }
+  return keys;
+}
+
+const GROQ_API_KEYS = loadGroqApiKeys();
+console.log(
+  GROQ_API_KEYS.length > 0
+    ? `[Groq] ${GROQ_API_KEYS.length} API key terdeteksi.`
+    : "[Groq] TIDAK ADA API key yang di-set (GROQ_API_KEY_1 / GROQ_API_KEY).",
+);
+
+// key -> timestamp (ms) kapan key ini boleh dipakai lagi (0 = selalu boleh)
+const groqKeyCooldownUntil = new Map(GROQ_API_KEYS.map((k) => [k, 0]));
+let groqKeyRotateIndex = 0; // pointer round-robin antar key yang available
+
+// Pilih key yang bisa dipakai sekarang (round-robin). Kalau semua key
+// lagi cooldown, balikin key yang paling cepat available lagi (pemanggil
+// yang nentuin mau nunggu atau enggak).
+function pickAvailableGroqKey() {
+  if (GROQ_API_KEYS.length === 0) return null;
+  const now = Date.now();
+
+  for (let offset = 0; offset < GROQ_API_KEYS.length; offset++) {
+    const idx = (groqKeyRotateIndex + offset) % GROQ_API_KEYS.length;
+    const key = GROQ_API_KEYS[idx];
+    if ((groqKeyCooldownUntil.get(key) || 0) <= now) {
+      groqKeyRotateIndex = (idx + 1) % GROQ_API_KEYS.length;
+      return key;
+    }
+  }
+
+  let soonestKey = GROQ_API_KEYS[0];
+  let soonestAt = groqKeyCooldownUntil.get(soonestKey) || 0;
+  for (const key of GROQ_API_KEYS) {
+    const until = groqKeyCooldownUntil.get(key) || 0;
+    if (until < soonestAt) {
+      soonestAt = until;
+      soonestKey = key;
+    }
+  }
+  return soonestKey;
+}
+
+function markGroqKeyCooldown(key, waitMs) {
+  groqKeyCooldownUntil.set(key, Date.now() + waitMs);
+}
+
+// Cuma buat label log ("key #2 dari 3") biar gampang di-debug tanpa
+// nge-log API key aslinya.
+function groqKeyLabel(key) {
+  const idx = GROQ_API_KEYS.indexOf(key);
+  return idx === -1 ? "?" : `#${idx + 1}/${GROQ_API_KEYS.length}`;
+}
+
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_TIMEOUT_MS = 20000;
@@ -376,10 +464,24 @@ async function callGroqWithRetry(payload) {
   let attempt = 0;
 
   while (true) {
+    if (GROQ_API_KEYS.length === 0) {
+      throw new Error("GROQ_API_KEY belum di-set di environment variable.");
+    }
+
+    const apiKey = pickAvailableGroqKey();
+
+    // pickAvailableGroqKey() cuma balikin key yang masih cooldown kalau
+    // SEMUA key lagi cooldown -- di situ baru kita nunggu.
+    const waitForKey = (groqKeyCooldownUntil.get(apiKey) || 0) - Date.now();
+    if (waitForKey > 0) {
+      console.log(`[Groq] Semua key lagi cooldown, nunggu ${waitForKey}ms (key ${groqKeyLabel(apiKey)} paling cepat available)`);
+      await sleep(waitForKey);
+    }
+
     try {
       const res = await axios.post(GROQ_API_URL, payload, {
         headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
+          Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
         timeout: GROQ_TIMEOUT_MS,
@@ -395,7 +497,7 @@ async function callGroqWithRetry(payload) {
         const retryAfterHeader = err.response?.headers?.["retry-after"];
         const retryAfterSec = retryAfterHeader !== undefined ? Number(retryAfterHeader) : NaN;
 
-        console.log("[Groq] 429 Too Many Requests");
+        console.log(`[Groq] 429 Too Many Requests (key ${groqKeyLabel(apiKey)})`);
 
         let waitMs;
         if (Number.isFinite(retryAfterSec) && retryAfterSec >= 0) {
@@ -405,14 +507,27 @@ async function callGroqWithRetry(payload) {
           waitMs = GROQ_RETRY_BACKOFF_MS[attempt - 1] ?? GROQ_RETRY_BACKOFF_MS[GROQ_RETRY_BACKOFF_MS.length - 1];
         }
 
-        console.log(`[Groq] Waiting ${waitMs}ms before retry`);
-        await sleep(waitMs);
+        // Tandai key ini cooldown. Kalau ada key LAIN yang available,
+        // langsung retry pakai itu di iterasi berikutnya tanpa nunggu
+        // waitMs sama sekali -- nunggu cuma kepakai kalau ternyata semua
+        // key lagi cooldown (dicek di awal loop lewat pickAvailableGroqKey).
+        markGroqKeyCooldown(apiKey, waitMs);
+
+        const hasOtherAvailable = GROQ_API_KEYS.some(
+          (k) => k !== apiKey && (groqKeyCooldownUntil.get(k) || 0) <= Date.now(),
+        );
+        console.log(
+          hasOtherAvailable
+            ? `[Groq] Pindah ke key lain, retry tanpa nunggu`
+            : `[Groq] Gak ada key lain yang available, key ${groqKeyLabel(apiKey)} cooldown ${waitMs}ms`,
+        );
+
         console.log(`[Groq] Retry ${attempt}/${GROQ_MAX_RETRIES}`);
         continue;
       }
 
       if (isRateLimited) {
-        console.log(`[Groq] Request failed after ${GROQ_MAX_RETRIES} retries`);
+        console.log(`[Groq] Request gagal setelah ${GROQ_MAX_RETRIES} retry (key ${groqKeyLabel(apiKey)}, semua key kena limit)`);
       }
       throw err;
     }
@@ -425,7 +540,7 @@ async function callGroqWithRetry(payload) {
 // lewat sini, gak ada jalur lain yang manggil axios ke Groq langsung, biar
 // queue + rate limiter globalnya kepakai konsisten.
 async function askGroqTsundere(chat, userText, senderName) {
-  if (!GROQ_API_KEY) {
+  if (GROQ_API_KEYS.length === 0) {
     throw new Error("GROQ_API_KEY belum di-set di environment variable.");
   }
 
