@@ -120,7 +120,7 @@ const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 // (GROQ_MODEL) TIDAK punya kemampuan lihat gambar sama sekali.
 const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_TIMEOUT_MS = Number(process.env.GROQ_TIMEOUT_MS) || 30000;
+const GROQ_TIMEOUT_MS = 20000;
 // Request yang nyertain gambar ke model vision (reasoning model, "mikir"
 // dulu sebelum jawab) ternyata bisa jauh lebih lama dari chat teks biasa.
 // Kalau dipaksa pakai GROQ_TIMEOUT_MS yang sama (20s), request gambar
@@ -158,6 +158,57 @@ const GROQ_MAX_TOKENS = Number(process.env.GROQ_MAX_TOKENS) || 800;
 // sendiri sukses (200 OK) -- persis gejala "Groq tidak mengembalikan
 // jawaban" yang kejadian. Kasih jatah lebih longgar khusus buat vision.
 const GROQ_VISION_MAX_TOKENS = Number(process.env.GROQ_VISION_MAX_TOKENS) || 1024;
+
+// =====================================================
+// Auto-continue kalau jawaban Groq terpotong (finish_reason "length").
+// Daripada cuma naikin max_tokens (yang lama-lama tetap bisa kepotong buat
+// jawaban yang emang panjang), begitu kedeteksi terpotong, kita minta Groq
+// nerusin PERSIS dari kata terakhir (lewat GROQ_CONTINUE_PROMPT di bawah),
+// digabung jadi satu jawaban utuh -- maksimal GROQ_MAX_CONTINUATIONS kali
+// nyambung biar gak muter terus kalau modelnya "ngasal" gak pernah selesai.
+//
+// Jawaban utuh itu lalu dipecah per paragraf (splitReplyIntoChunks) dan
+// dikirim sebagai BEBERAPA pesan WhatsApp berurutan (bukan satu pesan
+// panjang) -- biar kerasa natural kayak orang ngetik nyicil, bukan kayak
+// dinding teks atau -- yang lebih parah -- keputus di tengah kalimat.
+// =====================================================
+const GROQ_MAX_CONTINUATIONS = Number(process.env.GROQ_MAX_CONTINUATIONS) || 2;
+const GROQ_CONTINUE_PROMPT =
+  "[SISTEM: balasanmu barusan terpotong karena kehabisan token. Lanjutkan PERSIS dari kata/kalimat terakhir yang belum selesai. JANGAN mengulang apa yang sudah kamu tulis, JANGAN buka salam baru, JANGAN mulai aksi (*...*) baru -- langsung sambung kalimat/list yang terputus tadi.]";
+
+// Pecah 1 jawaban utuh jadi beberapa "bubble" pesan WhatsApp berdasarkan
+// baris kosong (paragraf). Paragraf yang kepanjangan (>MAX_CHUNK_CHARS)
+// dipecah lagi per kalimat biar gak ada 1 bubble yang kegedean sendiri.
+const MAX_CHUNK_CHARS = 700;
+function splitReplyIntoChunks(fullText) {
+  const paragraphs = fullText
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const chunks = [];
+  for (const paragraph of paragraphs) {
+    if (paragraph.length <= MAX_CHUNK_CHARS) {
+      chunks.push(paragraph);
+      continue;
+    }
+    // Paragraf kepanjangan -- pecah per kalimat, digabung lagi sampai
+    // mendekati MAX_CHUNK_CHARS supaya gak kebanyakan bubble kecil-kecil.
+    const sentences = paragraph.split(/(?<=[.!?])\s+/);
+    let buffer = "";
+    for (const sentence of sentences) {
+      if (buffer && (buffer.length + sentence.length + 1) > MAX_CHUNK_CHARS) {
+        chunks.push(buffer.trim());
+        buffer = sentence;
+      } else {
+        buffer = buffer ? `${buffer} ${sentence}` : sentence;
+      }
+    }
+    if (buffer.trim()) chunks.push(buffer.trim());
+  }
+
+  return chunks.length > 0 ? chunks : [fullText.trim()];
+}
 const GROQ_TEMPERATURE =
   process.env.GROQ_TEMPERATURE !== undefined
     ? Number(process.env.GROQ_TEMPERATURE)
@@ -704,54 +755,84 @@ async function askGroqTsundere(chat, userText, senderName, imageDataUri) {
     { role: "user", content: userContent },
   ];
 
-  const payload = {
-    model: imageDataUri ? GROQ_VISION_MODEL : GROQ_MODEL,
-    messages,
-    temperature: GROQ_TEMPERATURE,
-    max_completion_tokens: imageDataUri ? GROQ_VISION_MAX_TOKENS : GROQ_MAX_TOKENS,
-  };
+  const model = imageDataUri ? GROQ_VISION_MODEL : GROQ_MODEL;
+  const maxTokens = imageDataUri ? GROQ_VISION_MAX_TOKENS : GROQ_MAX_TOKENS;
+  const timeoutMs = imageDataUri ? GROQ_VISION_TIMEOUT_MS : GROQ_TIMEOUT_MS;
 
-  // GROQ_VISION_MODEL (qwen/qwen3.6-27b) itu "reasoning model" -- kalau
-  // reasoning_format gak di-set, default-nya "raw" dan proses mikirnya
-  // (<think>...</think>) ikut nempel di reply.content, bikin balasan Groq
-  // isinya "chain of thought" mentah bukan jawaban final. "hidden" bikin
-  // Groq cuma balikin jawaban akhirnya aja (dijaga sebagai jaring
-  // pengaman terakhir).
-  //
-  // reasoning_effort: "none" MATIIN reasoning-nya sama sekali -- ini yang
-  // PALING nentuin: persona tsundere gak butuh "mikir" berat buat jawab
-  // soal gambar/chat santai, dan tanpa ini reasoning tokens bisa ngabisin
-  // max_completion_tokens duluan sebelum sempat nulis jawaban akhir
-  // (lihat catatan di GROQ_VISION_MAX_TOKENS). Efek sampingnya malah
-  // bagus: respons jadi lebih cepat juga.
-  if (imageDataUri) {
-    payload.reasoning_format = "hidden";
-    payload.reasoning_effort = "none";
+  // Panggil Groq SEKALI (dipakai berulang di loop auto-continue di bawah).
+  // Balikin { content, finishReason } -- content sudah ditrim & dibuang
+  // tag <think> kalau ada (lihat catatan reasoning_format di bawah).
+  async function callOnce(msgs) {
+    const payload = {
+      model,
+      messages: msgs,
+      temperature: GROQ_TEMPERATURE,
+      max_completion_tokens: maxTokens,
+    };
+
+    // GROQ_VISION_MODEL (qwen/qwen3.6-27b) itu "reasoning model" -- kalau
+    // reasoning_format gak di-set, default-nya "raw" dan proses mikirnya
+    // (<think>...</think>) ikut nempel di reply.content, bikin balasan
+    // Groq isinya "chain of thought" mentah bukan jawaban final. "hidden"
+    // bikin Groq cuma balikin jawaban akhirnya aja (dijaga sebagai jaring
+    // pengaman terakhir).
+    //
+    // reasoning_effort: "none" MATIIN reasoning-nya sama sekali -- ini
+    // yang PALING nentuin: persona tsundere gak butuh "mikir" berat buat
+    // jawab soal gambar/chat santai, dan tanpa ini reasoning tokens bisa
+    // ngabisin max_completion_tokens duluan sebelum sempat nulis jawaban
+    // akhir (lihat catatan di GROQ_VISION_MAX_TOKENS). Efek sampingnya
+    // malah bagus: respons jadi lebih cepat juga.
+    if (imageDataUri) {
+      payload.reasoning_format = "hidden";
+      payload.reasoning_effort = "none";
+    }
+
+    const res = await enqueueGroqRequest(() => callGroqWithRetry(payload, timeoutMs));
+
+    const rawContent = res.data?.choices?.[0]?.message?.content?.trim();
+    const finishReason = res.data?.choices?.[0]?.finish_reason;
+    if (!rawContent) {
+      // Diagnostik: kalau ini kejadian lagi, finish_reason "length" berarti
+      // kehabisan max_completion_tokens (reasoning makan semua jatah token
+      // sebelum sempat nulis jawaban) -- solusinya naikkin
+      // GROQ_VISION_MAX_TOKENS / GROQ_MAX_TOKENS lebih lanjut.
+      console.log(
+        "[groq tsundere] content kosong, finish_reason:",
+        finishReason,
+        "usage:",
+        JSON.stringify(res.data?.usage || {}),
+      );
+      throw new Error("Groq tidak mengembalikan jawaban.");
+    }
+
+    // Jaring pengaman: kalau reasoning_format "hidden" ternyata masih
+    // nyisain tag <think>...</think> (jarang, tapi bisa kejadian), buang
+    // manual biar gak ada "proses mikir" model yang ikut kekirim ke user.
+    const content = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() || rawContent;
+    return { content, finishReason };
   }
 
-  const res = await enqueueGroqRequest(() =>
-    callGroqWithRetry(payload, imageDataUri ? GROQ_VISION_TIMEOUT_MS : GROQ_TIMEOUT_MS),
-  );
-
-  const rawReply = res.data?.choices?.[0]?.message?.content?.trim();
-  if (!rawReply) {
-    // Diagnostik: kalau ini kejadian lagi, finish_reason "length" berarti
-    // kehabisan max_completion_tokens (reasoning makan semua jatah token
-    // sebelum sempat nulis jawaban) -- solusinya naikkin
-    // GROQ_VISION_MAX_TOKENS / GROQ_MAX_TOKENS lebih lanjut.
-    console.log(
-      "[groq tsundere] content kosong, finish_reason:",
-      res.data?.choices?.[0]?.finish_reason,
-      "usage:",
-      JSON.stringify(res.data?.usage || {}),
-    );
-    throw new Error("Groq tidak mengembalikan jawaban.");
+  // Loop auto-continue: kalau finish_reason "length" (kepotong kehabisan
+  // token), minta Groq nerusin persis dari kata terakhir, digabung jadi
+  // satu jawaban utuh. Riwayat sesi (chat.history) TIDAK ikut dicemari
+  // pesan "lanjutin dong" ini -- itu cuma dipakai lokal di loop ini, yang
+  // disimpan ke history nanti cuma hasil gabungannya yang sudah utuh.
+  let workingMessages = messages;
+  let { content: reply, finishReason } = await callOnce(workingMessages);
+  let continuations = 0;
+  while (finishReason === "length" && continuations < GROQ_MAX_CONTINUATIONS) {
+    continuations++;
+    workingMessages = [
+      ...workingMessages,
+      { role: "assistant", content: reply },
+      { role: "user", content: GROQ_CONTINUE_PROMPT },
+    ];
+    console.log(`[groq tsundere] jawaban kepotong, auto-continue ${continuations}/${GROQ_MAX_CONTINUATIONS}`);
+    const next = await callOnce(workingMessages);
+    reply += next.content;
+    finishReason = next.finishReason;
   }
-
-  // Jaring pengaman: kalau reasoning_format "hidden" ternyata masih
-  // nyisain tag <think>...</think> (jarang, tapi bisa kejadian), buang
-  // manual biar gak ada "proses mikir" model yang ikut kekirim ke user.
-  const reply = rawReply.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() || rawReply;
 
   chat.history.push({ role: "user", content: historyContent });
   chat.history.push({ role: "assistant", content: reply });
@@ -764,7 +845,10 @@ async function askGroqTsundere(chat, userText, senderName, imageDataUri) {
   // gak hilang kalau bot restart sebelum sempat dipakai lagi.
   scheduleSaveHistory();
 
-  return reply;
+  // Balikin jawaban utuh SEKALIGUS pecahannya per paragraf/bubble --
+  // pemanggil (handleTsundereChat) yang nentuin cara kirimnya (1 pesan
+  // atau nyicil beberapa pesan berurutan).
+  return { text: reply, chunks: splitReplyIntoChunks(reply) };
 }
 
 // =====================================================
@@ -817,11 +901,29 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
 
   try {
     await sock.sendPresenceUpdate("composing", jid);
-    const reply = await askGroqTsundere(chat, cleanText, senderName, imageDataUri);
-    const sentMsg = await sock.sendMessage(jid, { text: reply }, { quoted: msg });
-    // Ingat ID pesan ini supaya kalau user reply ke pesan ini nanti, bot
-    // tau harus lanjut obrolan (lihat isReplyToBotMessage di atas).
-    rememberSentMsgId(chat, sentMsg?.key?.id);
+    const { chunks } = await askGroqTsundere(chat, cleanText, senderName, imageDataUri);
+
+    // Kirim tiap chunk (paragraf/bagian jawaban) sebagai pesan terpisah
+    // berurutan, bukan sekaligus jadi 1 dinding teks -- biar kerasa kayak
+    // orang ngetik nyicil per-bubble. Delay singkat + "composing" lagi di
+    // antara chunk biar animasi "typing..." muncul wajar (bukan spam
+    // kilat), skala dikit sesuai panjang teksnya.
+    for (let i = 0; i < chunks.length; i++) {
+      if (i > 0) {
+        await sock.sendPresenceUpdate("composing", jid);
+        const typingDelay = Math.min(2500, 400 + chunks[i].length * 8);
+        await sleep(typingDelay);
+      }
+      const sentMsg = await sock.sendMessage(
+        jid,
+        { text: chunks[i] },
+        i === 0 ? { quoted: msg } : {},
+      );
+      // Ingat ID tiap bubble supaya kalau user reply ke salah satu (bukan
+      // cuma yang terakhir), bot tetap tau harus lanjut obrolan (lihat
+      // isReplyToBotMessage di atas).
+      rememberSentMsgId(chat, sentMsg?.key?.id);
+    }
     scheduleSaveHistory();
   } catch (err) {
     // Log detail lengkap (bukan cuma err.message) -- error dari axios ke
