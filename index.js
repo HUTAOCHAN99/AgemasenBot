@@ -17,6 +17,7 @@ const crypto = require("crypto");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
 const sharp = require("sharp");
+const { PDFParse } = require("pdf-parse");
 
 // Fitur chat AI tsundere (Groq) -- dipisah dari file ini, lihat
 // agemasenTsundere.js untuk semua logic-nya (persona, panggilan API,
@@ -25,6 +26,12 @@ const {
   handleTsundereChat,
   sweepExpiredTsundereChats,
   forgetGroqChat,
+  summarizeDocumentText,
+  saveDocumentContext,
+  DOC_HARD_MAX_CHARS,
+  SUMMARY_SINGLE_PASS_MAX_CHARS,
+  SUMMARY_CHUNK_CHARS,
+  DOC_CONTEXT_TTL_MS,
 } = require("./agemasenTsundere");
 
 // =====================================================
@@ -924,6 +931,11 @@ Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti
 ▸ !hd
 
 ┏━━━━━━━━━━━━━━━┓
+┃ 📄 *DOKUMEN*
+┗━━━━━━━━━━━━━━━┛
+▸ !ringkas
+
+┏━━━━━━━━━━━━━━━┓
 ┃ 💬 *CHAT AI*
 ┗━━━━━━━━━━━━━━━┛
 ▸ Tag aku (@AgemasenBot) buat ngobrol
@@ -1074,9 +1086,28 @@ Beda dari *!dl*: langsung ambil jalur foto tanpa nyoba download video dulu -- le
 
 ⚠️ Batas ukuran file *95MB* per foto. Postingan Facebook yang isinya cuma FOTO (bukan video) tidak didukung -- ini murni buat Instagram/TikTok.`,
 
+  ringkas: `📄 *!ringkas [instruksi tambahan]*
+
+Ringkas GARIS BESAR isi dokumen PDF pakai AI (Groq). Dokumen panjang (100+ halaman) otomatis dibaca per-bagian dulu baru digabung jadi 1 ringkasan, jadi tetap kebaca semuanya -- bukan cuma bagian awal doang.
+
+*Cara pakai:*
+• Kirim file PDF dengan caption \`!ringkas\`.
+• Atau kirim PDF-nya dulu, terus *reply* dengan \`!ringkas\`.
+• Boleh tambahin instruksi setelahnya, mis. \`!ringkas fokus ke bagian kesimpulan aja\`.
+
+*Contoh:*
+\`\`\`
+!ringkas
+!ringkas jelasin poin-poin utamanya aja
+\`\`\`
+
+💡 Setelah diringkas, kamu bisa nanya-nanya lebih detail soal isi dokumennya lewat chat biasa (tag @AgemasenBot / reply pesan bot) selama beberapa jam ke depan -- bot masih "inget" isi lengkap dokumennya, gak cuma ringkasannya.
+
+⚠️ Cuma baca teks yang ADA di PDF-nya (PDF hasil scan/foto tanpa lapisan teks gak bisa dibaca). Dokumen yang EKSTREM panjang tetap ada batas mutlaknya, sisanya dipotong.`,
+
   lupain: `🧠 *!lupain*
 
-Hapus ingatan obrolan chat AI (tsundere) kamu sama bot -- bot bakal "lupa" semua percakapan sebelumnya dan mulai dari nol lagi.
+Hapus ingatan obrolan chat AI (tsundere) kamu sama bot -- termasuk ingatan isi dokumen PDF dari !ringkas kalau ada -- bot bakal "lupa" semuanya dan mulai dari nol lagi.
 
 Command pencarian gambar (!img/!next/!id) TIDAK kepengaruh, ini cuma buat ingatan obrolan chat AI-nya doang.`,
 };
@@ -1605,6 +1636,16 @@ function isAnyMediaSource(content) {
   return isAnimatedSource(content) || isStaticSource(content);
 }
 
+// Dokumen PDF (dipakai !ringkas) -- HANYA documentMessage bermime
+// application/pdf. Beda jalur dari isStaticSource/isAnimatedSource di
+// atas (yang khusus stiker/meme), karena PDF bukan media visual.
+function isPdfSource(content) {
+  if (!content) return false;
+  if (!content.documentMessage) return false;
+  const mime = content.documentMessage.mimetype || "";
+  return mime === "application/pdf";
+}
+
 // PENTING: apakah medianya cuma 1 frame (gambar diam)?
 // Filter ffmpeg "fps=12" (dipakai bareng "-fps_mode cfr") butuh minimal 2
 // frame buat bisa nentuin durasi/timing antar-frame. Kalau sumbernya cuma
@@ -1679,6 +1720,11 @@ function findStickerSource(msg) {
 // Semua jenis media (dipakai !s, karena !s memang generik).
 function findAnySource(msg) {
   return findMediaSource(msg, isAnyMediaSource);
+}
+
+// Dokumen PDF (dipakai !ringkas).
+function findPdfSource(msg) {
+  return findMediaSource(msg, isPdfSource);
 }
 
 // ffmpeg (termasuk build "ffmpeg-static" yang dipakai bot ini) BISA encode
@@ -3357,6 +3403,124 @@ async function startBot() {
     // =====================
     if (text === "!menu") {
       await sendMenu(sock, jid);
+      return;
+    }
+
+    // =====================
+    // !ringkas [instruksi tambahan] -> baca teks dari dokumen PDF (langsung
+    // dikirim dengan caption, atau reply ke PDF yang sudah ada), lalu minta
+    // Groq bikin ringkasan GARIS BESARnya (dokumen panjang otomatis diproses
+    // per-bagian dulu, lihat summarizeDocumentText di agemasenTsundere.js).
+    // Teks lengkap dokumennya ikut "diinget" di sesi ini (lihat
+    // saveDocumentContext) selama DOC_CONTEXT_TTL_MS, jadi user bisa nanya
+    // lebih lanjut soal isi dokumennya lewat chat AI (tag bot/reply) setelah
+    // ini, gak cuma dapet ringkasannya doang.
+    //
+    // Kalau PDF-nya hasil scan/foto tanpa lapisan teks, pdf-parse gak bakal
+    // nemu teks apa-apa -- kita kasih tau user daripada maksain ringkasan
+    // kosong/ngasal.
+    // =====================
+    if (text === "!ringkas" || text.startsWith("!ringkas ")) {
+      const userInstruction = text.slice("!ringkas".length).trim();
+      const pdfSource = findPdfSource(msg);
+
+      if (!pdfSource) {
+        await sendCommandDetail(sock, jid, "ringkas");
+        return;
+      }
+
+      try {
+        await sock.sendMessage(jid, {
+          text: "Hmph, tunggu bentar, aku bacain dulu dokumennya... 📄",
+        });
+
+        const fakeMsg = { key: pdfSource.refKey, message: pdfSource.content };
+        const pdfBuffer = await downloadMediaMessage(fakeMsg, "buffer", {});
+        const fileName = pdfSource.content.documentMessage?.fileName || "dokumen.pdf";
+
+        const parser = new PDFParse({ data: pdfBuffer });
+        let rawText;
+        try {
+          const result = await parser.getText();
+          rawText = result.text || "";
+        } finally {
+          await parser.destroy();
+        }
+
+        // Buang penanda antar-halaman ("-- N of M --") yang disisipkan
+        // pdf-parse -- itu bukan bagian isi dokumen, cuma bikin bising
+        // buat model pas diringkas.
+        const cleanedTextFull = rawText
+          .replace(/--\s*\d+\s*of\s*\d+\s*--/gi, "")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+
+        // Jaring pengaman terakhir buat dokumen yang BENERAN ekstrem
+        // (ratusan-ribuan halaman) -- di luar ini dipotong total, gak ikut
+        // diproses maupun disimpan sebagai ingatan.
+        const hardTruncated = cleanedTextFull.length > DOC_HARD_MAX_CHARS;
+        const cleanedText = hardTruncated
+          ? cleanedTextFull.slice(0, DOC_HARD_MAX_CHARS)
+          : cleanedTextFull;
+
+        // Kalau bakal lewat proses map-reduce (dokumen panjang), kasih tau
+        // user duluan biar gak bingung nunggu -- sekalian estimasi jumlah
+        // bagian yang bakal diproses satu-satu.
+        if (cleanedText.length > SUMMARY_SINGLE_PASS_MAX_CHARS) {
+          const estChunks = Math.ceil(cleanedText.length / SUMMARY_CHUNK_CHARS);
+          await sock.sendMessage(jid, {
+            text:
+              `Dokumennya lumayan panjang (kira-kira ${estChunks} bagian yang aku baca satu-satu), ` +
+              `jadi agak lama dikit ya, sabar! Bukan berarti aku males, cuma... yah, gitu deh. 😤`,
+          });
+        }
+
+        const senderName = msg.pushName || "";
+        let lastProgressSentAt = 0;
+        const { chunks } = await summarizeDocumentText(cleanedText, {
+          senderName,
+          fileName,
+          userInstruction,
+          truncated: hardTruncated,
+          // Update presence "typing..." tiap beberapa bagian biar user tau
+          // bot masih proses (bukan macet), tanpa spam pesan tiap bagian.
+          onProgress: async (current, total) => {
+            const now = Date.now();
+            if (now - lastProgressSentAt < 8000 && current !== total) return;
+            lastProgressSentAt = now;
+            await sock.sendPresenceUpdate("composing", jid);
+          },
+        });
+
+        for (let i = 0; i < chunks.length; i++) {
+          await sock.sendMessage(
+            jid,
+            { text: chunks[i] },
+            i === 0 ? { quoted: msg } : {},
+          );
+        }
+
+        // Simpan teks lengkapnya (bukan ringkasannya) ke sesi ini biar bisa
+        // dipakai lagi kalau user nanya-nanya lanjutan soal isi dokumennya.
+        saveDocumentContext(sessionKey, { text: cleanedText, fileName });
+
+        const ttlHours = Math.round(DOC_CONTEXT_TTL_MS / (60 * 60 * 1000));
+        await sock.sendMessage(jid, {
+          text:
+            `💡 Kalau mau nanya-nanya lebih detail soal isi dokumen ini, tinggal tag aku (@AgemasenBot) atau ` +
+            `reply pesanku -- masih inget isinya kok, sekitar ${ttlHours} jam ke depan. ...B-bukan berarti aku niat ` +
+            `bantuin lama-lama, ya!`,
+        });
+      } catch (err) {
+        console.log("[!ringkas] gagal:", err.message || err);
+        const isConfigError = /GROQ_API_KEY/.test(err.message || "");
+        await sock.sendMessage(jid, {
+          text: isConfigError
+            ? "Hmph, aku belum dikasih GROQ_API_KEY sama pemilikku. Bukan salahku ya! 😤"
+            : "Duh, aku gagal bacain/ringkas dokumennya. Coba cek lagi filenya bener PDF & gak rusak, terus coba lagi. 💢",
+        });
+      }
+
       return;
     }
 
