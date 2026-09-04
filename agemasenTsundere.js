@@ -120,7 +120,7 @@ const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 // (GROQ_MODEL) TIDAK punya kemampuan lihat gambar sama sekali.
 const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_TIMEOUT_MS = 20000;
+const GROQ_TIMEOUT_MS = Number(process.env.GROQ_TIMEOUT_MS) || 30000;
 // Request yang nyertain gambar ke model vision (reasoning model, "mikir"
 // dulu sebelum jawab) ternyata bisa jauh lebih lama dari chat teks biasa.
 // Kalau dipaksa pakai GROQ_TIMEOUT_MS yang sama (20s), request gambar
@@ -147,7 +147,7 @@ const GROQ_CHAT_TTL_MS = 24 * 60 * 60 * 1000; // 24 jam, sama kayak sesi gambar
 // 0.9) -- bukan diganti ke nilai lain -- cuma dirapikan jadi konstanta di
 // sini + bisa di-override lewat env var kalau perlu.
 // =====================================================
-const GROQ_MAX_TOKENS = Number(process.env.GROQ_MAX_TOKENS) || 300;
+const GROQ_MAX_TOKENS = Number(process.env.GROQ_MAX_TOKENS) || 800;
 // GROQ_VISION_MODEL (qwen/qwen3.6-27b) itu REASONING model -- sebelum
 // nulis jawaban akhir, dia "mikir" dulu pakai reasoning tokens yang
 // SAMA-SAMA motong dari max_completion_tokens (walau hasil mikirnya
