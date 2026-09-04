@@ -19,6 +19,11 @@ const ffmpegPath = require("ffmpeg-static");
 const sharp = require("sharp");
 const { PDFParse } = require("pdf-parse");
 
+// Fitur Article/Document Downloader ("!artikel <URL>") -- semua logic
+// (provider registry, SSRF-safe downloader, Open Access finder, dst)
+// ada di src/, lihat src/commands/artikel.js untuk entry point-nya.
+const { runArtikelCommand } = require("./src/commands/artikel");
+
 // Fitur chat AI tsundere (Groq) -- dipisah dari file ini, lihat
 // agemasenTsundere.js untuk semua logic-nya (persona, panggilan API,
 // riwayat chat, deteksi mention).
@@ -934,6 +939,7 @@ Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti
 ┃ 📄 *DOKUMEN*
 ┗━━━━━━━━━━━━━━━┛
 ▸ !ringkas
+▸ !artikel
 
 ┏━━━━━━━━━━━━━━━┓
 ┃ 💬 *CHAT AI*
@@ -1104,6 +1110,18 @@ Ringkas GARIS BESAR isi dokumen PDF pakai AI (Groq). Dokumen panjang (100+ halam
 💡 Setelah diringkas, kamu bisa nanya-nanya lebih detail soal isi dokumennya lewat chat biasa (tag @AgemasenBot / reply pesan bot) selama beberapa jam ke depan -- bot masih "inget" isi lengkap dokumennya, gak cuma ringkasannya.
 
 ⚠️ Cuma baca teks yang ADA di PDF-nya (PDF hasil scan/foto tanpa lapisan teks gak bisa dibaca). Dokumen yang EKSTREM panjang tetap ada batas mutlaknya, sisanya dipotong.`,
+
+  artikel: `📚 *!artikel <URL>*
+
+Download artikel/dokumen dari link yang PUBLIK dan LEGAL aja (arXiv, DOAJ, Internet Archive, repository kampus, OJS, atau link PDF langsung). Kalau file-nya gak tersedia langsung, bot bakal cari versi Open Access resminya dulu lewat DOI/judul sebelum nyerah.
+
+*Contoh:*
+\`\`\`
+!artikel https://arxiv.org/abs/2101.00001
+!artikel https://doaj.org/article/xxxxxxxx
+\`\`\`
+
+⚠️ Bot ini SENGAJA gak bakal nyoba nembus paywall, login, CAPTCHA, atau DRM. Kalau memang gak ada versi publiknya, kamu bakal dikasih link ke artikel aslinya aja.`,
 
   lupain: `🧠 *!lupain*
 
@@ -3403,6 +3421,20 @@ async function startBot() {
     // =====================
     if (text === "!menu") {
       await sendMenu(sock, jid);
+      return;
+    }
+
+    // =====================
+    // !artikel <URL> -> Article/Document Downloader. Deteksi sumber
+    // (arXiv/DOAJ/Internet Archive/repository kampus/OJS/dll lewat
+    // Provider Registry di src/providers), coba download PDF publiknya,
+    // atau cari versi Open Access resmi kalau gak ada file langsung.
+    // Gak pernah nyoba bypass paywall/login/CAPTCHA -- lihat src/commands/artikel.js.
+    // =====================
+    if (text === "!artikel" || text.startsWith("!artikel ")) {
+      const articleUrl = text.slice("!artikel".length).trim();
+      const senderId = getSenderJid(msg);
+      await runArtikelCommand(sock, jid, articleUrl, senderId);
       return;
     }
 
