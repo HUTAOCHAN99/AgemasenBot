@@ -13,6 +13,9 @@ const {
   downloadMediaFromUrl,
   isRateLimitOrBotDetectionError,
   registerYtdlpSuccess,
+  registerYtdlpRateLimitFailure,
+  getYtdlpBackoffRemainingMs,
+  formatDurationId,
   friendlyDlError,
 } = require("./ytdlp");
 

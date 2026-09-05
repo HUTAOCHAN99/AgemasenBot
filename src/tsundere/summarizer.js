@@ -1,4 +1,4 @@
-const { GROQ_MODEL, enqueueGroqRequest, callGroqWithRetry } = require("./groqClient");
+const { GROQ_API_KEYS, GROQ_MODEL, enqueueGroqRequest, callGroqWithRetry } = require("./groqClient");
 const { splitReplyIntoChunks } = require("./replyFormat");
 
 // =====================================================

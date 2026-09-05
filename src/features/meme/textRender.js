@@ -1,5 +1,5 @@
 const { createCanvas } = require("@napi-rs/canvas");
-const { splitTextEmoji, getEmojiImage, ensureFontsRegistered, MEME_FONT_FAMILY } = require("./emoji");
+const { splitTextEmoji, getEmojiImage, ensureFontsRegistered, MEME_FONT_FAMILY, preloadEmojisInText } = require("./emoji");
 
 // Ukur lebar total 1 baris (campuran teks+emoji), emoji dihitung selebar
 // fontSize (persegi).

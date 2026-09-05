@@ -1,4 +1,5 @@
 const axios = require("axios");
+const { touchSession } = require("./sessionStore");
 
 const API_PAGE_SIZE = 100;
 
