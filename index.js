@@ -524,22 +524,57 @@ function errorReplyText(err) {
   return "Terjadi kesalahan.";
 }
 
-function buildCaption(post, karakterLabel, { isNext = false, code } = {}) {
-  const link = `https://safebooru.org/index.php?page=post&s=view&id=${post.id}`;
+// `source` bedain Safebooru ("safebooru", default -- demi kompatibilitas
+// kode lama yang belum pernah ngirim opsi ini) dari Pinterest ("pinterest",
+// dipakai !pin). Bedanya cuma di link, label, dan baris "!id" (Pinterest
+// gak punya command !id karena ID pin gak bisa dipakai ulang lewat API
+// pencarian yang dipakai bot ini).
+function buildCaption(
+  post,
+  karakterLabel,
+  { isNext = false, code, source = "safebooru" } = {},
+) {
+  const isPinterest = source === "pinterest";
+
+  const link = isPinterest
+    ? post.source_link || `https://www.pinterest.com/pin/${post.id}/`
+    : `https://safebooru.org/index.php?page=post&s=view&id=${post.id}`;
+
+  const labelLine = isPinterest
+    ? `🔎 *Keyword:* ${karakterLabel}`
+    : `👤 *Karakter:* ${karakterLabel}`;
 
   const codeLine = code ? `\n🔢 *Kode Sesi:* ${code}` : "";
   const continueLine = code
     ? `➡️ Ketik *${code}* (siapa saja boleh) atau *!next* untuk gambar lain dari pencarian ini`
     : `➡️ Ketik *!next* untuk gambar lain dari pencarian ini`;
 
-  return `🖼️ *Hasil Gambar*${isNext ? " (lanjutan)" : ""}
+  const idLine = isPinterest
+    ? ""
+    : `\n🔁 Ketik *!id ${post.id}* untuk lihat gambar ini lagi kapan saja`;
 
-👤 *Karakter:* ${karakterLabel}${codeLine}
+  return `🖼️ *Hasil Gambar*${isNext ? " (lanjutan)" : ""}${isPinterest ? " (Pinterest)" : ""}
+
+${labelLine}${codeLine}
 🆔 *Kode Gambar:* ${post.id}
 🔗 *Link:* ${link}
 
-${continueLine}
-🔁 Ketik *!id ${post.id}* untuk lihat gambar ini lagi kapan saja`;
+${continueLine}${idLine}`;
+}
+
+// Label yang ditampilin di caption buat pemilik pencarian ini (dipakai di
+// !img/!next/kode-sesi & !pin/next). Safebooru: tag mentah di-"prettify"
+// (underscore -> spasi, tiap kata dikapital). Pinterest: keyword asli
+// user apa adanya, gak perlu di-prettify.
+function sessionLabel(session) {
+  if (session.source === "pinterest") return session.tag;
+
+  return session.tag
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(prettifyTag)
+    .join(", ");
 }
 
 // Kasih timeout eksplisit per-request. Tanpa ini, satu request yang
@@ -654,12 +689,137 @@ async function loadMoreCandidates(session) {
 // loadMoreCandidates() setelah ini sebelum kirim gambar pertama.
 function newCandidateSession(tag) {
   return {
+    source: "safebooru",
     tag,
     pool: [],
     seenIds: new Set(),
     pid: 0,
     noMorePages: false,
   };
+}
+
+// =====================================================
+// Fitur: Cari gambar di Pinterest berdasarkan keyword ("!pin")
+// -----------------------------------------------------
+// Pinterest gak punya API publik resmi buat pencarian pin, jadi ini pakai
+// endpoint INTERNAL yang dipakai situs pinterest.com sendiri buat nge-load
+// hasil pencarian (BaseSearchResource). Ini bukan API resmi/berdokumen --
+// bisa berubah atau berhenti kerja kapan saja kalau Pinterest ubah struktur
+// internalnya, TAPI gak butuh API key/login sama sekali buat pencarian pin
+// publik biasa, jadi cukup buat kebutuhan bot ini.
+//
+// Alurnya SENGAJA dibikin semirip mungkin sama Safebooru (lihat
+// loadMoreCandidates/newCandidateSession di atas) supaya bisa numpang sama
+// mekanisme session/"!next"/kode-sesi yang sudah ada -- bedanya cuma
+// Safebooru paging pakai nomor halaman (pid), Pinterest paging pakai
+// "bookmark" (token cursor buram yang dikasih balik sama responsenya).
+// =====================================================
+const PINTEREST_TIMEOUT_MS = 15000;
+// Batas berapa kali nyoba ambil halaman berikutnya SEKALI PANGGILAN --
+// jaga-jaga kalau suatu saat Pinterest balikin banyak halaman kosong
+// berturut-turut (hasil sudah kefilter semua karena sudah pernah dikirim)
+// tapi bookmark-nya tetap ada, biar gak nyangkut lama nunggu.
+const PINTEREST_MAX_PAGES_PER_CALL = 5;
+
+// Ambil satu "halaman" hasil pencarian Pinterest untuk sebuah keyword.
+// `bookmark` = cursor dari response sebelumnya (null buat halaman pertama).
+// Return { pins, bookmark } -- bookmark null/"-end-" berarti sudah halaman
+// terakhir.
+async function fetchPinterestPage(query, bookmark) {
+  const url = "https://www.pinterest.com/resource/BaseSearchResource/get/";
+  const sourceUrl = `/search/pins/?q=${encodeURIComponent(query)}`;
+
+  const options = {
+    query,
+    scope: "pins",
+    isPrefetch: false,
+    auto_correction_disabled: false,
+  };
+  if (bookmark) options.bookmarks = [bookmark];
+
+  const res = await fetchWithRetry(url, {
+    params: {
+      source_url: sourceUrl,
+      data: JSON.stringify({ options, context: {} }),
+    },
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "X-Requested-With": "XMLHttpRequest",
+      "X-Pinterest-PWS-Handler": "www/search/[scope].js",
+      Accept: "application/json, text/javascript, */*, q=0.01",
+      Referer: `https://www.pinterest.com${sourceUrl}`,
+    },
+    timeout: PINTEREST_TIMEOUT_MS,
+  });
+
+  const resourceResponse = res.data?.resource_response;
+  const results = resourceResponse?.data?.results || [];
+  const rawBookmark = resourceResponse?.bookmark || null;
+  const nextBookmark = rawBookmark && rawBookmark !== "-end-" ? rawBookmark : null;
+
+  const pins = results
+    .filter((r) => r?.type === "pin" && r.images)
+    .map((r) => {
+      // Ambil resolusi terbesar yang tersedia ("orig" kalau ada, kalau
+      // gak ada Pinterest biasanya tetap kasih minimal satu ukuran lain).
+      const imgObj =
+        r.images.orig || r.images["736x"] || Object.values(r.images)[0];
+
+      return {
+        id: r.id,
+        file_url: imgObj?.url,
+        width: imgObj?.width,
+        height: imgObj?.height,
+        source_link: `https://www.pinterest.com/pin/${r.id}/`,
+      };
+    })
+    .filter((p) => p.file_url);
+
+  return { pins, bookmark: nextBookmark };
+}
+
+// Bikin session baru buat pencarian keyword Pinterest baru (dipakai tiap
+// kali user mulai pencarian lewat "!pin <keyword>"). pool masih kosong --
+// caller wajib panggil loadMorePinterestCandidates() dulu sebelum kirim
+// gambar pertama.
+function newPinterestSession(query) {
+  return {
+    source: "pinterest",
+    tag: query,
+    pool: [],
+    seenIds: new Set(),
+    bookmark: null,
+    noMore: false,
+  };
+}
+
+// Isi ulang `session.pool` dengan pin-pin BARU (belum pernah dikirim di
+// session ini), sama polanya kayak loadMoreCandidates buat Safebooru.
+// Return true kalau pool berhasil terisi, false kalau sudah benar-benar
+// habis / tidak ada hasil sama sekali.
+async function loadMorePinterestCandidates(session) {
+  let pagesTried = 0;
+
+  while (!session.noMore && pagesTried < PINTEREST_MAX_PAGES_PER_CALL) {
+    pagesTried++;
+
+    const { pins, bookmark } = await fetchPinterestPage(
+      session.tag,
+      session.bookmark,
+    );
+
+    session.bookmark = bookmark;
+    if (!bookmark) session.noMore = true;
+
+    const fresh = pins.filter((p) => !session.seenIds.has(String(p.id)));
+    if (fresh.length > 0) {
+      session.pool.push(...fresh);
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // Safebooru's s=tag&q=index endpoint ignores json=1 and always replies with
@@ -803,16 +963,11 @@ async function searchAndSendImage(sock, jid, sessionKey, tag, candidateSession) 
   const code = assignSessionCode(jid, session);
 
   const buffer = await downloadImage(post.file_url);
-  const karakterLabel = tag
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map(prettifyTag)
-    .join(", ");
+  const karakterLabel = sessionLabel(session);
 
   await sock.sendMessage(jid, {
     image: buffer,
-    caption: buildCaption(post, karakterLabel, { code }),
+    caption: buildCaption(post, karakterLabel, { code, source: session.source }),
   });
 }
 
@@ -912,6 +1067,7 @@ Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti
 ┃ 🔎 *PENCARIAN GAMBAR*
 ┗━━━━━━━━━━━━━━━┛
 ▸ !img
+▸ !pin
 ▸ !next
 ▸ !id
 
@@ -981,13 +1137,28 @@ Tiap hasil pencarian dikasih *Kode Sesi* (angka). Siapa pun di grup boleh ketik 
 
 "Uchiha" itu terlalu banyak hasilnya... ya makanya pilih nomor yang muncul. Masa gitu aja harus dijelasin...`,
 
+  pin: `📌 *!pin <keyword>*
+
+Cari gambar di Pinterest berdasarkan keyword.
+
+Sama kayak *!img*, tiap hasil pencarian dikasih *Kode Sesi*. Siapa pun di grup boleh ketik angka itu (atau *!next*) buat lanjut ke gambar lain dari pencarian yang sama.
+
+*Contoh:*
+\`\`\`
+!pin sunset aesthetic
+!pin kucing lucu
+!pin desain kamar minimalis
+\`\`\`
+
+⚠️ Ini pakai fitur pencarian internal Pinterest (bukan API resmi), jadi sesekali bisa gagal/berubah sewaktu-waktu -- kalau gitu coba lagi beberapa saat.`,
+
   next: `➡️ *!next*
 
-Lanjut ke gambar berikutnya dari pencarian tag yang sama.
+Lanjut ke gambar berikutnya dari pencarian tag/keyword yang sama (baik dari *!img* maupun *!pin*).
 
 💡 Selain ketik *!next*, bisa juga ketik *Kode Sesi*-nya (angka yang muncul di hasil gambar) -- ini bisa dipakai siapa saja di grup, gak cuma yang mulai pencariannya.
 
-⚠️ Pakai *!img <tag>* dulu sebelum pakai ini.`,
+⚠️ Pakai *!img <tag>* atau *!pin <keyword>* dulu sebelum pakai ini.`,
 
   id: `🆔 *!id <kode>*
 
@@ -3659,20 +3830,30 @@ async function startBot() {
     async function refillPool(session) {
       if (session.pool.length > 0) return true;
 
-      if (await loadMoreCandidates(session)) return true;
+      const isPinterest = session.source === "pinterest";
+      const loader = isPinterest
+        ? loadMorePinterestCandidates
+        : loadMoreCandidates;
+
+      if (await loader(session)) return true;
 
       session.seenIds.clear();
-      session.pid = 0;
-      session.noMorePages = false;
+      if (isPinterest) {
+        session.bookmark = null;
+        session.noMore = false;
+      } else {
+        session.pid = 0;
+        session.noMorePages = false;
+      }
 
-      if (await loadMoreCandidates(session)) {
+      if (await loader(session)) {
         await sock.sendMessage(jid, {
-          text: "🔁 Semua gambar untuk tag ini sudah pernah ditampilkan. Mulai ulang dari awal ya.",
+          text: "🔁 Semua gambar untuk tag/keyword ini sudah pernah ditampilkan. Mulai ulang dari awal ya.",
         });
         return true;
       }
 
-      return false; // tag ini memang tidak punya gambar sama sekali
+      return false; // tag/keyword ini memang tidak punya gambar sama sekali
     }
 
     // =====================
@@ -3750,18 +3931,14 @@ async function startBot() {
           codeSession.lastId = post.id;
 
           const buffer = await downloadImage(post.file_url);
-          const karakterLabel = codeSession.tag
-            .toLowerCase()
-            .split(/\s+/)
-            .filter(Boolean)
-            .map(prettifyTag)
-            .join(", ");
+          const karakterLabel = sessionLabel(codeSession);
 
           await sock.sendMessage(jid, {
             image: buffer,
             caption: buildCaption(post, karakterLabel, {
               isNext: true,
               code: codeNum,
+              source: codeSession.source,
             }),
           });
         } catch (err) {
@@ -4078,6 +4255,43 @@ async function startBot() {
     }
 
     // =====================
+    // !pin <keyword>  -> cari gambar di Pinterest berdasarkan keyword.
+    // Numpang sama mekanisme session/"!next"/kode-sesi yang dipakai !img
+    // (lihat searchAndSendImage & sessionLabel) -- bedanya cuma sumber
+    // datanya (lihat komentar panjang di newPinterestSession/
+    // fetchPinterestPage soal caranya).
+    // =====================
+    if (text === "!pin" || text.startsWith("!pin ")) {
+      const keyword = text.slice(4).trim();
+
+      if (!keyword) {
+        await sendCommandDetail(sock, jid, "pin");
+        return;
+      }
+
+      try {
+        const pinSession = newPinterestSession(keyword);
+        const hasHit = await loadMorePinterestCandidates(pinSession);
+
+        if (!hasHit) {
+          await sock.sendMessage(jid, {
+            text: "❌ Gambar tidak ditemukan di Pinterest untuk keyword ini.",
+          });
+          return;
+        }
+
+        await searchAndSendImage(sock, jid, sessionKey, keyword, pinSession);
+      } catch (err) {
+        console.log(err);
+        await sock.sendMessage(jid, {
+          text: errorReplyText(err),
+        });
+      }
+
+      return;
+    }
+
+    // =====================
     // !next
     // =====================
     if (text === "!next") {
@@ -4104,18 +4318,14 @@ async function startBot() {
         session.lastId = post.id;
 
         const buffer = await downloadImage(post.file_url);
-        const karakterLabel = session.tag
-          .toLowerCase()
-          .split(/\s+/)
-          .filter(Boolean)
-          .map(prettifyTag)
-          .join(", ");
+        const karakterLabel = sessionLabel(session);
 
         await sock.sendMessage(jid, {
           image: buffer,
           caption: buildCaption(post, karakterLabel, {
             isNext: true,
             code: session.code,
+            source: session.source,
           }),
         });
       } catch (err) {
