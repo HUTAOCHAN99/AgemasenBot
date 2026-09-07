@@ -235,6 +235,89 @@ function enqueueDownloadJob(jobFn) {
   });
 }
 
+// Baca info teknis video (codec, profile, resolusi, dst) lewat "ffmpeg -i"
+// -- info-nya keluar di stderr (bukan stdout), dan ffmpeg SELALU exit
+// dengan kode error kalau gak dikasih output file, jadi kita cuma perlu
+// stderr-nya, bukan urusin exit code-nya.
+function probeVideoInfo(inputPath) {
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegPath, ["-i", inputPath]);
+    let info = "";
+    proc.stderr.on("data", (chunk) => {
+      info += chunk.toString();
+    });
+    proc.on("close", () => resolve(info));
+    proc.on("error", () => resolve(info));
+  });
+}
+
+// Transcode ulang ke H.264 (yuv420p, profil "high", max 720p) + AAC --
+// dipakai KHUSUS kalau video sumbernya codec non-H.264 (AV1/VP9/dst)
+// yang gak bisa diputar WhatsApp mobile sama sekali. Lebih lambat dari
+// remux biasa (beneran re-encode, bukan cuma copy stream), tapi ini
+// satu-satunya cara jamin videonya bisa dibuka di WA.
+function runFfmpegTranscodeToH264(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, [
+      "-y",
+      "-i",
+      inputPath,
+      "-c:v",
+      "libx264",
+      "-profile:v",
+      "high",
+      "-pix_fmt",
+      "yuv420p",
+      "-vf",
+      "scale='min(1280,iw)':-2",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
+      outputPath,
+    ]);
+    let stderr = "";
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg transcode H.264 exit ${code}: ${stderr}`));
+    });
+  });
+}
+
+// Remux cepat: pindahin "moov atom" ke depan file mp4 (+faststart) tanpa
+// re-encode (-c copy), biar WhatsApp mobile bisa muter videonya. Lihat
+// komentar panjang di pemanggilnya (downloadMediaFromUrl) buat alasan
+// kenapa ini perlu.
+function runFfmpegFaststartRemux(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, [
+      "-y",
+      "-i",
+      inputPath,
+      "-c",
+      "copy",
+      "-movflags",
+      "+faststart",
+      outputPath,
+    ]);
+    let stderr = "";
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg faststart remux exit ${code}: ${stderr}`));
+    });
+  });
+}
+
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(YTDLP_PATH, args);
@@ -524,7 +607,65 @@ async function downloadMediaFromUrl(url, mode) {
     }
 
     const outputPath = path.join(tmpDir, files[0]);
-    const buffer = fs.readFileSync(outputPath);
+
+    let finalPath = outputPath;
+    if (mode !== "audio" && outputPath.toLowerCase().endsWith(".mp4")) {
+      // PENTING: format selector di atas MENCOBA memaksa H.264 (avc1)
+      // lewat "[vcodec^=avc1]", TAPI kalau sumbernya (Facebook/TikTok/
+      // IG/dst) ternyata CUMA nyediain stream non-H.264 (misal AV1 atau
+      // VP9 -- makin sering kejadian karena situs-situs itu pelan-pelan
+      // pindah ke codec modern), 2 tingkat pertama selector gagal match
+      // dan JATUH ke tingkat fallback yang gak mensyaratkan codec sama
+      // sekali -- hasilnya video ke-download beneran, TAPI codec-nya
+      // AV1/VP9/dst.
+      //
+      // Player desktop (VLC dkk) biasanya punya decoder buat codec
+      // modern itu jadi tetap lancar, TAPI WhatsApp mobile TIDAK bisa
+      // decode AV1 (dan VP9 dukungannya juga gak konsisten) di video
+      // message -- hasilnya persis pesan "This video is not available
+      // because something is wrong with the video file", walau file-nya
+      // sendiri valid & sehat.
+      //
+      // Makanya di sini kita CEK dulu codec videonya pakai "ffmpeg -i"
+      // (baca info dari stderr, gak butuh ffprobe terpisah). Kalau
+      // codec-nya BUKAN h264, WAJIB transcode ulang ke H.264 (bukan
+      // cuma remux) sebelum dikirim -- baru itu dijamin bisa diputar di
+      // WhatsApp. Kalau codec-nya SUDAH h264, cukup remux cepat pakai
+      // -movflags +faststart (tanpa re-encode, lebih cepat & gak ada
+      // penurunan kualitas) buat jaga-jaga soal moov atom placement.
+      const info = await probeVideoInfo(outputPath);
+      const isH264 = /Video:\s*h264/i.test(info);
+
+      const outPath = path.join(
+        tmpDir,
+        isH264 ? `dl-${uid}-faststart.mp4` : `dl-${uid}-h264.mp4`,
+      );
+
+      try {
+        if (isH264) {
+          await runFfmpegFaststartRemux(outputPath, outPath);
+          console.log(`[dl] Codec sudah H.264 -- remux +faststart saja.`);
+        } else {
+          await runFfmpegTranscodeToH264(outputPath, outPath);
+          console.log(
+            `[dl] Codec BUKAN H.264 (info: ${info.match(/Video:.*$/m)?.[0] || "?"}) -- ` +
+              `sudah di-transcode ulang ke H.264 biar bisa diputar di WhatsApp.`,
+          );
+        }
+        finalPath = outPath;
+      } catch (err) {
+        console.error(
+          `[dl] Gagal ${isH264 ? "remux +faststart" : "transcode ke H.264"}, ` +
+            "pakai file asli (video mungkin gagal dibuka di WA):",
+          err.message,
+        );
+      }
+    }
+
+    const buffer = fs.readFileSync(finalPath);
+    console.log(
+      `[dl] Ukuran file final yang bakal dikirim: ${(buffer.length / 1024 / 1024).toFixed(2)}MB (${finalPath})`,
+    );
 
     return { buffer };
   } finally {
