@@ -31,10 +31,27 @@ const BOT_STATE_FILE =
   process.env.BOT_STATE_FILE ||
   path.join(BOT_STATE_DATA_DIR, "bot_state.json");
 
+// =====================================================
+// Monitoring & saklar aktif/nonaktif bot PER NOMOR (DM pribadi)
+//
+// - Setiap orang yang pernah DM bot ini bakal otomatis kecatet
+//   (nomor, jumlah pesan, terakhir kontak) di file JSON ini.
+// - Owner bisa lihat daftarnya lewat "!listuser", dan bisa
+//   block/unblock nomor tertentu lewat "!user on/off/status <nomor>"
+//   dari MANA PUN (DM lain, grup owner, dll) -- gak perlu ngetik
+//   langsung dari nomor WA yang jadi bot.
+// - State-nya kepisah dari bot_state.json (yang itu buat grup),
+//   supaya on/off grup dan on/off per-nomor gak nyampur.
+// =====================================================
+const USER_STATE_FILE =
+  process.env.USER_STATE_FILE ||
+  path.join(BOT_STATE_DATA_DIR, "user_state.json");
+
 module.exports = {
   ROOT_DIR,
   OWNER_NUMBER,
   OWNER_JID,
   BOT_STATE_DATA_DIR,
   BOT_STATE_FILE,
+  USER_STATE_FILE,
 };

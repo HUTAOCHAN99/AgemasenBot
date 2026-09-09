@@ -15,11 +15,14 @@ const {
 
 const { getSenderJid, getSessionKey, isOwnerMsg } = require("../utils/whatsapp");
 const { isBotDisabledFor } = require("../state/botState");
+const { recordUserActivity, isUserDisabled } = require("../state/userState");
 const {
   handleWhoamiCommand,
   sendNgambekReply,
   handleBotSwitchCommand,
   handleListGroupsCommand,
+  handleUserSwitchCommand,
+  handleListUsersCommand,
 } = require("../features/owner/ownerCommands");
 
 const { sendMenu, sendCommandDetail } = require("../features/menu/menu");
@@ -131,6 +134,47 @@ async function handleMessagesUpsert(sock, { messages, type }) {
     // dinonaktifin.
     // =====================
     if (await handleListGroupsCommand(sock, msg, { jid, text })) {
+      return;
+    }
+
+    // =====================
+    // !user on / !user off / !user status <nomor> -- KHUSUS owner.
+    // Blokir/buka balasan bot buat DM dari nomor tertentu. Bisa dipanggil
+    // dari MANA PUN (gak harus dari chat sama nomor targetnya), jadi
+    // ditaruh paling atas juga.
+    // =====================
+    if (await handleUserSwitchCommand(sock, msg, { jid, text })) {
+      return;
+    }
+
+    // =====================
+    // !listuser -- KHUSUS owner. Monitoring: daftar semua nomor yang
+    // pernah DM bot ini + jumlah pesan, terakhir kontak, status blokir.
+    // =====================
+    if (await handleListUsersCommand(sock, msg, { jid, text })) {
+      return;
+    }
+
+    // =====================
+    // Monitoring DM pribadi: catat setiap orang yang DM bot ini (nomor,
+    // jumlah pesan, terakhir kontak) supaya bisa dipantau lewat
+    // "!listuser". Cuma buat chat pribadi, bukan grup (grup dipantau
+    // lewat "!listgrup").
+    // =====================
+    const isPrivateChat = !jid.endsWith("@g.us") && !jid.endsWith("@broadcast");
+    if (isPrivateChat && !isOwnerMsg(msg)) {
+      recordUserActivity(jid, msg.pushName || null);
+    }
+
+    // =====================
+    // Saklar blokir per NOMOR (DM pribadi): kalau nomor ini lagi
+    // DIBLOKIR owner lewat "!user off <nomor>" dan bukan owner sendiri,
+    // bot "ngambek" -- gak proses command/fitur apa pun lagi buat dia.
+    // =====================
+    if (isPrivateChat && isUserDisabled(jid) && !isOwnerMsg(msg)) {
+      if (text.startsWith("!")) {
+        await sendNgambekReply(sock, jid);
+      }
       return;
     }
 
