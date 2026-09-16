@@ -18,6 +18,11 @@ const {
   formatDurationId,
   friendlyDlError,
 } = require("./ytdlp");
+const {
+  isSilenceApiEnabled,
+  downloadViaSilenceApi,
+  SILENCE_FALLBACK_YTDLP,
+} = require("./silenceApi");
 
 // =====================================================
 // Fitur: download foto/carousel/slideshow ("!dl" fallback foto & "!dlr")
@@ -250,7 +255,90 @@ async function handleDlrDownload(sock, jid, url) {
   }
 }
 
+// =====================================================
+// Jalur YouTube lewat API SilenceYTDown (lihat silenceApi.js).
+//
+// Dipanggil DULUAN buat link YouTube kalau SILENCE_API_BASE_URL diisi.
+// Return:
+//   true  -> user SUDAH dapet media/pesan error final, pemanggil stop.
+//   false -> gagal tapi "layak dicoba lagi lokal", pemanggil lanjut ke
+//            jalur yt-dlp biasa (fallback).
+//
+// Kenapa fallback-nya gak otomatis buat SEMUA jenis gagal: kalau
+// gagalnya karena video-nya privat/dihapus/geo-block, yt-dlp lokal ya
+// pasti gagal juga -- cuma bikin user nunggu dua kali lebih lama tanpa
+// hasil beda. Jadi cuma error "service-nya lagi rewel" (mati, timeout,
+// antre kelamaan) yang di-fallback.
+// =====================================================
+async function tryDownloadViaSilence(sock, jid, url, mode) {
+  // Anti-spam pesan progress: cuma kirim update kalau posisi antreannya
+  // beneran bikin user perlu nunggu lama (bukan tiap polling 3 detik).
+  let queueNotified = false;
+
+  try {
+    const { buffer } = await downloadViaSilenceApi(url, mode, {
+      onProgress: async (p) => {
+        if (
+          !queueNotified &&
+          p.status === "queued" &&
+          (p.queuePosition ?? 0) > 1
+        ) {
+          queueNotified = true;
+          await sock
+            .sendMessage(jid, {
+              text: `🕒 Lagi antre di server download (posisi ${p.queuePosition}). Sabar ya, gak usah kirim ulang.`,
+            })
+            .catch(() => {});
+        }
+      },
+    });
+
+    // Sukses lewat jalur ini artinya YouTube emang gak lagi ngeblok --
+    // tapi itu IP-nya SilenceYTDown, bukan IP bot ini. Jadi backoff
+    // lokal SENGAJA gak di-reset di sini (registerYtdlpSuccess), biar
+    // status backoff yt-dlp lokal tetap jujur nyeritain kondisi IP
+    // server bot sendiri.
+    await sendDownloadedMedia(sock, jid, buffer, mode, url, false);
+    return true;
+  } catch (err) {
+    console.log("=== [dl] jalur SilenceYTDown gagal ===");
+    console.log(err.message || err);
+    console.log("=====================================");
+
+    const canFallback = SILENCE_FALLBACK_YTDLP && err.silenceRetryable !== false;
+
+    if (!canFallback) {
+      await sock.sendMessage(jid, {
+        text: `❌ Gagal download.\n${err.message}`,
+      });
+      return true;
+    }
+
+    await sock.sendMessage(jid, {
+      text: "⚠️ Server download utama lagi bermasalah, coba cara cadangan dulu ya...",
+    });
+    return false;
+  }
+}
+
 async function handleDlDownload(sock, jid, url, mode) {
+  // Link YouTube: coba dulu lewat SilenceYTDown kalau diaktifin. Ini
+  // dicek SEBELUM backoff lokal, karena backoff itu soal IP server bot
+  // ini -- gak ada hubungannya sama IP service SilenceYTDown yang punya
+  // cookies & antrean sendiri.
+  if (isYoutubeUrl(url) && isSilenceApiEnabled()) {
+    await sock.sendMessage(jid, {
+      text:
+        mode === "audio"
+          ? "⏳ Download audio (MP3) lewat server download, tunggu ya..."
+          : "⏳ Download video lewat server download, tunggu ya...",
+    });
+
+    const handled = await tryDownloadViaSilence(sock, jid, url, mode);
+    if (handled) return;
+    // kalau false -> lanjut ke jalur yt-dlp lokal di bawah
+  }
+
   // Cek backoff DULUAN, sebelum buang-buang 1 percobaan yt-dlp lagi kalau
   // memang lagi kena rate-limit. Cuma berlaku buat YouTube -- situs lain
   // (TikTok, Bilibili, dst) gak ikut kena backoff ini karena rate-limit-nya
@@ -338,5 +426,6 @@ module.exports = {
   tryHandleAsPhotoPost,
   handleDlrDownload,
   handleDlDownload,
+  tryDownloadViaSilence,
   sendDownloadedMedia,
 };

@@ -256,7 +256,16 @@ function probeVideoInfo(inputPath) {
 // yang gak bisa diputar WhatsApp mobile sama sekali. Lebih lambat dari
 // remux biasa (beneran re-encode, bukan cuma copy stream), tapi ini
 // satu-satunya cara jamin videonya bisa dibuka di WA.
-function runFfmpegTranscodeToH264(inputPath, outputPath) {
+// opts (semuanya opsional -- default-nya = perilaku lama persis):
+//   maxWidth : lebar maksimum hasil (default 1280 alias 720p-ish)
+//   crf      : kualitas x264, makin besar makin kecil ukurannya
+//              (default: biarin x264 pakai default-nya, 23)
+//   audioBitrate : default "128k"
+// Dipakai dua tingkat sama ensureWhatsAppCompatibleVideo() di bawah: pass
+// pertama kualitas normal, pass kedua (cuma kalau hasilnya masih kegedean
+// buat WhatsApp) diperkecil lagi pakai crf/maxWidth yang lebih agresif.
+function runFfmpegTranscodeToH264(inputPath, outputPath, opts = {}) {
+  const { maxWidth = 1280, crf = null, audioBitrate = "128k" } = opts;
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, [
       "-y",
@@ -269,11 +278,12 @@ function runFfmpegTranscodeToH264(inputPath, outputPath) {
       "-pix_fmt",
       "yuv420p",
       "-vf",
-      "scale='min(1280,iw)':-2",
+      `scale='min(${maxWidth},iw)':-2`,
+      ...(crf ? ["-crf", String(crf), "-preset", "veryfast"] : []),
       "-c:a",
       "aac",
       "-b:a",
-      "128k",
+      audioBitrate,
       "-movflags",
       "+faststart",
       outputPath,
@@ -316,6 +326,124 @@ function runFfmpegFaststartRemux(inputPath, outputPath) {
       else reject(new Error(`ffmpeg faststart remux exit ${code}: ${stderr}`));
     });
   });
+}
+
+// =====================================================
+// "Sterilisasi" file video sebelum dikirim ke WhatsApp.
+//
+// Dipakai DUA jalur sekaligus:
+//   1. downloadMediaFromUrl() -- hasil yt-dlp lokal (jalur lama).
+//   2. silenceApi.js -- file .mp4 yang diambil dari Worker SilenceYTDown.
+//
+// Kenapa perlu:
+//   - WhatsApp mobile TIDAK bisa decode AV1, dan VP9 dukungannya gak
+//     konsisten. File-nya sehat, tapi di HP muncul "This video is not
+//     available because something is wrong with the video file". Jadi
+//     kalau codec-nya bukan H.264, WAJIB transcode (bukan cuma remux).
+//   - Kalau codec-nya SUDAH H.264, cukup remux +faststart (moov atom
+//     dipindah ke depan) -- cepat, tanpa penurunan kualitas.
+//   - Khusus jalur SilenceYTDown: kualitasnya di-cap 1080p (bukan 720p
+//     kayak selector yt-dlp lokal), jadi file 1080p gampang nembus batas
+//     WhatsApp. Lewat opsi maxBytes, fungsi ini otomatis nge-shrink
+//     (turunin resolusi + naikin CRF) sampai muat, berjenjang.
+//
+// Return: path file yang siap dikirim. Kalau ffmpeg gagal total, sengaja
+// balikin file aslinya (lebih baik coba kirim apa adanya daripada
+// gagal total), sama seperti perilaku lama.
+// =====================================================
+const WA_SHRINK_TIERS = [
+  { maxWidth: 1280, crf: 26, audioBitrate: "128k" },
+  { maxWidth: 854, crf: 30, audioBitrate: "96k" },
+  { maxWidth: 640, crf: 33, audioBitrate: "64k" },
+];
+
+async function ensureWhatsAppCompatibleVideo(inputPath, opts = {}) {
+  const {
+    workDir = path.dirname(inputPath),
+    prefix = `wa-${crypto.randomBytes(4).toString("hex")}`,
+    maxBytes = 0, // 0 = gak usah peduli ukuran (perilaku lama)
+  } = opts;
+
+  const info = await probeVideoInfo(inputPath);
+  const isH264 = /Video:\s*h264/i.test(info);
+  const sizeOf = (p) => {
+    try {
+      return fs.statSync(p).size;
+    } catch {
+      return 0;
+    }
+  };
+
+  const inputSize = sizeOf(inputPath);
+  const tooBig = maxBytes > 0 && inputSize > maxBytes;
+
+  // Jalur cepat: codec sudah benar DAN ukurannya masih muat -> remux aja.
+  if (isH264 && !tooBig) {
+    const outPath = path.join(workDir, `${prefix}-faststart.mp4`);
+    try {
+      await runFfmpegFaststartRemux(inputPath, outPath);
+      console.log("[dl] Codec sudah H.264 -- remux +faststart saja.");
+      return outPath;
+    } catch (err) {
+      console.error(
+        "[dl] Gagal remux +faststart, pakai file asli (video mungkin gagal dibuka di WA):",
+        err.message,
+      );
+      return inputPath;
+    }
+  }
+
+  // Perlu re-encode: entah karena codec-nya bukan H.264, atau karena
+  // file-nya kegedean buat WhatsApp (atau dua-duanya).
+  if (!isH264) {
+    console.log(
+      `[dl] Codec BUKAN H.264 (${info.match(/Video:.*$/m)?.[0] || "?"}) -- transcode ke H.264.`,
+    );
+  }
+  if (tooBig) {
+    console.log(
+      `[dl] Ukuran ${(inputSize / 1024 / 1024).toFixed(2)}MB > batas ${(maxBytes / 1024 / 1024).toFixed(0)}MB -- dikecilin dulu.`,
+    );
+  }
+
+  // Tier pertama = kualitas normal (sama kayak perilaku lama) kalau cuma
+  // masalah codec. Kalau file-nya kegedean, langsung mulai dari tier yang
+  // sudah pakai CRF biar ada efek pengecilan beneran.
+  const tiers = tooBig
+    ? WA_SHRINK_TIERS
+    : [{ maxWidth: 1280, crf: null, audioBitrate: "128k" }];
+
+  let lastGood = null;
+
+  for (const [i, tier] of tiers.entries()) {
+    const outPath = path.join(workDir, `${prefix}-h264-${i}.mp4`);
+    try {
+      await runFfmpegTranscodeToH264(inputPath, outPath, tier);
+    } catch (err) {
+      console.error(`[dl] Transcode tier ${i} gagal:`, err.message);
+      continue;
+    }
+
+    const size = sizeOf(outPath);
+    lastGood = outPath;
+    console.log(
+      `[dl] Transcode tier ${i} (maxWidth=${tier.maxWidth}, crf=${tier.crf ?? "default"}) -> ${(size / 1024 / 1024).toFixed(2)}MB`,
+    );
+
+    if (maxBytes === 0 || size <= maxBytes) return outPath;
+  }
+
+  // Semua tier sudah dicoba tapi masih kegedean juga -- lempar error yang
+  // pesannya sudah ramah user (pemanggil tinggal tampilin apa adanya).
+  if (lastGood && maxBytes > 0 && sizeOf(lastGood) > maxBytes) {
+    const err = new Error(
+      `Videonya kepanjangan/kegedean buat WhatsApp -- setelah dikompres pun masih ${(sizeOf(lastGood) / 1024 / 1024).toFixed(0)}MB (batas ~${(maxBytes / 1024 / 1024).toFixed(0)}MB). Coba video yang lebih pendek, atau pakai "!dl <link> mp3" kalau cuma butuh audionya.`,
+    );
+    err.tooLargeForWhatsApp = true;
+    throw err;
+  }
+
+  return lastGood || inputPath;
 }
 
 function runYtDlp(args) {
@@ -610,57 +738,17 @@ async function downloadMediaFromUrl(url, mode) {
 
     let finalPath = outputPath;
     if (mode !== "audio" && outputPath.toLowerCase().endsWith(".mp4")) {
-      // PENTING: format selector di atas MENCOBA memaksa H.264 (avc1)
-      // lewat "[vcodec^=avc1]", TAPI kalau sumbernya (Facebook/TikTok/
-      // IG/dst) ternyata CUMA nyediain stream non-H.264 (misal AV1 atau
-      // VP9 -- makin sering kejadian karena situs-situs itu pelan-pelan
-      // pindah ke codec modern), 2 tingkat pertama selector gagal match
-      // dan JATUH ke tingkat fallback yang gak mensyaratkan codec sama
-      // sekali -- hasilnya video ke-download beneran, TAPI codec-nya
-      // AV1/VP9/dst.
-      //
-      // Player desktop (VLC dkk) biasanya punya decoder buat codec
-      // modern itu jadi tetap lancar, TAPI WhatsApp mobile TIDAK bisa
-      // decode AV1 (dan VP9 dukungannya juga gak konsisten) di video
-      // message -- hasilnya persis pesan "This video is not available
-      // because something is wrong with the video file", walau file-nya
-      // sendiri valid & sehat.
-      //
-      // Makanya di sini kita CEK dulu codec videonya pakai "ffmpeg -i"
-      // (baca info dari stderr, gak butuh ffprobe terpisah). Kalau
-      // codec-nya BUKAN h264, WAJIB transcode ulang ke H.264 (bukan
-      // cuma remux) sebelum dikirim -- baru itu dijamin bisa diputar di
-      // WhatsApp. Kalau codec-nya SUDAH h264, cukup remux cepat pakai
-      // -movflags +faststart (tanpa re-encode, lebih cepat & gak ada
-      // penurunan kualitas) buat jaga-jaga soal moov atom placement.
-      const info = await probeVideoInfo(outputPath);
-      const isH264 = /Video:\s*h264/i.test(info);
-
-      const outPath = path.join(
-        tmpDir,
-        isH264 ? `dl-${uid}-faststart.mp4` : `dl-${uid}-h264.mp4`,
-      );
-
-      try {
-        if (isH264) {
-          await runFfmpegFaststartRemux(outputPath, outPath);
-          console.log(`[dl] Codec sudah H.264 -- remux +faststart saja.`);
-        } else {
-          await runFfmpegTranscodeToH264(outputPath, outPath);
-          console.log(
-            `[dl] Codec BUKAN H.264 (info: ${info.match(/Video:.*$/m)?.[0] || "?"}) -- ` +
-              `sudah di-transcode ulang ke H.264 biar bisa diputar di WhatsApp.`,
-          );
-        }
-        finalPath = outPath;
-      } catch (err) {
-        console.error(
-          `[dl] Gagal ${isH264 ? "remux +faststart" : "transcode ke H.264"}, ` +
-            "pakai file asli (video mungkin gagal dibuka di WA):",
-          err.message,
-        );
-      }
+      // Logikanya dipindah ke ensureWhatsAppCompatibleVideo() (lihat di
+      // atas) supaya jalur download lewat API SilenceYTDown
+      // (silenceApi.js) bisa pakai pemrosesan yang PERSIS SAMA -- dulu
+      // blok ini nempel di sini doang, jadi file dari API eksternal gak
+      // kebagian pengecekan codec ini sama sekali.
+      finalPath = await ensureWhatsAppCompatibleVideo(outputPath, {
+        workDir: tmpDir,
+        prefix: `dl-${uid}`,
+      });
     }
+
 
     const buffer = fs.readFileSync(finalPath);
     console.log(
@@ -700,4 +788,6 @@ module.exports = {
   friendlyDlError,
   isYoutubeUrl,
   downloadMediaFromUrl,
+  ensureWhatsAppCompatibleVideo,
+  probeVideoInfo,
 };
