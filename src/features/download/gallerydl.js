@@ -270,13 +270,14 @@ async function handleDlrDownload(sock, jid, url) {
 // hasil beda. Jadi cuma error "service-nya lagi rewel" (mati, timeout,
 // antre kelamaan) yang di-fallback.
 // =====================================================
-async function tryDownloadViaSilence(sock, jid, url, mode) {
+async function tryDownloadViaSilence(sock, jid, url, mode, maxHeight) {
   // Anti-spam pesan progress: cuma kirim update kalau posisi antreannya
   // beneran bikin user perlu nunggu lama (bukan tiap polling 3 detik).
   let queueNotified = false;
 
   try {
     const { buffer } = await downloadViaSilenceApi(url, mode, {
+      maxHeight,
       onProgress: async (p) => {
         if (
           !queueNotified &&
@@ -321,7 +322,7 @@ async function tryDownloadViaSilence(sock, jid, url, mode) {
   }
 }
 
-async function handleDlDownload(sock, jid, url, mode) {
+async function handleDlDownload(sock, jid, url, mode, maxHeight) {
   // Link YouTube: coba dulu lewat SilenceYTDown kalau diaktifin. Ini
   // dicek SEBELUM backoff lokal, karena backoff itu soal IP server bot
   // ini -- gak ada hubungannya sama IP service SilenceYTDown yang punya
@@ -331,10 +332,10 @@ async function handleDlDownload(sock, jid, url, mode) {
       text:
         mode === "audio"
           ? "⏳ Download audio (MP3) lewat server download, tunggu ya..."
-          : "⏳ Download video lewat server download, tunggu ya...",
+          : `⏳ Download video${maxHeight ? ` (maks ${maxHeight}p)` : ""} lewat server download, tunggu ya...`,
     });
 
-    const handled = await tryDownloadViaSilence(sock, jid, url, mode);
+    const handled = await tryDownloadViaSilence(sock, jid, url, mode, maxHeight);
     if (handled) return;
     // kalau false -> lanjut ke jalur yt-dlp lokal di bawah
   }
@@ -367,7 +368,7 @@ async function handleDlDownload(sock, jid, url, mode) {
     // masuk QUEUE, biar gak numpuk proses yt-dlp jalan bersamaan kalau
     // lagi banyak yang minta download sekaligus.
     const { buffer } = await enqueueDownloadJob(() =>
-      downloadMediaFromUrl(url, mode),
+      downloadMediaFromUrl(url, mode, maxHeight),
     );
 
     if (isYoutubeUrl(url)) registerYtdlpSuccess();

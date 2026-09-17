@@ -560,7 +560,31 @@ function isYoutubeUrl(url) {
 // Generik untuk YouTube (video/short), Bilibili, Facebook (video/reel/
 // postingan video), TikTok, Instagram, X/Twitter, dst -- semua situs yang
 // didukung yt-dlp. YouTube dapet argumen tambahan (lihat di bawah).
-async function downloadMediaFromUrl(url, mode) {
+// Resolusi yang boleh diminta user lewat "!dl <link> <height>p" buat jalur
+// yt-dlp lokal (fallback kalau SilenceYTDown lagi gak dipakai/gagal).
+const YTDLP_ALLOWED_HEIGHTS = [144, 240, 360, 480, 720];
+const YTDLP_DEFAULT_MAX_HEIGHT = 720; // perilaku lama, dipertahankan sebagai default
+
+// Bangun -f selector yt-dlp yang di-cap ke `maxHeight` (kalau valid),
+// tetap paksa codec H.264 (avc1) + AAC (mp4a) biar video-nya bisa
+// diputer di player native WhatsApp HP -- alasan lengkapnya lihat
+// komentar di pemanggil. 3 tingkat fallback: DASH avc1+mp4a pas cap ->
+// progresif avc1 pas cap -> apa pun pas cap -> pamungkas "apa aja yang
+// penting kebentuk" (buat kasus video yang formatnya di luar cap sama
+// sekali, misal gara-gara SABR cuma nyisa 1 opsi).
+function buildVideoFormatSelector(maxHeight) {
+  const cap = YTDLP_ALLOWED_HEIGHTS.includes(maxHeight)
+    ? maxHeight
+    : YTDLP_DEFAULT_MAX_HEIGHT;
+  return (
+    `bestvideo[height<=${cap}][vcodec^=avc1]+bestaudio[acodec^=mp4a]` +
+    `/best[height<=${cap}][vcodec^=avc1]` +
+    `/best[height<=${cap}]` +
+    `/best`
+  );
+}
+
+async function downloadMediaFromUrl(url, mode, maxHeight) {
   const tmpDir = os.tmpdir();
   const uid = crypto.randomBytes(6).toString("hex");
   const outputTemplate = path.join(tmpDir, `dl-${uid}.%(ext)s`);
@@ -667,15 +691,10 @@ async function downloadMediaFromUrl(url, mode) {
           // dukung H.264+AAC -- makanya video ke-download tapi gak bisa
           // dibuka di HP.
           //
-          // Kualitas dibatasi 360p-720p (bukan "sebesar-besarnya"):
-          //   - Atas (720p): cukup buat nonton normal, gak perlu 1080p/4K
-          //     yang bikin file gede & lama diproses/dikirim ke WhatsApp.
-          //   - Bawah (360p): ini juga kebetulan pas sama batas bawah
-          //     yang masih sering YouTube kasih walau lagi mode SABR
-          //     (server cuma ngasih 1 format progresif kayak itag 18,
-          //     360p) -- jadi selector ini tetap dapet sesuatu di kasus
-          //     video yang paling dibatasin sekalipun, bukannya gagal
-          //     total kena "Requested format is not available".
+          // Kualitas dibatasi lewat buildVideoFormatSelector() -- default
+          // 720p kalau user gak minta resolusi spesifik (mis. "!dl <link>
+          // 480p" -> maxHeight=480), gak perlu 1080p/4K yang bikin file
+          // gede & lama diproses/dikirim ke WhatsApp.
           //
           // CATATAN: filter [filesize<95M] SENGAJA TIDAK dipakai di sini
           // (walau versi sebelumnya ada). Filter itu cuma ngecek field
@@ -687,12 +706,7 @@ async function downloadMediaFromUrl(url, mode) {
           // ukuran file tetap ditegakkan lewat flag --max-filesize
           // (lihat DL_MAX_FILESIZE di atas), yang otomatis
           // mempertimbangkan filesize_approx juga.
-          //
-          // 4 tingkat fallback: DASH avc1+mp4a max 720p -> progresif
-          // avc1 max 720p -> apa pun max 720p (asal masih >=360p) ->
-          // pamungkas "apa aja yang penting kebentuk" (kalau video-nya
-          // emang cuma punya format di luar rentang itu).
-          "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/best[height<=720][vcodec^=avc1]/best[height<=720][height>=360]/best",
+          buildVideoFormatSelector(maxHeight),
           "--merge-output-format",
           "mp4",
           url,
@@ -790,4 +804,5 @@ module.exports = {
   downloadMediaFromUrl,
   ensureWhatsAppCompatibleVideo,
   probeVideoInfo,
+  YTDLP_ALLOWED_HEIGHTS,
 };

@@ -86,6 +86,13 @@ const {
   handleDlrDownload,
 } = require("../features/download/gallerydl");
 
+// Resolusi yang boleh diminta user lewat "!dl <link> <height>p". Batasnya
+// 720p (bukan sampai 2160p walau SilenceYTDown sendiri sanggup) karena
+// jalur fallback yt-dlp lokal di ytdlp.js memang di-cap segitu buat jaga
+// ukuran file/waktu proses tetap aman buat WhatsApp -- lihat
+// YTDLP_ALLOWED_HEIGHTS di ytdlp.js.
+const DL_ALLOWED_HEIGHTS = [144, 240, 360, 480, 720];
+
 // Tangani satu event "messages.upsert" dari Baileys. Ini adalah router
 // utama semua command (!ping, !img, !meme, !dl, dst) -- pisahan logic
 // tiap fitur sendiri ada di src/features/*, di sini cuma orkestrasinya.
@@ -1027,7 +1034,7 @@ async function handleMessagesUpsert(sock, { messages, type }) {
     }
 
     // =====================
-    // !dl <link> [mp3|mp4]
+    // !dl <link> [mp3|mp4|144p|240p|360p|480p|720p]
     // =====================
     if (text === "!dl" || text.startsWith("!dl ")) {
       const rest = text.slice(3).trim();
@@ -1040,7 +1047,8 @@ async function handleMessagesUpsert(sock, { messages, type }) {
 
       const url = urlMatch[0];
       // Sisa teks setelah link (kalau ada) dipakai buat override format,
-      // mis. "!dl <link> mp3" -- biar gak perlu balas angka lagi.
+      // mis. "!dl <link> mp3" atau "!dl <link> 480p" -- biar gak perlu
+      // balas angka lagi.
       const hint = rest
         .slice(urlMatch.index + urlMatch[0].length)
         .trim()
@@ -1053,11 +1061,30 @@ async function handleMessagesUpsert(sock, { messages, type }) {
         return;
       }
 
+      // "144p"/"240"/"360p"/dst -- angka "p"-nya opsional. Cuma dipakai
+      // buat mode video; kalau hint-nya "mp3"/"audio" itu ditangani
+      // terpisah di bawah dan maxHeight-nya diabaikan (gak relevan buat
+      // audio).
+      const heightMatch = hint.match(/^(\d{2,4})p?$/);
+      const requestedHeight = heightMatch ? Number(heightMatch[1]) : null;
+      const maxHeight = DL_ALLOWED_HEIGHTS.includes(requestedHeight)
+        ? requestedHeight
+        : undefined;
+
       // Link YouTube ikut alur sama seperti situs lain -- argumen khusus
       // (client rotation, force-ipv4, dst) ditangani otomatis di dalam
       // downloadMediaFromUrl(), gak perlu logic tambahan di sini.
       const mode = hint === "mp3" || hint === "audio" ? "audio" : "video";
-      await handleDlDownload(sock, jid, url, mode);
+
+      if (heightMatch && !maxHeight) {
+        await sock.sendMessage(jid, {
+          text: `⚠️ Resolusi "${hint}" gak dikenal, pakai salah satu: ${DL_ALLOWED_HEIGHTS.join(
+            "p, ",
+          )}p. Lanjut download pakai kualitas default dulu ya...`,
+        });
+      }
+
+      await handleDlDownload(sock, jid, url, mode, maxHeight);
       return;
     }
 

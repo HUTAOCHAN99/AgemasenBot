@@ -144,12 +144,25 @@ async function requestJson(url, options, label) {
   return body || {};
 }
 
+// Resolusi yang boleh diminta lewat "!dl <link> <height>p" -- HARUS sama
+// persis dengan ALLOWED_HEIGHTS di app/api/bot/dl/route.js SilenceYTDown.
+// Kalau user minta angka di luar ini, diabaikan & jatuh ke SILENCE_MAX_HEIGHT.
+const SILENCE_ALLOWED_HEIGHTS = [144, 240, 360, 480, 720, 1080, 1440, 2160];
+
 // Langkah 1: masukin job ke antrean SilenceYTDown.
-async function enqueueSilenceJob(url, mode) {
+//
+// requestedHeight datang dari user (mis. "!dl <link> 480p") -- OPSIONAL.
+// Kalau kosong atau bukan salah satu SILENCE_ALLOWED_HEIGHTS, jatuh ke
+// SILENCE_MAX_HEIGHT (default env, biasanya 720) seperti perilaku lama.
+async function enqueueSilenceJob(url, mode, requestedHeight) {
+  const maxHeight = SILENCE_ALLOWED_HEIGHTS.includes(requestedHeight)
+    ? requestedHeight
+    : SILENCE_MAX_HEIGHT;
+
   const payload =
     mode === "audio"
       ? { url, type: "audio", quality: "mp3-128" }
-      : { url, type: "video", maxHeight: SILENCE_MAX_HEIGHT };
+      : { url, type: "video", maxHeight };
 
   const data = await requestJson(
     `${SILENCE_API_BASE_URL}/api/bot/dl`,
@@ -274,7 +287,7 @@ async function fetchResultFile(fileUrl, destPath) {
 // SAMA PERSIS kayak downloadMediaFromUrl() di ytdlp.js, biar pemanggil
 // (handleDlDownload) bisa tukar-pasang jalur tanpa ubah apa pun setelahnya.
 // =====================================================
-async function downloadViaSilenceApi(url, mode, { onProgress } = {}) {
+async function downloadViaSilenceApi(url, mode, { onProgress, maxHeight } = {}) {
   if (!isSilenceApiEnabled()) {
     throw silenceError("SILENCE_API_BASE_URL belum diset.");
   }
@@ -283,7 +296,7 @@ async function downloadViaSilenceApi(url, mode, { onProgress } = {}) {
   const tmpDir = os.tmpdir();
   const prefix = `silence-${uid}`;
 
-  const job = await enqueueSilenceJob(url, mode);
+  const job = await enqueueSilenceJob(url, mode, maxHeight);
   console.log(
     `[silence] Job ${job.jobId} masuk antrean (posisi ${job.queuePosition ?? "?"}).`,
   );
@@ -336,6 +349,7 @@ module.exports = {
   SILENCE_API_BASE_URL,
   SILENCE_MAX_HEIGHT,
   SILENCE_FALLBACK_YTDLP,
+  SILENCE_ALLOWED_HEIGHTS,
   isSilenceApiEnabled,
   downloadViaSilenceApi,
 };
