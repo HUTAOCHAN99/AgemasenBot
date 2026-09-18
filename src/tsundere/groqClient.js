@@ -1,4 +1,5 @@
 const axios = require("axios");
+const { sleep, enqueueLlmRequest, LLM_REQUEST_DELAY_MS } = require("./llmQueue");
 
 // Multi API-key Groq (buat handle rate limit / 429)
 //
@@ -116,67 +117,25 @@ const GROQ_TEMPERATURE =
     : 0.9;
 
 
-const GROQ_REQUEST_DELAY_MS = Number(process.env.GROQ_REQUEST_DELAY) || 2000; // jeda antar-request Groq
+// Jeda antar-request sekarang diurus llmQueue (dipakai bareng Gemini).
+// Alias ini dipertahankan karena chatReply.js mengimpornya buat jeda
+// manual di loop auto-continue.
+const GROQ_REQUEST_DELAY_MS = LLM_REQUEST_DELAY_MS;
 const GROQ_MAX_RETRIES = Number(process.env.GROQ_MAX_RETRIES) || 3; // maksimal retry saat 429
 // Dipakai HANYA kalau response 429 gak punya header retry-after.
 const GROQ_RETRY_BACKOFF_MS = [2000, 5000, 10000];
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 // =====================================================
-// Global queue Groq
+// Queue: sekarang PINDAH ke llmQueue.js (dipakai bareng Gemini).
 //
-// Concurrency dikunci ke 1 (cuma 1 task yang diproses dalam satu waktu) +
-// dijaga jeda GROQ_REQUEST_DELAY_MS setelah sebuah request SELESAI sebelum
-// request berikutnya di-kirim. Ini queue GLOBAL (bukan per-chat) -- karena
-// concurrency-nya memang cuma 1, urutan antar-chat otomatis tetap adil
-// (FIFO, siapa duluan masuk antrian duluan diproses), jadi gak perlu bikin
-// queue terpisah per-chat di atasnya; itu cuma nambah kompleksitas tanpa
-// nambah throughput nyata (limiter globalnya tetap concurrency=1).
+// Dulu queue-nya tinggal di sini dan namanya enqueueGroqRequest. Begitu
+// providernya jadi dua, queue-nya harus SATU buat semua -- kalau enggak,
+// jaminan anti-race di chat.history (lihat komentar besar di chatReply.js)
+// bocor tiap kali request jatuh ke provider yang beda. Alias di bawah
+// dipertahankan supaya kode lama yang masih manggil enqueueGroqRequest
+// tetap jalan tanpa diubah.
 // =====================================================
-const groqQueue = [];
-let groqQueueRunning = false;
-let groqLastRequestEndedAt = 0;
-
-function enqueueGroqRequest(taskFn) {
-  return new Promise((resolve, reject) => {
-    groqQueue.push({ taskFn, resolve, reject });
-    console.log(`[Groq] Queue: ${groqQueue.length} pending`);
-    processGroqQueue();
-  });
-}
-
-async function processGroqQueue() {
-  if (groqQueueRunning) return;
-  groqQueueRunning = true;
-
-  while (groqQueue.length > 0) {
-    // Jaga jeda GROQ_REQUEST_DELAY_MS sejak request SEBELUMNYA selesai,
-    // bukan cuma delay tetap antar-item queue -- supaya tetap kehormat
-    // walau queue sempat kosong lalu keisi lagi.
-    const waitNeeded = GROQ_REQUEST_DELAY_MS - (Date.now() - groqLastRequestEndedAt);
-    if (groqLastRequestEndedAt > 0 && waitNeeded > 0) {
-      console.log(`[Groq] Waiting ${waitNeeded}ms before next request`);
-      await sleep(waitNeeded);
-    }
-
-    const { taskFn, resolve, reject } = groqQueue.shift();
-    console.log("[Groq] Sending request");
-    try {
-      const result = await taskFn();
-      console.log("[Groq] Success");
-      resolve(result);
-    } catch (err) {
-      reject(err);
-    } finally {
-      groqLastRequestEndedAt = Date.now();
-    }
-  }
-
-  groqQueueRunning = false;
-}
+const enqueueGroqRequest = enqueueLlmRequest;
 
 // Log ringkas info rate-limit dari header response Groq (kalau ada), buat
 // bantu observability -- gak dipakai buat ngatur delay langsung karena
@@ -305,6 +264,10 @@ module.exports = {
   GROQ_MAX_TOKENS,
   GROQ_VISION_MAX_TOKENS,
   GROQ_TEMPERATURE,
+  // BUG FIX: konstanta ini diimpor chatReply.js sejak dulu tapi gak pernah
+  // ada di module.exports -> nilainya undefined -> jeda antar panggilan
+  // auto-continue gak pernah beneran jalan.
+  GROQ_REQUEST_DELAY_MS,
   GROQ_MAX_RETRIES,
   GROQ_RETRY_BACKOFF_MS,
   sleep,

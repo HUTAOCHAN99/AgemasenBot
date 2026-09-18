@@ -1,5 +1,23 @@
-const { GROQ_API_KEYS, GROQ_MODEL, enqueueGroqRequest, callGroqWithRetry } = require("./groqClient");
+const { GROQ_API_KEYS } = require("./groqClient");
+const { GEMINI_API_KEYS } = require("./geminiClient");
+const { askLLMQueued } = require("./llmRouter");
 const { splitReplyIntoChunks } = require("./replyFormat");
+
+// =====================================================
+// Kenapa !ringkas TIDAK pakai Search Grounding
+//
+// Grounding di sini bukan cuma mubazir, tapi berbahaya buat akurasi:
+// tugas !ringkas adalah meringkas DOKUMEN YANG DIKIRIM USER, dan seluruh
+// prompt-nya sudah tegas melarang nambah info di luar bahan yang dikasih.
+// Kalau hasil pencarian web ikut masuk, model bisa "melengkapi" ringkasan
+// pakai info dari internet yang sebenarnya GAK ADA di dokumen itu -- user
+// gak akan sadar mana yang dari dokumennya dan mana yang bukan.
+//
+// Bonusnya: kuota grounding gratis cuma 500 request/hari, dan satu
+// dokumen panjang bisa makan belasan request (map-reduce, satu request
+// per potongan). Satu !ringkas bisa ngabisin jatah chat seharian.
+// =====================================================
+const SUMMARY_GROUNDING = false;
 
 // =====================================================
 // Fitur: ringkas dokumen PDF ("!ringkas")
@@ -68,18 +86,19 @@ Aturan:
 - Kalau potongan ini isinya gak penting/gak ada info berarti (mis. cuma daftar isi, header berulang, halaman kosong), boleh tulis 1 poin singkat yang bilang begitu.`;
 
 async function extractChunkPoints(chunkText) {
-  const payload = {
-    model: GROQ_MODEL,
-    messages: [
+  const { content } = await askLLMQueued(
+    [
       { role: "system", content: DOC_CHUNK_EXTRACT_SYSTEM_PROMPT },
       { role: "user", content: chunkText },
     ],
-    temperature: 0.3,
-    max_completion_tokens: SUMMARY_CHUNK_MAX_TOKENS,
-  };
-  const res = await enqueueGroqRequest(() => callGroqWithRetry(payload, SUMMARY_CHUNK_TIMEOUT_MS));
-  const raw = res.data?.choices?.[0]?.message?.content?.trim();
-  return raw ? raw.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() : "";
+    {
+      temperature: 0.3,
+      maxTokens: SUMMARY_CHUNK_MAX_TOKENS,
+      timeoutMs: SUMMARY_CHUNK_TIMEOUT_MS,
+      grounding: SUMMARY_GROUNDING,
+    },
+  );
+  return content || "";
 }
 
 const SUMMARY_SYSTEM_PROMPT = `Kamu adalah Special Week (Spe-chan), persona di balik AgemasenBot, sedang diminta meringkas ISI SEBUAH DOKUMEN PDF yang dikirim pengguna lewat command !ringkas.
@@ -104,8 +123,10 @@ Aturan penting:
 - Jangan pernah bilang kamu AI/model bahasa buatan perusahaan tertentu.`;
 
 async function summarizeDocumentText(documentText, { senderName, fileName, userInstruction, truncated, onProgress } = {}) {
-  if (GROQ_API_KEYS.length === 0) {
-    throw new Error("GROQ_API_KEY belum di-set di environment variable.");
+  if (GEMINI_API_KEYS.length === 0 && GROQ_API_KEYS.length === 0) {
+    throw new Error(
+      "Belum ada API key sama sekali -- set GEMINI_API_KEY (utama) dan/atau GROQ_API_KEY (cadangan).",
+    );
   }
 
   const cleanedText = (documentText || "").trim();
@@ -167,27 +188,16 @@ async function summarizeDocumentText(documentText, { senderName, fileName, userI
     { role: "user", content: parts.join("\n\n") },
   ];
 
-  const payload = {
-    model: GROQ_MODEL,
-    messages,
+  const { content, provider } = await askLLMQueued(messages, {
     temperature: 0.5,
-    max_completion_tokens: GROQ_SUMMARY_MAX_TOKENS,
-  };
+    maxTokens: GROQ_SUMMARY_MAX_TOKENS,
+    timeoutMs: GROQ_SUMMARY_TIMEOUT_MS,
+    grounding: SUMMARY_GROUNDING,
+  });
 
-  const res = await enqueueGroqRequest(() => callGroqWithRetry(payload, GROQ_SUMMARY_TIMEOUT_MS));
+  if (!content) throw new Error("Tidak ada ringkasan yang dikembalikan.");
+  console.log(`[ringkas] ringkasan akhir dibuat oleh: ${provider}`);
 
-  const rawContent = res.data?.choices?.[0]?.message?.content?.trim();
-  if (!rawContent) {
-    console.log(
-      "[groq ringkas] content kosong, finish_reason:",
-      res.data?.choices?.[0]?.finish_reason,
-      "usage:",
-      JSON.stringify(res.data?.usage || {}),
-    );
-    throw new Error("Groq tidak mengembalikan ringkasan.");
-  }
-
-  const content = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() || rawContent;
   return { text: content, chunks: splitReplyIntoChunks(content), usedMapReduce };
 }
 
