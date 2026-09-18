@@ -86,7 +86,7 @@ const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 // Model vision Groq (per dokumentasi resmi console.groq.com/docs/vision) --
 // dipakai HANYA untuk giliran yang ada gambarnya. Model teks biasa di atas
 // (GROQ_MODEL) TIDAK punya kemampuan lihat gambar sama sekali.
-const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.6-27b";
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || "qwen/qwen3.8-27b";
 const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const GROQ_TIMEOUT_MS = 20000;
 // Request yang nyertain gambar ke model vision (reasoning model, "mikir"
