@@ -167,10 +167,23 @@ async function handleMessagesUpsert(sock, { messages, type }) {
     // jumlah pesan, terakhir kontak) supaya bisa dipantau lewat
     // "!listuser". Cuma buat chat pribadi, bukan grup (grup dipantau
     // lewat "!listgrup").
+    //
+    // PENTING: dicatat pakai getSenderJid(msg), BUKAN "jid" (remoteJid)
+    // mentah. Kalau kontaknya pakai fitur privasi WhatsApp "Linked ID",
+    // remoteJid muncul dalam bentuk "xxxxx@lid" (bukan nomor telepon
+    // asli), beda tiap device -- sedangkan "!user off <nomor>" (di
+    // ownerCommands.js) selalu bikin key dalam format nomor telepon
+    // asli ("<nomor>@s.whatsapp.net"). Kalau di sini masih pakai
+    // remoteJid mentah, hasilnya adalah 2 key yang gak akan pernah nyambung
+    // -- blokir keliatan "berhasil" tapi gak akan pernah efektif buat
+    // kontak yang JID-nya "@lid". getSenderJid() sudah nanganin ini
+    // (dia ambil nomor asli lewat field senderPn dari Baileys), jadi
+    // key yang kepakai di sini SELALU konsisten sama yang diketik owner.
     // =====================
     const isPrivateChat = !jid.endsWith("@g.us") && !jid.endsWith("@broadcast");
-    if (isPrivateChat && !isOwnerMsg(msg)) {
-      recordUserActivity(jid, msg.pushName || null);
+    const senderJid = isPrivateChat ? getSenderJid(msg) : null;
+    if (isPrivateChat && senderJid && !isOwnerMsg(msg)) {
+      recordUserActivity(senderJid, msg.pushName || null);
     }
 
     // =====================
@@ -178,7 +191,7 @@ async function handleMessagesUpsert(sock, { messages, type }) {
     // DIBLOKIR owner lewat "!user off <nomor>" dan bukan owner sendiri,
     // bot "ngambek" -- gak proses command/fitur apa pun lagi buat dia.
     // =====================
-    if (isPrivateChat && isUserDisabled(jid) && !isOwnerMsg(msg)) {
+    if (isPrivateChat && senderJid && isUserDisabled(senderJid) && !isOwnerMsg(msg)) {
       if (text.startsWith("!")) {
         await sendNgambekReply(sock, jid);
       }
