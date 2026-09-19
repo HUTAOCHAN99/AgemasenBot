@@ -262,7 +262,7 @@ Kamu punya akses ke hasil pencarian web terbaru. Aturannya:
 - Kalau info yang ketemu ternyata gak yakin/bertentangan, bilang terus terang -- jangan sok tahu.
 - Kalau pertanyaannya jelas-jelas gak butuh info terkini (obrolan santai, curhat, nanya soal kamu sendiri), ABAIKAN hasil pencarian sepenuhnya dan jawab seperti biasa.`;
 
-function toGeminiRequest(messages, { temperature, maxTokens, grounding }) {
+function toGeminiRequest(messages, { temperature, maxTokens, grounding, thinkingBudget }) {
   const systemTexts = [];
   const contents = [];
 
@@ -299,8 +299,8 @@ function toGeminiRequest(messages, { temperature, maxTokens, grounding }) {
   if (systemTexts.length > 0) {
     payload.systemInstruction = { parts: [{ text: systemTexts.join("\n\n") }] };
   }
-  if (Number.isFinite(GEMINI_THINKING_BUDGET)) {
-    payload.generationConfig.thinkingConfig = { thinkingBudget: GEMINI_THINKING_BUDGET };
+  if (Number.isFinite(thinkingBudget)) {
+    payload.generationConfig.thinkingConfig = { thinkingBudget };
   }
   if (grounding) {
     payload.tools = [{ google_search: {} }];
@@ -318,7 +318,16 @@ function toGeminiRequest(messages, { temperature, maxTokens, grounding }) {
 function parseGeminiResponse(data) {
   const candidate = data?.candidates?.[0];
   const parts = candidate?.content?.parts || [];
+  // PENTING: buang part yang ditandai "thought": true. Kalau
+  // GEMINI_THINKING_BUDGET diaktifkan (bukan 0), Gemini balikin proses
+  // "mikir"-nya sebagai part terpisah SEBELUM part jawaban final -- kalau
+  // gak difilter, isi reasoning mentah itu ikut ke-gabung jadi "jawaban"
+  // dan bocor ke user (ciri-cirinya: teks berbahasa Inggris, gaya analisis
+  // step-by-step / "Determine the ...", gak nyambung sama persona sama
+  // sekali). Ini juga yang bikin token cepat abis -> finishReason "length"
+  // -> auto-continue kepicu lebih sering dari seharusnya.
   const text = parts
+    .filter((p) => !p.thought)
     .map((p) => p.text || "")
     .join("")
     .trim();
@@ -356,6 +365,10 @@ async function callGeminiWithRetry(messages, options = {}) {
     timeoutMs,
     hasImage = false,
     grounding = GEMINI_GROUNDING_ENABLED,
+    // Boleh di-override per-pemanggil (mis. chatReply.js matiin thinking
+    // buat obrolan santai). Kalau gak dikasih, pakai default global env
+    // GEMINI_THINKING_BUDGET.
+    thinkingBudget = GEMINI_THINKING_BUDGET,
   } = options;
 
   if (GEMINI_API_KEYS.length === 0) {
@@ -378,6 +391,7 @@ async function callGeminiWithRetry(messages, options = {}) {
     temperature,
     maxTokens: effectiveMaxTokens,
     grounding,
+    thinkingBudget,
   });
 
   let attempt = 0;

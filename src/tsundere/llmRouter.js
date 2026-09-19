@@ -119,6 +119,11 @@ async function askLLM(messages, options = {}) {
     timeoutMs,
     hasImage = false,
     grounding = GEMINI_GROUNDING_ENABLED,
+    // Diteruskan apa adanya ke callGeminiWithRetry -- kalau gak dikasih
+    // pemanggil, biar callGeminiWithRetry yang pakai default env-nya
+    // sendiri (GEMINI_THINKING_BUDGET). Groq gak punya konsep ini, jadi
+    // gak dipakai di callGroqFallback.
+    thinkingBudget,
   } = options;
 
   const geminiUsable = GEMINI_API_KEYS.length > 0 && !allKeysDailyExhausted();
@@ -131,6 +136,7 @@ async function askLLM(messages, options = {}) {
         timeoutMs,
         hasImage,
         grounding,
+        thinkingBudget,
       });
       return {
         content: stripThinkTags(result.text),

@@ -115,6 +115,15 @@ async function askGroqTsundere(chat, userText, senderName, imageDataUri) {
       const { content, finishReason, sources, provider } = await askLLM(msgs, {
         temperature: GROQ_TEMPERATURE,
         hasImage,
+        // Matikan Gemini "thinking" khusus buat obrolan tsundere ini,
+        // TERLEPAS dari nilai GEMINI_THINKING_BUDGET di env (dipakai lagi
+        // oleh !ringkas di summarizer.js kalau env-nya diisi bukan 0).
+        // Alasan: persona ini didesain buat balasan pendek & cepat (2-5
+        // kalimat), bukan reasoning berlapis -- thinking cuma numpang
+        // makan jatah GEMINI_MAX_TOKENS yang sama dengan jawaban, bikin
+        // jawaban gampang kepotong (finishReason "length") dan kepicu
+        // auto-continue padahal gak perlu.
+        thinkingBudget: 0,
       });
       return { content, finishReason, sources, provider };
     }
