@@ -13,7 +13,7 @@ const {
   DOC_CONTEXT_TTL_MS,
 } = require("../../agemasenTsundere");
 
-const { getSenderJid, getSessionKey, isOwnerMsg } = require("../utils/whatsapp");
+const { getSenderJid, getSessionKey, getTsundereSessionKey, isOwnerMsg } = require("../utils/whatsapp");
 const { isBotDisabledFor } = require("../state/botState");
 const { recordUserActivity, isUserDisabled } = require("../state/userState");
 const {
@@ -107,6 +107,11 @@ async function handleMessagesUpsert(sock, { messages, type }) {
 
     const jid = msg.key.remoteJid;
     const sessionKey = getSessionKey(msg);
+    // Sesi khusus obrolan AI tsundere -- di grup, ini SATU key buat seluruh
+    // anggota grup (bukan per-orang seperti sessionKey biasa di atas),
+    // supaya siapa pun bisa reply ke pesan bot manapun dan tetap nyambung
+    // ke obrolan yang sama. Lihat komentar di getTsundereSessionKey.
+    const tsundereSessionKey = getTsundereSessionKey(msg);
 
     const text = (
       msg.message.conversation ||
@@ -220,10 +225,12 @@ async function handleMessagesUpsert(sock, { messages, type }) {
     }
 
     // =====================
-    // !lupain -- reset ingatan obrolan chat AI (tsundere) buat pengirim ini
+    // !lupain -- reset ingatan obrolan chat AI (tsundere).
+    // Di grup ini bakal ngelupain obrolan BERSAMA seluruh grup (karena
+    // sekarang 1 grup = 1 sesi tsundere, lihat tsundereSessionKey).
     // =====================
     if (text === "!lupain") {
-      const had = forgetGroqChat(sessionKey);
+      const had = forgetGroqChat(tsundereSessionKey);
       await sock.sendMessage(jid, {
         text: had
           ? "Hmph, oke... sudah aku lupain semua obrolan kita. Mulai dari nol lagi ya. 😤"
@@ -350,7 +357,7 @@ async function handleMessagesUpsert(sock, { messages, type }) {
 
         // Simpan teks lengkapnya (bukan ringkasannya) ke sesi ini biar bisa
         // dipakai lagi kalau user nanya-nanya lanjutan soal isi dokumennya.
-        saveDocumentContext(sessionKey, { text: cleanedText, fileName });
+        saveDocumentContext(tsundereSessionKey, { text: cleanedText, fileName });
 
         const ttlHours = Math.round(DOC_CONTEXT_TTL_MS / (60 * 60 * 1000));
         await sock.sendMessage(jid, {
@@ -1136,7 +1143,7 @@ async function handleMessagesUpsert(sock, { messages, type }) {
     // return true kalau pesan ini sudah ditangani (berarti kita return di
     // sini juga), false kalau tidak relevan (lanjut ke pengecekan bawah).
     // =====================
-    if (await handleTsundereChat(sock, msg, { jid, text, sessionKey })) {
+    if (await handleTsundereChat(sock, msg, { jid, text, sessionKey: tsundereSessionKey })) {
       return;
     }
 

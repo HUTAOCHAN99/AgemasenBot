@@ -35,10 +35,32 @@ function isOwnerMsg(msg) {
 // Di chat pribadi: remoteJid sudah unik per orang.
 // Di grup: remoteJid sama untuk semua anggota, jadi wajib digabung
 // dengan participant supaya 2 orang di grup yang sama tidak bentrok.
+//
+// Dipakai buat fitur-fitur yang memang harus PRIVAT per orang (mis. sesi
+// pencarian gambar !img / !pin -- kalau 2 orang di grup yang sama lagi
+// nyari kata kunci beda-beda barengan, jangan sampai nyampur).
 function getSessionKey(msg) {
   const jid = msg.key.remoteJid;
   const participant = msg.key.participant;
   return participant ? `${jid}::${participant}` : jid;
+}
+
+// Kunci session buat obrolan AI tsundere (chatSession.js / agemasenTsundere.js)
+// -- SENGAJA beda dari getSessionKey biasa di atas.
+//
+// Dulu obrolan tsundere pakai getSessionKey (per jid::participant), jadi tiap
+// orang di grup punya riwayat & "reply-thread" sendiri-sendiri ke bot --
+// akibatnya cuma orang yang ASLI nge-tag bot yang bisa lanjut ngobrol lewat
+// reply; orang lain di grup yang ikut reply ke pesan bot yang sama gak
+// nyambung ke obrolan itu (dianggap sesi baru/kosong).
+//
+// Sekarang: di GRUP, kunci sesinya cukup remoteJid (jadi SATU obrolan
+// bersama buat seluruh grup) -- supaya siapa pun anggota grup bisa reply ke
+// balasan bot manapun (punya orang lain sekalipun) dan tetap nyambung ke
+// riwayat yang sama, ngobrol bareng-bareng kayak grup chat beneran. Di chat
+// pribadi tetap sama seperti biasa (remoteJid = lawan bicara itu sendiri).
+function getTsundereSessionKey(msg) {
+  return msg.key.remoteJid;
 }
 
 function sleep(ms) {
@@ -49,5 +71,6 @@ module.exports = {
   getSenderJid,
   isOwnerMsg,
   getSessionKey,
+  getTsundereSessionKey,
   sleep,
 };
