@@ -262,7 +262,30 @@ Kamu punya akses ke hasil pencarian web terbaru. Aturannya:
 - Kalau info yang ketemu ternyata gak yakin/bertentangan, bilang terus terang -- jangan sok tahu.
 - Kalau pertanyaannya jelas-jelas gak butuh info terkini (obrolan santai, curhat, nanya soal kamu sendiri), ABAIKAN hasil pencarian sepenuhnya dan jawab seperti biasa.`;
 
-function toGeminiRequest(messages, { temperature, maxTokens, grounding, thinkingBudget }) {
+// Gemini 3.x ke atas itu "thinking-only" -- beda sama 2.5 yang bisa
+// dimatiin total thinking-nya (thinkingBudget: 0 valid). Kirim
+// thinkingBudget: 0 (atau angka fix lain) ke model 3.x malah ditolak API
+// dengan HTTP 400 "INVALID_ARGUMENT" -- jadi buat model 3.x, JANGAN kirim
+// thinkingConfig sama sekali, biar dia pakai default thinking-nya sendiri.
+function isGemini3PlusModel(model) {
+  return typeof model === "string" && /gemini-[3-9]/i.test(model);
+}
+
+// Gemini 3.x gak pakai thinkingBudget (angka token) kayak 2.5 -- dia
+// pakai thinkingLevel ("minimal"/"low"/"medium"/"high"), dan KALAU
+// thinkingConfig-nya gak dikirim sama sekali, defaultnya "high" (paling
+// banyak mikir, paling makan token & paling lambat). Supaya niat
+// "matiin thinking" dari pemanggil (thinkingBudget: 0, dipakai
+// chatReply.js buat obrolan santai) tetap ada efeknya di model 3.x --
+// walau gak bisa beneran nol -- petakan ke "minimal" (level paling irit
+// yang masih valid). Nilai lain (mis. -1/dynamic dari GEMINI_THINKING_BUDGET
+// buat !ringkas) sengaja gak dipetakan -- biarin Gemini 3.x pakai level
+// default-nya sendiri.
+function toGemini3ThinkingLevel(thinkingBudget) {
+  return thinkingBudget === 0 ? "minimal" : null;
+}
+
+function toGeminiRequest(messages, { temperature, maxTokens, grounding, thinkingBudget, model }) {
   const systemTexts = [];
   const contents = [];
 
@@ -300,7 +323,15 @@ function toGeminiRequest(messages, { temperature, maxTokens, grounding, thinking
     payload.systemInstruction = { parts: [{ text: systemTexts.join("\n\n") }] };
   }
   if (Number.isFinite(thinkingBudget)) {
-    payload.generationConfig.thinkingConfig = { thinkingBudget };
+    if (isGemini3PlusModel(model)) {
+      const level = toGemini3ThinkingLevel(thinkingBudget);
+      // level null -> sengaja gak set apa-apa, biar Gemini 3.x pakai
+      // default-nya sendiri (relevan buat !ringkas yang mau thinking
+      // dinamis/lebih dalam).
+      if (level) payload.generationConfig.thinkingConfig = { thinkingLevel: level };
+    } else {
+      payload.generationConfig.thinkingConfig = { thinkingBudget };
+    }
   }
   if (grounding) {
     payload.tools = [{ google_search: {} }];
@@ -392,6 +423,7 @@ async function callGeminiWithRetry(messages, options = {}) {
     maxTokens: effectiveMaxTokens,
     grounding,
     thinkingBudget,
+    model,
   });
 
   let attempt = 0;
