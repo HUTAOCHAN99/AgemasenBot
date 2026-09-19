@@ -1,9 +1,18 @@
 const fs = require("fs");
 const path = require("path");
 const { ROOT_DIR } = require("../config/env");
+const { pool, DB_ENABLED, ensureSchema } = require("./db");
 
 const GROQ_CHAT_HISTORY_LIMIT = Number(process.env.GROQ_MAX_HISTORY_MESSAGES) || 12;
-const GROQ_CHAT_TTL_MS = 24 * 60 * 60 * 1000; // 24 jam, sama kayak sesi gambar
+// Berapa lama sesi obrolan "dianggurin" sebelum dianggap basi & dibuang
+// (lihat sweepExpiredTsundereChats). Defaultnya 7 hari (seminggu) --
+// bisa di-override lewat env var GROQ_CHAT_TTL_DAYS kalau mau lebih
+// pendek/panjang. Pengecekannya sendiri jalan tiap 1 jam (lihat
+// setInterval di src/features/booru/sessionStore.js), jadi walau TTL-nya
+// "seminggu", sesi yang basi bakal ke-detect & kehapus di jam-jam
+// terdekat setelah lewat 7 hari, bukan pas beneran 7x24 jam.
+const GROQ_CHAT_TTL_MS =
+  (Number(process.env.GROQ_CHAT_TTL_DAYS) || 7) * 24 * 60 * 60 * 1000;
 
 const groqChats = new Map(); // sessionKey -> { history, lastUsed, sentMsgIds }
 
@@ -18,26 +27,33 @@ const HISTORY_FILE =
 const SAVE_DEBOUNCE_MS = 3000;
 let saveTimer = null;
 
+// =====================================================
+// Loader: dari DATABASE (kalau DATABASE_URL diisi) atau dari file JSON
+// lokal (fallback, perilaku lama). Dipanggil SEKALI pas modul ini
+// pertama kali di-require (lihat pemanggilan initSessionStore() di bawah).
+// =====================================================
+function applyLoadedSessions(parsed) {
+  for (const [key, chat] of Object.entries(parsed)) {
+    groqChats.set(key, {
+      history: Array.isArray(chat.history) ? chat.history : [],
+      lastUsed: chat.lastUsed || Date.now(),
+      sentMsgIds: Array.isArray(chat.sentMsgIds) ? chat.sentMsgIds : [],
+      // Konteks dokumen PDF (dari !ringkas) -- ikut dipulihkan supaya
+      // "ingatan" dokumennya gak hilang kalau bot restart di tengah
+      // window DOC_CONTEXT_TTL_MS. Divalidasi bentuknya dulu biar gak
+      // crash kalau data lama (sebelum fitur ini ada) gak punya field ini.
+      documentContext:
+        chat.documentContext && typeof chat.documentContext.text === "string"
+          ? chat.documentContext
+          : null,
+    });
+  }
+}
+
 function loadHistoryFromDisk() {
   try {
     const raw = fs.readFileSync(HISTORY_FILE, "utf8");
-    const parsed = JSON.parse(raw);
-    for (const [key, chat] of Object.entries(parsed)) {
-      groqChats.set(key, {
-        history: Array.isArray(chat.history) ? chat.history : [],
-        lastUsed: chat.lastUsed || Date.now(),
-        sentMsgIds: Array.isArray(chat.sentMsgIds) ? chat.sentMsgIds : [],
-        // Konteks dokumen PDF (dari !ringkas) -- ikut dipulihkan dari disk
-        // supaya "ingatan" dokumennya gak hilang kalau bot restart di
-        // tengah window DOC_CONTEXT_TTL_MS. Divalidasi bentuknya dulu biar
-        // gak crash kalau file lama (sebelum fitur ini ada) gak punya field
-        // ini sama sekali.
-        documentContext:
-          chat.documentContext && typeof chat.documentContext.text === "string"
-            ? chat.documentContext
-            : null,
-      });
-    }
+    applyLoadedSessions(JSON.parse(raw));
     console.log(
       `[groq tsundere] riwayat chat dimuat dari disk (${groqChats.size} sesi).`,
     );
@@ -49,7 +65,38 @@ function loadHistoryFromDisk() {
   }
 }
 
-function writeHistoryToDiskNow() {
+async function loadHistoryFromDb() {
+  try {
+    await ensureSchema();
+    const { rows } = await pool.query(
+      `SELECT session_key, history, sent_msg_ids, document_context,
+              EXTRACT(EPOCH FROM last_used) * 1000 AS last_used_ms
+       FROM tsundere_sessions`,
+    );
+    const parsed = {};
+    for (const row of rows) {
+      parsed[row.session_key] = {
+        history: row.history,
+        sentMsgIds: row.sent_msg_ids,
+        documentContext: row.document_context,
+        lastUsed: Number(row.last_used_ms),
+      };
+    }
+    applyLoadedSessions(parsed);
+    console.log(
+      `[groq tsundere] riwayat chat dimuat dari database (${groqChats.size} sesi).`,
+    );
+  } catch (err) {
+    console.log("[groq tsundere] gagal load riwayat dari database:", err.message);
+  }
+}
+
+// =====================================================
+// Penyimpan: ke DATABASE atau ke file JSON, sama pola dual-mode kayak
+// loader di atas. Dipanggil lewat scheduleSaveHistory() (debounced) tiap
+// ada perubahan di groqChats.
+// =====================================================
+function writeHistoryToFileNow() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     const plain = Object.fromEntries(groqChats);
@@ -59,8 +106,64 @@ function writeHistoryToDiskNow() {
   }
 }
 
+// Nulis SELURUH isi groqChats ke tabel -- upsert tiap sesi yang masih ada,
+// lalu hapus baris DB yang session_key-nya sudah GAK ADA lagi di map
+// (baik karena "!lupain" atau karena sweepExpiredTsundereChats sudah
+// mbuang sesi basi). groqChats di memory selalu jadi SUMBER KEBENARAN;
+// DB cuma cerminan dari situ.
+async function writeHistoryToDbNow() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const keys = [...groqChats.keys()];
+    for (const [key, chat] of groqChats) {
+      await client.query(
+        `INSERT INTO tsundere_sessions
+           (session_key, history, sent_msg_ids, document_context, last_used)
+         VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, to_timestamp($5 / 1000.0))
+         ON CONFLICT (session_key) DO UPDATE SET
+           history = EXCLUDED.history,
+           sent_msg_ids = EXCLUDED.sent_msg_ids,
+           document_context = EXCLUDED.document_context,
+           last_used = EXCLUDED.last_used`,
+        [
+          key,
+          JSON.stringify(chat.history || []),
+          JSON.stringify(chat.sentMsgIds || []),
+          chat.documentContext ? JSON.stringify(chat.documentContext) : null,
+          chat.lastUsed || Date.now(),
+        ],
+      );
+    }
+    // keys kosong (semua sesi dihapus) -> hapus semua baris, itu memang
+    // perilaku yang benar (map adalah sumber kebenaran).
+    await client.query(
+      `DELETE FROM tsundere_sessions WHERE session_key <> ALL($1::text[])`,
+      [keys],
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.log("[groq tsundere] gagal simpan riwayat ke database:", err.message);
+  } finally {
+    client.release();
+  }
+}
+
+function writeHistoryToDiskNow() {
+  if (DB_ENABLED) {
+    // Fire-and-forget dari pemanggil sinkron (scheduleSaveHistory /
+    // flushHistoryOnExit) -- errornya sendiri sudah di-log di dalam
+    // writeHistoryToDbNow, gak perlu di-await di sini supaya gak
+    // ngeblok caller yang masih nganggep fungsi ini sinkron.
+    writeHistoryToDbNow();
+    return;
+  }
+  writeHistoryToFileNow();
+}
+
 // Debounce: kalau ada banyak pesan numpuk dalam waktu dekat, gak perlu
-// nulis file tiap kali -- cukup tulis sekali beberapa detik setelah
+// nulis file/DB tiap kali -- cukup tulis sekali beberapa detik setelah
 // perubahan TERAKHIR berhenti.
 function scheduleSaveHistory() {
   if (saveTimer) clearTimeout(saveTimer);
@@ -68,9 +171,9 @@ function scheduleSaveHistory() {
   saveTimer.unref?.();
 }
 
-// Pastikan riwayat sempat ke-flush ke disk kalau proses dimatikan (mis.
-// Railway restart/redeploy yang ngirim SIGTERM), bukan cuma pas debounce
-// timer kebetulan sempat jalan.
+// Pastikan riwayat sempat ke-flush kalau proses dimatikan (mis. Railway
+// restart/redeploy yang ngirim SIGTERM), bukan cuma pas debounce timer
+// kebetulan sempat jalan.
 function flushHistoryOnExit() {
   if (saveTimer) clearTimeout(saveTimer);
   writeHistoryToDiskNow();
@@ -78,7 +181,13 @@ function flushHistoryOnExit() {
 process.on("SIGTERM", flushHistoryOnExit);
 process.on("SIGINT", flushHistoryOnExit);
 
-loadHistoryFromDisk();
+// Inisialisasi sesuai mode (DB kalau DATABASE_URL diisi, file kalau
+// enggak) -- dipanggil sekali pas modul ini pertama kali di-require.
+if (DB_ENABLED) {
+  loadHistoryFromDb();
+} else {
+  loadHistoryFromDisk();
+}
 
 function getGroqChat(sessionKey) {
   let chat = groqChats.get(sessionKey);
