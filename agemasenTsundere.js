@@ -33,6 +33,7 @@ const {
 const { findImageForVision, downloadImageAsDataUri } = require("./src/tsundere/vision");
 const { saveDocumentContext, DOC_CONTEXT_TTL_MS } = require("./src/tsundere/documentContext");
 const { askGroqTsundere } = require("./src/tsundere/chatReply");
+const { hasRenderableContent, buildSolutionImage } = require("./src/tsundere/solutionImage");
 const {
   summarizeDocumentText,
   DOC_HARD_MAX_CHARS,
@@ -90,7 +91,38 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
 
   try {
     await sock.sendPresenceUpdate("composing", jid);
-    const { chunks } = await askGroqTsundere(chat, cleanText, senderName, imageDataUri);
+    const { text: fullReply, chunks } = await askGroqTsundere(chat, cleanText, senderName, imageDataUri);
+
+    // Kalau jawabannya mengandung rumus ($$..$$ / $..$) atau tabel
+    // markdown (| a | b |), jangan dikirim sebagai teks mentah -- di WA
+    // itu bakal berantakan (LaTeX gak dirender, tabel jadi tumpukan garis
+    // "|" yang gak sejajar). Rakit jadi 1 gambar "lembar jawaban" yang
+    // rapi (lihat src/tsundere/solutionImage.js), kirim itu, baru sisanya
+    // (kalau ada obrolan tsundere yang beneran cuma teks biasa) dikirim
+    // biasa lewat bubble chat.
+    if (hasRenderableContent(fullReply)) {
+      try {
+        const imageBuffer = await buildSolutionImage(fullReply, {
+          title: "Penjelasan Special Week",
+        });
+        const sentMsg = await sock.sendMessage(
+          jid,
+          {
+            image: imageBuffer,
+            caption: "Nih, biar rapi aku buatin gambar. Jangan sampai gak paham, ya! 😤",
+          },
+          { quoted: msg },
+        );
+        rememberSentMsgId(chat, sentMsg?.key?.id);
+        scheduleSaveHistory();
+        return true;
+      } catch (err) {
+        // Gagal render gambar (mis. domain render rumus lagi down) --
+        // fallback ke kirim chunk teks biasa seperti sebelumnya, daripada
+        // user gak dapet jawaban sama sekali.
+        console.log("[groq tsundere] gagal buat gambar solusi, fallback teks:", err.message || err);
+      }
+    }
 
     // Kirim tiap chunk (paragraf/bagian jawaban) sebagai pesan terpisah
     // berurutan, bukan sekaligus jadi 1 dinding teks -- biar kerasa kayak
