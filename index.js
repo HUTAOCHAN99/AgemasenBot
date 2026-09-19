@@ -1,5 +1,27 @@
 console.log("Program dimulai");
 
+// =====================================================================
+// Jaring pengaman TERAKHIR terhadap error async yang gak sengaja lolos
+// dari try/catch manapun (termasuk dari dalam library seperti Baileys
+// sendiri, bukan cuma dari command kita). TANPA ini, satu "unhandled
+// rejection" (promise reject yang gak ada .catch()-nya) bisa MEMATIKAN
+// SELURUH PROSES Node.js (perilaku default sejak Node v15) -- akibatnya
+// kalau kebetulan ada 2 user yang lagi sama-sama pakai command, command
+// user lain yang gak ada hubungannya ikut keputus/interrupted juga,
+// padahal cuma 1 command yang sebenarnya bermasalah.
+//
+// Didaftarkan di titik paling atas & paling awal supaya menangkap
+// SEMUA proses turunan (koneksi Baileys, command handler, dst), bukan
+// cuma dari src/bot/connection.js.
+// =====================================================================
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL-DICEGAH] Unhandled promise rejection:", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL-DICEGAH] Uncaught exception:", err);
+});
+
 // PENTING: daftarkan folder ffmpeg-static ke system PATH SEBELUM apa pun
 // yang butuh spawn("ffmpeg") dijalankan (termasuk Baileys sendiri).
 //

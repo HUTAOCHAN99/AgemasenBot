@@ -57,7 +57,19 @@ async function startBot() {
     }
   });
 
-  sock.ev.on("messages.upsert", (payload) => handleMessagesUpsert(sock, payload));
+  // PENTING: bungkus dengan .catch(). handleMessagesUpsert itu async function --
+  // kalau ada error yang gak ketangkep try/catch di dalam salah satu command
+  // (router.js/features/*), promise-nya bakal reject. Tanpa .catch() di sini,
+  // itu jadi "unhandled rejection" yang bisa MEMATIKAN SELURUH PROSES bot
+  // (default Node.js sejak v15) -- efeknya command user lain yang lagi
+  // diproses BARENGAN ikut keputus tanpa sempat kekirim balasannya, padahal
+  // command dia sendiri gak ada masalah. Dengan .catch() di sini, error dari
+  // satu pesan cuma di-log dan gak ganggu pemrosesan pesan/user lain.
+  sock.ev.on("messages.upsert", (payload) => {
+    handleMessagesUpsert(sock, payload).catch((err) => {
+      console.error("[messages.upsert] Unhandled error saat proses pesan:", err);
+    });
+  });
 }
 
 module.exports = { startBot };
