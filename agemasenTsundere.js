@@ -29,7 +29,9 @@ const {
   isReplyToBotMessage,
   rememberSentMsgId,
   scheduleSaveHistory,
+  jidNumber,
 } = require("./src/tsundere/chatSession");
+const { getSenderJid } = require("./src/utils/whatsapp");
 const { findImageForVision, downloadImageAsDataUri } = require("./src/tsundere/vision");
 const { saveDocumentContext, DOC_CONTEXT_TTL_MS } = require("./src/tsundere/documentContext");
 const { askGroqTsundere } = require("./src/tsundere/chatReply");
@@ -134,7 +136,28 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
   if (!mentioned && !repliedToBot) return false;
 
   const cleanText = text.replace(/@\d+/g, "").trim();
-  const senderName = msg.pushName || "";
+
+  // Label pengirim buat dikasih tau ke LLM (dipakai chatReply.js sebagai
+  // "[dari <label>]" di history) -- SENGAJA nggak cuma pakai pushName
+  // mentah (msg.pushName), karena pushName itu NAMA TAMPILAN yang bisa
+  // diganti pengirimnya kapan aja lewat setting WA-nya sendiri. Kalau
+  // cuma modal nama, begitu orang ganti nick di tengah obrolan, di mata
+  // bot dia jadi "kelihatan seperti orang baru" -- riwayat lama jadi
+  // kayak punya orang lain. Sama juga kalau kebetulan ada 2 orang di
+  // grup yang pushName-nya sama persis, bot bisa ketuker.
+  //
+  // Solusinya: tempelkan suffix STABIL yang diturunkan dari NOMOR WA asli
+  // (getSenderJid -> jidNumber, 4 digit terakhir) -- ini nggak berubah
+  // walau nick-nya ganti-ganti, jadi biar nick berapa kali pun diganti,
+  // suffix ini tetap sama dan LLM tetap bisa "mengenali" ini orang yang
+  // sama dari histori sebelumnya.
+  const senderJid = getSenderJid(msg);
+  const senderNumberSuffix = senderJid ? jidNumber(senderJid).slice(-4) : "";
+  const rawSenderName = msg.pushName || "";
+  const senderName = senderNumberSuffix
+    ? `${rawSenderName || "seseorang"} (...${senderNumberSuffix})`
+    : rawSenderName;
+
   const chat = getGroqChat(sessionKey);
 
   // Cek apakah ada gambar yang perlu dianalisis (dikirim langsung dengan
