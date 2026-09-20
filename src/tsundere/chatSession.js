@@ -3,16 +3,34 @@ const path = require("path");
 const { ROOT_DIR } = require("../config/env");
 const { pool, DB_ENABLED, ensureSchema } = require("./db");
 
-const GROQ_CHAT_HISTORY_LIMIT = Number(process.env.GROQ_MAX_HISTORY_MESSAGES) || 12;
+// Defaultnya dinaikin dari 12 -> 150 pesan -- diitung berdasarkan
+// ESTIMASI VOLUME OBROLAN KE BOT (bukan volume chat grup keseluruhan --
+// yang masuk history cuma pesan yang beneran tag/reply ke bot) buat
+// grup yang rame dalam kurun waktu ~2 hari:
+//   asumsi ±30 interaksi/hari ke bot (gabungan semua anggota grup)
+//   x 2 hari x 2 entri/interaksi (giliran user + giliran bot)
+//   = ±120 entri, dibulatkan ke 150 buat kasih buffer.
+//
+// PENTING: ini limit berbasis JUMLAH pesan, BUKAN berbasis waktu -- jadi
+// bukan "history di-reset tiap 2 hari", tapi "history nampung kira-kira
+// sebanyak obrolan 2 hari grup rame sebelum pesan paling lama mulai
+// kebuang". Kalau grupnya jauh lebih/kurang aktif dari asumsi ini,
+// cakupan waktunya otomatis ikut lebih pendek/panjang.
+//
+// Aman dinaikin segini karena yang disimpan SELALU teks polos (gambar
+// diganti placeholder teks "[mengirim gambar] ..." -- lihat
+// historyContent di chatReply.js) dan provider utama (Gemini) context
+// window-nya jauh lebih dari cukup buat nampung ini.
+const GROQ_CHAT_HISTORY_LIMIT = Number(process.env.GROQ_MAX_HISTORY_MESSAGES) || 150;
 // Berapa lama sesi obrolan "dianggurin" sebelum dianggap basi & dibuang
-// (lihat sweepExpiredTsundereChats). Defaultnya 7 hari (seminggu) --
-// bisa di-override lewat env var GROQ_CHAT_TTL_DAYS kalau mau lebih
+// (lihat sweepExpiredTsundereChats). Defaultnya 2 hari -- bisa
+// di-override lewat env var GROQ_CHAT_TTL_DAYS kalau mau lebih
 // pendek/panjang. Pengecekannya sendiri jalan tiap 1 jam (lihat
 // setInterval di src/features/booru/sessionStore.js), jadi walau TTL-nya
-// "seminggu", sesi yang basi bakal ke-detect & kehapus di jam-jam
-// terdekat setelah lewat 7 hari, bukan pas beneran 7x24 jam.
+// "2 hari", sesi yang basi bakal ke-detect & kehapus di jam-jam terdekat
+// setelah lewat 2 hari, bukan pas beneran 2x24 jam persis.
 const GROQ_CHAT_TTL_MS =
-  (Number(process.env.GROQ_CHAT_TTL_DAYS) || 7) * 24 * 60 * 60 * 1000;
+  (Number(process.env.GROQ_CHAT_TTL_DAYS) || 2) * 24 * 60 * 60 * 1000;
 
 const groqChats = new Map(); // sessionKey -> { history, lastUsed, sentMsgIds }
 
