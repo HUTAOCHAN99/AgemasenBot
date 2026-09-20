@@ -33,7 +33,8 @@ const {
 const { findImageForVision, downloadImageAsDataUri } = require("./src/tsundere/vision");
 const { saveDocumentContext, DOC_CONTEXT_TTL_MS } = require("./src/tsundere/documentContext");
 const { askGroqTsundere } = require("./src/tsundere/chatReply");
-const { hasRenderableContent, buildSolutionImage } = require("./src/tsundere/solutionImage");
+const { splitReplyIntoChunks } = require("./src/tsundere/replyFormat");
+const { hasRenderableContent, parseSegments, buildSegmentImage } = require("./src/tsundere/solutionImage");
 const {
   summarizeDocumentText,
   DOC_HARD_MAX_CHARS,
@@ -58,6 +59,67 @@ const {
 //      obrolan bisa dilanjut natural kayak chat WhatsApp beneran, tanpa
 //      harus nge-tag ulang tiap kali mau lanjut.
 // =====================================================
+// Kirim balasan yang mengandung tabel/rumus sebagai CAMPURAN pesan
+// berurutan, MEMPERTAHANKAN urutan asli jawabannya (misal: teks
+// pembuka -> gambar tabel -> teks penutup):
+//   - Segmen teks -> dipecah per-bubble (splitReplyIntoChunks, SAMA
+//     kayak jalur teks biasa) dan dikirim sebagai pesan teks WA normal.
+//   - Segmen tabel/rumus -> dirender jadi gambar KECIL per-segmen
+//     (buildSegmentImage), TANPA teks lain nempel di situ. Kalau
+//     render-nya gagal (mis. API LaTeX down), fallback kirim mentah
+//     sebagai teks (tabel jadi baris " | " dipisah newline, rumus jadi
+//     "$..$"/"$$..$$" apa adanya) daripada segmen itu ilang total.
+//
+// quoted+reply-tracking cuma ditempel di pesan yang PALING PERTAMA
+// kekirim (apa pun tipenya -- teks atau gambar), sisanya nyusul biasa.
+// =====================================================
+async function sendSegmentedReply({ sock, jid, msg, chat, fullReply }) {
+  const segments = parseSegments(fullReply);
+  let sentAny = false;
+
+  async function sendOne(content) {
+    const opts = sentAny ? {} : { quoted: msg };
+    const sentMsg = await sock.sendMessage(jid, content, opts);
+    sentAny = true;
+    rememberSentMsgId(chat, sentMsg?.key?.id);
+  }
+
+  async function typingPause(approxLen) {
+    if (!sentAny) return; // jangan ada delay sebelum bubble PERTAMA
+    await sock.sendPresenceUpdate("composing", jid);
+    await sleep(Math.min(2500, 400 + approxLen * 8));
+  }
+
+  for (const seg of segments) {
+    if (seg.type === "text") {
+      const textChunks = splitReplyIntoChunks(seg.value);
+      for (const chunk of textChunks) {
+        await typingPause(chunk.length);
+        await sendOne({ text: chunk });
+      }
+    } else {
+      // seg.type === "table" atau "math"
+      await typingPause(80);
+      try {
+        const imgBuffer = await buildSegmentImage(seg);
+        await sendOne({ image: imgBuffer });
+      } catch (err) {
+        console.log(
+          "[groq tsundere] gagal render segmen gambar, fallback teks mentah:",
+          err.message || err,
+        );
+        const raw =
+          seg.type === "table"
+            ? [seg.header.join(" | "), ...seg.rows.map((r) => r.join(" | "))].join("\n")
+            : seg.display
+              ? `$$${seg.latex}$$`
+              : `$${seg.latex}$`;
+        await sendOne({ text: raw });
+      }
+    }
+  }
+}
+
 async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
   if (text.startsWith("!")) return false;
 
@@ -94,33 +156,36 @@ async function handleTsundereChat(sock, msg, { jid, text, sessionKey }) {
     const { text: fullReply, chunks } = await askGroqTsundere(chat, cleanText, senderName, imageDataUri);
 
     // Kalau jawabannya mengandung rumus ($$..$$ / $..$) atau tabel
-    // markdown (| a | b |), jangan dikirim sebagai teks mentah -- di WA
-    // itu bakal berantakan (LaTeX gak dirender, tabel jadi tumpukan garis
-    // "|" yang gak sejajar). Rakit jadi 1 gambar "lembar jawaban" yang
-    // rapi (lihat src/tsundere/solutionImage.js), kirim itu, baru sisanya
-    // (kalau ada obrolan tsundere yang beneran cuma teks biasa) dikirim
-    // biasa lewat bubble chat.
+    // markdown (| a | b |), pecah jawabannya per-segmen (lihat
+    // parseSegments di src/tsundere/solutionImage.js) dan kirim CAMPURAN:
+    //   - segmen teks biasa -> dikirim sebagai bubble chat WA NORMAL
+    //     (bisa di-reply/di-copy, format *bold*/_italic_ WA-nya tetap
+    //     kepakai) -- SAMA seperti kalau jawabannya nggak ada tabel sama
+    //     sekali.
+    //   - segmen tabel/rumus -> BARU ini yang dirender jadi gambar kecil
+    //     terpisah (lihat buildSegmentImage), karena WA emang gak bisa
+    //     nampilin tabel markdown / LaTeX dengan rapi kalau dikirim
+    //     mentah sebagai teks.
+    //
+    // Dulu SEMUANYA (termasuk basa-basi tsundere-nya) digambar jadi SATU
+    // gambar besar (buildSolutionImage) -- akibatnya teksnya "kebawa"
+    // masuk ke gambar dan gak bisa di-reply/di-copy kayak chat biasa.
     if (hasRenderableContent(fullReply)) {
       try {
-        const imageBuffer = await buildSolutionImage(fullReply, {
-          title: "Penjelasan Special Week",
-        });
-        const sentMsg = await sock.sendMessage(
-          jid,
-          {
-            image: imageBuffer,
-            caption: "Nih, biar rapi aku buatin gambar. Jangan sampai gak paham, ya! 😤",
-          },
-          { quoted: msg },
-        );
-        rememberSentMsgId(chat, sentMsg?.key?.id);
+        await sendSegmentedReply({ sock, jid, msg, chat, fullReply });
         scheduleSaveHistory();
         return true;
       } catch (err) {
-        // Gagal render gambar (mis. domain render rumus lagi down) --
-        // fallback ke kirim chunk teks biasa seperti sebelumnya, daripada
-        // user gak dapet jawaban sama sekali.
-        console.log("[groq tsundere] gagal buat gambar solusi, fallback teks:", err.message || err);
+        // Gagal total di tengah proses kirim campuran (jarang -- biasanya
+        // cuma 1 segmen gambar yang gagal, dan itu SUDAH ditangani sendiri
+        // di dalam sendSegmentedReply dengan fallback teks per-segmen).
+        // Kalau sampai ke sini, fallback ke chunk teks polos seperti
+        // sebelumnya (dari askGroqTsundere), daripada user gak dapet
+        // jawaban sama sekali.
+        console.log(
+          "[groq tsundere] gagal kirim balasan campuran teks+gambar, fallback teks:",
+          err.message || err,
+        );
       }
     }
 

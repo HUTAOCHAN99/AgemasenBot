@@ -326,7 +326,68 @@ async function buildSolutionImage(fullText, { title } = {}) {
   return canvas.toBuffer("image/png");
 }
 
+// =====================================================
+// 5b. RENDER SATU SEGMEN AJA (tabel ATAU rumus) -- versi "kecil", TANPA
+// teks di sekitarnya dan TANPA judul. Dipakai buat balasan campuran:
+// teks tsundere dikirim sebagai bubble chat WA biasa (bisa di-reply,
+// di-copy, dan format *bold*/_italic_ WA-nya tetap kepakai), sedangkan
+// CUMA bagian yang beneran butuh dirender visual (tabel/rumus) yang
+// jadi gambar terpisah -- beda dari buildSolutionImage() di atas yang
+// nggabung SEMUANYA (teks + tabel + rumus) jadi satu gambar besar.
+//
+// Melempar error kalau gagal (mis. render LaTeX gagal karena internet/
+// API down) -- pemanggil (agemasenTsundere.js) yang tanggung jawab
+// fallback ke teks mentah kalau ini gagal.
+// =====================================================
+async function buildSegmentImage(segment) {
+  ensureFonts();
+  const CANVAS_WIDTH = 900;
+  const MARGIN = 20;
+  const CONTENT_WIDTH = CANVAS_WIDTH - MARGIN * 2;
+
+  let itemW;
+  let itemH;
+  let drawItem;
+
+  if (segment.type === "table") {
+    const tableCanvas = renderTableCanvas(segment.header, segment.rows);
+    const scale = Math.min(1, CONTENT_WIDTH / tableCanvas.width);
+    itemW = tableCanvas.width * scale;
+    itemH = tableCanvas.height * scale;
+    drawItem = (ctx, x, y) => ctx.drawImage(tableCanvas, x, y, itemW, itemH);
+  } else if (segment.type === "math") {
+    // Sengaja TIDAK di-try/catch di sini -- biarkan errornya nyembur ke
+    // pemanggil (buildSegmentImage) supaya caller yang nentuin fallback
+    // (kirim mentah "$..$"/"$$..$$" sebagai teks), sama seperti pola
+    // fallback yang sudah ada di buildSolutionImage.
+    const img = await renderLatexPng(segment.latex, segment.display);
+    const scale = Math.min(1, CONTENT_WIDTH / img.width);
+    itemW = img.width * scale;
+    itemH = img.height * scale;
+    drawItem = (ctx, x, y) => ctx.drawImage(img, x, y, itemW, itemH);
+  } else {
+    throw new Error(`buildSegmentImage: tipe segmen tidak didukung: ${segment.type}`);
+  }
+
+  const canvas = createCanvas(Math.ceil(itemW + MARGIN * 2), Math.ceil(itemH + MARGIN * 2));
+  const ctx = canvas.getContext("2d");
+
+  // Bingkai "kertas catatan" yang sama kayak buildSolutionImage, biar
+  // gaya visualnya konsisten walau sekarang dipecah per-segmen.
+  ctx.fillStyle = "#fffaf5";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = "#f0c9dd";
+  ctx.lineWidth = 4;
+  ctx.strokeRect(2, 2, canvas.width - 4, canvas.height - 4);
+
+  drawItem(ctx, MARGIN, MARGIN);
+
+  return canvas.toBuffer("image/png");
+}
+
 module.exports = {
   hasRenderableContent,
+  parseSegments,
   buildSolutionImage,
+  buildSegmentImage,
 };
