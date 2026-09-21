@@ -1104,7 +1104,7 @@ async function handleMessagesUpsert(sock, { messages, type }) {
         });
       }
 
-      await handleDlDownload(sock, jid, url, mode, maxHeight);
+      await handleDlDownload(sock, jid, url, mode, maxHeight, msg);
       return;
     }
 
@@ -1131,7 +1131,7 @@ async function handleMessagesUpsert(sock, { messages, type }) {
         return;
       }
 
-      await handleDlrDownload(sock, jid, url);
+      await handleDlrDownload(sock, jid, url, msg);
       return;
     }
 

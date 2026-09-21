@@ -166,7 +166,7 @@ async function downloadGalleryFromUrl(url) {
 // handleDlrDownload ("!dlr", command khusus foto/carousel). Return true
 // kalau berhasil kirim minimal 1 foto, false kalau ternyata gak ada foto
 // yang bisa diambil dari link ini sama sekali.
-async function sendPhotoGallery(sock, jid, url) {
+async function sendPhotoGallery(sock, jid, url, quotedMsg) {
   let imageBuffers, audioBuffer, audioExt;
   try {
     const result = await enqueueDownloadJob(() =>
@@ -180,14 +180,14 @@ async function sendPhotoGallery(sock, jid, url) {
     return false;
   }
 
+  // Cukup reply/quote pesan request user -- gak perlu tulis ulang link-nya
+  // di caption, user udah tau link apa yang dia kirim.
   for (let i = 0; i < imageBuffers.length; i++) {
-    await sock.sendMessage(jid, {
-      image: imageBuffers[i],
-      caption:
-        i === 0
-          ? `✅ Berhasil didownload (${imageBuffers.length} foto).\n🔗 ${url}`
-          : undefined,
-    });
+    await sock.sendMessage(
+      jid,
+      { image: imageBuffers[i] },
+      i === 0 && quotedMsg ? { quoted: quotedMsg } : undefined,
+    );
   }
 
   // Musik latar (kalau ada -- khusus TikTok slideshow) dikirim TERAKHIR,
@@ -215,12 +215,12 @@ async function sendPhotoGallery(sock, jid, url) {
 // pemanggil gak perlu nampilin pesan error generik lagi) -- return false
 // kalau ternyata bukan postingan foto juga, biar pemanggil lanjut ke
 // pesan error biasa.
-async function tryHandleAsPhotoPost(sock, jid, url) {
+async function tryHandleAsPhotoPost(sock, jid, url, quotedMsg) {
   await sock.sendMessage(jid, {
     text: "🖼️ Sepertinya ini postingan foto, bukan video. Coba download fotonya...",
   });
 
-  return sendPhotoGallery(sock, jid, url);
+  return sendPhotoGallery(sock, jid, url, quotedMsg);
 }
 
 // "!dlr <link>" -- command KHUSUS foto/carousel/slideshow, langsung ambil
@@ -228,13 +228,13 @@ async function tryHandleAsPhotoPost(sock, jid, url) {
 // video dulu baru fallback ke foto kalau gagal). Berguna kalau user sudah
 // tau link-nya carousel/slideshow, biar gak buang waktu nunggu percobaan
 // video yang pasti gagal duluan.
-async function handleDlrDownload(sock, jid, url) {
+async function handleDlrDownload(sock, jid, url, quotedMsg) {
   try {
     await sock.sendMessage(jid, {
       text: "⏳ Download foto/carousel, tunggu ya...",
     });
 
-    const sent = await sendPhotoGallery(sock, jid, url);
+    const sent = await sendPhotoGallery(sock, jid, url, quotedMsg);
 
     if (!sent) {
       await sock.sendMessage(jid, {
@@ -270,7 +270,7 @@ async function handleDlrDownload(sock, jid, url) {
 // hasil beda. Jadi cuma error "service-nya lagi rewel" (mati, timeout,
 // antre kelamaan) yang di-fallback.
 // =====================================================
-async function tryDownloadViaSilence(sock, jid, url, mode, maxHeight) {
+async function tryDownloadViaSilence(sock, jid, url, mode, maxHeight, quotedMsg) {
   // Anti-spam pesan progress: cuma kirim update kalau posisi antreannya
   // beneran bikin user perlu nunggu lama (bukan tiap polling 3 detik).
   let queueNotified = false;
@@ -299,7 +299,7 @@ async function tryDownloadViaSilence(sock, jid, url, mode, maxHeight) {
     // lokal SENGAJA gak di-reset di sini (registerYtdlpSuccess), biar
     // status backoff yt-dlp lokal tetap jujur nyeritain kondisi IP
     // server bot sendiri.
-    await sendDownloadedMedia(sock, jid, buffer, mode, url, false);
+    await sendDownloadedMedia(sock, jid, buffer, mode, url, false, quotedMsg);
     return true;
   } catch (err) {
     console.log("=== [dl] jalur SilenceYTDown gagal ===");
@@ -322,7 +322,7 @@ async function tryDownloadViaSilence(sock, jid, url, mode, maxHeight) {
   }
 }
 
-async function handleDlDownload(sock, jid, url, mode, maxHeight) {
+async function handleDlDownload(sock, jid, url, mode, maxHeight, quotedMsg) {
   // Link YouTube: coba dulu lewat SilenceYTDown kalau diaktifin. Ini
   // dicek SEBELUM backoff lokal, karena backoff itu soal IP server bot
   // ini -- gak ada hubungannya sama IP service SilenceYTDown yang punya
@@ -335,7 +335,7 @@ async function handleDlDownload(sock, jid, url, mode, maxHeight) {
           : `⏳ Download video${maxHeight ? ` (maks ${maxHeight}p)` : ""} lewat server download, tunggu ya...`,
     });
 
-    const handled = await tryDownloadViaSilence(sock, jid, url, mode, maxHeight);
+    const handled = await tryDownloadViaSilence(sock, jid, url, mode, maxHeight, quotedMsg);
     if (handled) return;
     // kalau false -> lanjut ke jalur yt-dlp lokal di bawah
   }
@@ -372,7 +372,7 @@ async function handleDlDownload(sock, jid, url, mode, maxHeight) {
     );
 
     if (isYoutubeUrl(url)) registerYtdlpSuccess();
-    await sendDownloadedMedia(sock, jid, buffer, mode, url, false);
+    await sendDownloadedMedia(sock, jid, buffer, mode, url, false, quotedMsg);
   } catch (err) {
     if (isYoutubeUrl(url) && isRateLimitOrBotDetectionError(err.stderr)) {
       registerYtdlpRateLimitFailure();
@@ -382,7 +382,7 @@ async function handleDlDownload(sock, jid, url, mode, maxHeight) {
     // TikTok) -- yt-dlp jalan sukses tapi emang gak ada video/audio buat
     // di-download lewat jalur biasa. Coba jalur foto dulu sebelum nyerah.
     if (err.possiblyPhotoOnly) {
-      const handled = await tryHandleAsPhotoPost(sock, jid, url);
+      const handled = await tryHandleAsPhotoPost(sock, jid, url, quotedMsg);
       if (handled) return;
     }
 
@@ -401,21 +401,24 @@ async function handleDlDownload(sock, jid, url, mode, maxHeight) {
   }
 }
 
-async function sendDownloadedMedia(sock, jid, buffer, mode, url, fromCache) {
+async function sendDownloadedMedia(sock, jid, buffer, mode, url, fromCache, quotedMsg) {
+  // Cukup balas (quoted) pesan "!dl <link>" milik user -- gak perlu lagi
+  // nulis ulang "Berhasil didownload" + link-nya di caption, karena
+  // reply-nya sendiri udah menunjukkan ini hasil dari request itu.
+  const options = quotedMsg ? { quoted: quotedMsg } : undefined;
+
   if (mode === "audio") {
-    await sock.sendMessage(jid, {
-      audio: buffer,
-      mimetype: "audio/mpeg",
-      fileName: "audio.mp3",
-    });
+    await sock.sendMessage(
+      jid,
+      { audio: buffer, mimetype: "audio/mpeg", fileName: "audio.mp3" },
+      options,
+    );
   } else {
-    await sock.sendMessage(jid, {
-      video: buffer,
-      mimetype: "video/mp4",
-      caption: fromCache
-        ? `✅ Berhasil didownload (dari cache).\n🔗 ${url}`
-        : `✅ Berhasil didownload.\n🔗 ${url}`,
-    });
+    await sock.sendMessage(
+      jid,
+      { video: buffer, mimetype: "video/mp4" },
+      options,
+    );
   }
 }
 
