@@ -4,6 +4,65 @@ const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");
+const ffprobePath = require("ffprobe-static").path;
+
+// yt-dlp (dan ffmpeg-nya) butuh dua binary: "ffmpeg" DAN "ffprobe", dan
+// KEDUANYA harus ada di satu folder yang sama, karena --ffmpeg-location
+// cuma nunjuk ke SATU direktori (yt-dlp nyari "ffprobe" otomatis di
+// direktori itu juga, gak bisa dikasih path ffprobe terpisah).
+//
+// Masalahnya: paket npm "ffmpeg-static" CUMA nyediain binary ffmpeg, TIDAK
+// menyertakan ffprobe sama sekali -- makanya dipasang paket terpisah
+// "ffprobe-static" khusus buat ffprobe-nya. Tapi dua paket ini naruh
+// binary-nya di folder node_modules yang BEDA, jadi kalau --ffmpeg-location
+// cuma diarahin ke folder ffmpeg-static, yt-dlp gak bakal ketemu ffprobe
+// sama sekali -> muncul "WARNING: unable to obtain file audio codec with
+// ffprobe" pas extract MP3 (dan proses postprocessing-nya gagal total),
+// atau di kasus lain video kekirim tanpa audio kalau merge video+audio
+// butuh ffprobe buat verifikasi stream tapi gak ketemu binary-nya.
+//
+// Fix-nya: siapin SATU folder gabungan (di tmp dir) yang isinya symlink
+// (atau copy kalau symlink gak didukung filesystem-nya) ke KEDUA binary
+// itu, dengan nama file asli masing-masing ("ffmpeg"/"ffmpeg.exe" dan
+// "ffprobe"/"ffprobe.exe") supaya yt-dlp bisa nemuin dua-duanya lewat satu
+// --ffmpeg-location. Dibikin sekali aja pas modul ini di-load (bukan tiap
+// kali download), biar gak nambah overhead per-request.
+function ensureCombinedFfmpegBinDir() {
+  const dir = path.join(os.tmpdir(), "agemasen-ffmpeg-bin");
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch (err) {
+    console.error("[dl] Gagal bikin folder gabungan ffmpeg/ffprobe:", err.message);
+    // Fallback: kalau gagal, tetap balikin folder ffmpeg-static asli --
+    // minimal ffmpeg-nya sendiri masih bisa dipakai (kayak perilaku lama).
+    return path.dirname(ffmpegPath);
+  }
+
+  for (const src of [ffmpegPath, ffprobePath]) {
+    const dest = path.join(dir, path.basename(src));
+    if (fs.existsSync(dest)) continue; // sudah pernah disiapin sebelumnya
+    try {
+      fs.symlinkSync(src, dest);
+    } catch {
+      // Symlink bisa gagal di beberapa environment (mis. Windows tanpa izin
+      // admin, atau filesystem tertentu di container) -- fallback ke copy
+      // file biasa, lalu pastikan bit executable-nya ikut ke-set.
+      try {
+        fs.copyFileSync(src, dest);
+        fs.chmodSync(dest, 0o755);
+      } catch (copyErr) {
+        console.error(
+          `[dl] Gagal siapin ${path.basename(src)} di folder gabungan:`,
+          copyErr.message,
+        );
+      }
+    }
+  }
+
+  return dir;
+}
+
+const FFMPEG_BIN_DIR = ensureCombinedFfmpegBinDir();
 
 // =====================================================
 // Fitur: Download media dari link ("!dl")
@@ -603,7 +662,7 @@ async function downloadMediaFromUrl(url, mode, maxHeight) {
     // ikut dikirim ke user WhatsApp (itu tetap lewat friendlyDlError),
     // jadi aman gak bikin pesan ke user jadi berantakan.
     "--ffmpeg-location",
-    path.dirname(ffmpegPath),
+    FFMPEG_BIN_DIR,
     "--max-filesize",
     DL_MAX_FILESIZE,
     // Jeda kecil (detik) antar request internal yt-dlp -- bukan obat buat
