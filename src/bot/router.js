@@ -65,6 +65,10 @@ const {
   stickerToImageBuffer,
 } = require("../features/media/sticker");
 const { gifToTextSticker, mediaToSticker } = require("../features/meme/stickerBuilder");
+const {
+  textToBratSticker,
+  MAX_CHARS: BRAT_MAX_CHARS,
+} = require("../features/meme/bratSticker");
 
 const {
   findImageSource,
@@ -750,6 +754,58 @@ async function handleMessagesUpsert(sock, { messages, type }) {
         console.log(err);
         await sock.sendMessage(jid, {
           text: `❌ Gagal membuat stiker.\n${err.message || ""}`,
+        });
+      }
+
+      return;
+    }
+
+    // =====================
+    // !sbrat <teks>  (alias: .sbrat <teks>)
+    // Stiker gaya BRAT (background abu-abu, teks hitam besar, blur
+    // ringan) dibuat MURNI dari teks -- beda dari !meme/!smeme/!s yang
+    // semuanya butuh sumber media (GIF/video/stiker/foto). Logic render-
+    // nya ada di bratSticker.js.
+    // =====================
+    if (
+      text === "!sbrat" ||
+      text.startsWith("!sbrat ") ||
+      text === ".sbrat" ||
+      text.startsWith(".sbrat ")
+    ) {
+      // "!sbrat" dan ".sbrat" sama-sama 6 karakter, jadi slice(6) berlaku
+      // buat kedua prefix tanpa perlu dicabang.
+      const bratText = text.slice(6).trim();
+
+      if (!bratText) {
+        await sendCommandDetail(sock, jid, "sbrat");
+        return;
+      }
+
+      if (bratText.length > BRAT_MAX_CHARS) {
+        await sock.sendMessage(jid, {
+          text:
+            `⚠️ Teksnya kepanjangan (${bratText.length} karakter, maksimal ${BRAT_MAX_CHARS}) ` +
+            "biar layout stikernya tetap rapi. Coba dipersingkat lagi ya.",
+        });
+        return;
+      }
+
+      try {
+        await sock.sendMessage(jid, { text: "⏳ Membuat stiker..." });
+
+        const stickerBuffer = await textToBratSticker(bratText);
+
+        await sock.sendMessage(jid, {
+          sticker: stickerBuffer,
+          isAnimated: false,
+        });
+      } catch (err) {
+        console.log("=== [sbrat] gagal ===");
+        console.log(err.message || err);
+        console.log("=====================");
+        await sock.sendMessage(jid, {
+          text: `❌ Gagal membuat stiker BRAT.\n${err.message || "Terjadi kesalahan saat merender teks, coba lagi ya."}`,
         });
       }
 

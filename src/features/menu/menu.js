@@ -85,6 +85,7 @@ Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti
 ▸ !meme
 ▸ !smeme
 ▸ !s
+▸ !sbrat
 ▸ !togif
 ▸ !toimg
 
@@ -218,6 +219,23 @@ Ubah GIF/video/stiker/foto apa pun jadi stiker biasa, tanpa teks.
 *Cara pakai:*
 • Kirim medianya dengan caption \`!s\`.
 • Atau kirim medianya dulu, terus *reply* dengan \`!s\`.`,
+
+  sbrat: `🖤 *!sbrat <teks>*
+
+Ubah teks jadi stiker gaya BRAT (background abu-abu, teks hitam besar rata kiri, blur ringan) -- murni dari teks, gak butuh media apa pun.
+
+*Cara pakai:*
+Ketik teksnya langsung setelah command.
+
+*Contoh:*
+\`\`\`
+!sbrat ayo ayo ganyang fufufafa
+!sbrat hidup cuma sekali
+\`\`\`
+
+💡 Bisa juga pakai titik: \`.sbrat teksnya\`.
+
+⚠️ Maksimal sekitar 80 karakter biar layout stikernya tetap rapi.`,
 
   togif: `🎞️ *!togif*
 
