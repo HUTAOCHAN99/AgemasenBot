@@ -132,7 +132,49 @@ const GALLERYDL_PATH = process.env.GALLERYDL_PATH || "gallery-dl";
 // minggu/bulan) -- kalau tiba-tiba mulai gagal lagi dengan pesan yang
 // sama, kemungkinan besar cookies-nya sudah kadaluarsa, tinggal ulangi
 // langkah export di atas.
-const GALLERYDL_COOKIES_FILE = process.env.GALLERYDL_COOKIES_FILE || "";
+// Alternatif setup cookies lewat env var base64 -- cocok buat platform
+// tanpa persistent volume (mis. Railway) di mana naruh file cookies.txt
+// langsung ke disk/repo gak praktis. Kalau env var ini diisi, kita decode
+// base64-nya balik jadi file fisik di tmpdir SEKALI pas modul ini
+// di-load, lalu path file itu dipakai sebagai fallback GALLERYDL_COOKIES_FILE
+// (kalau GALLERYDL_COOKIES_FILE belum diisi manual) -- dan juga dipakai
+// buat --cookies yt-dlp khusus Instagram (lihat downloadMediaFromUrl).
+//
+// Cara siapin:
+//   1. Export cookies.txt seperti biasa (lihat komentar GALLERYDL_COOKIES_FILE
+//      di bawah).
+//   2. `base64 -w0 cookies.txt` (Linux/Mac) lalu copy hasilnya.
+//   3. Set env var IG_COOKIES_B64 di Railway (tab Variables) ke hasil itu.
+function decodeCookiesFromEnvBase64(envVarName) {
+  const raw = process.env[envVarName];
+  if (!raw) return "";
+
+  try {
+    const dir = path.join(os.tmpdir(), "agemasen-cookies");
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, `${envVarName.toLowerCase()}.txt`);
+
+    const decoded = Buffer.from(raw, "base64").toString("utf8");
+
+    // Sanity check ringan -- file cookies Netscape yang valid selalu
+    // diawali baris ini. Kalau gak cocok, kemungkinan besar env var-nya
+    // salah isi (mis. ke-paste isi cookies.txt mentah, bukan base64-nya).
+    if (!decoded.includes("# Netscape HTTP Cookie File")) {
+      console.error(
+        `[dl] ${envVarName} ter-set tapi hasil decode base64-nya gak keliatan seperti cookies.txt Netscape. Dicek lagi isinya.`,
+      );
+    }
+
+    fs.writeFileSync(dest, decoded, { mode: 0o600 });
+    return dest;
+  } catch (err) {
+    console.error(`[dl] Gagal decode ${envVarName} jadi file cookies:`, err.message);
+    return "";
+  }
+}
+
+const GALLERYDL_COOKIES_FILE =
+  process.env.GALLERYDL_COOKIES_FILE || decodeCookiesFromEnvBase64("IG_COOKIES_B64");
 
 // Alternatif dari GALLERYDL_COOKIES_FILE di atas -- LEBIH SIMPEL setup-nya
 // (gak perlu extension browser & export manual), tapi TRADE-OFF-nya
@@ -442,6 +484,17 @@ async function ensureWhatsAppCompatibleVideo(inputPath, opts = {}) {
 
   const info = await probeVideoInfo(inputPath);
   const isH264 = /Video:\s*h264/i.test(info);
+
+  // Ketemu pas investigasi kasus "video kekirim tanpa suara": kadang
+  // sumbernya SENDIRI (sebelum kita proses apa-apa) udah gak punya stream
+  // audio sama sekali -- bukan gara-gara transcode/remux di sini yang
+  // "ngilangin" suara. Dicek & di-log di sini biar ketauan dari awal
+  // (Railway Logs), bukan baru ketauan pas user komplain video-nya bisu.
+  if (!/Audio:/i.test(info)) {
+    console.warn(
+      `[dl] PERINGATAN: file sumber (${inputPath}) TIDAK PUNYA stream audio sama sekali -- video bakal dikirim bisu. Ini bukan bug di transcode/remux, sumbernya emang udah video-only (cek lagi format selector / cookies buat platform ini).`,
+    );
+  }
   const sizeOf = (p) => {
     try {
       return fs.statSync(p).size;
@@ -657,6 +710,19 @@ function isYoutubeUrl(url) {
   }
 }
 
+// Deteksi link Instagram -- dipakai buat nambahin --cookies ke yt-dlp
+// (lihat downloadMediaFromUrl). Tanpa login, Instagram nyembunyiin format
+// audio dari reel/video (yt-dlp -F cuma nampilin video-only walau
+// postingannya beneran ada suaranya) -- --cookies buka format audio itu.
+function isInstagramUrl(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "");
+    return host === "instagram.com" || host.endsWith(".instagram.com");
+  } catch {
+    return false;
+  }
+}
+
 // mode: "video" -> MP4 (gabungan video+audio terbaik dalam batas ukuran)
 //       "audio" -> MP3 (audio-only, hasil ekstraksi)
 // Generik untuk YouTube (video/short), Bilibili, Facebook (video/reel/
@@ -667,23 +733,41 @@ function isYoutubeUrl(url) {
 const YTDLP_ALLOWED_HEIGHTS = [144, 240, 360, 480, 720];
 const YTDLP_DEFAULT_MAX_HEIGHT = 720; // perilaku lama, dipertahankan sebagai default
 
-// Bangun -f selector yt-dlp yang di-cap ke `maxHeight` (kalau valid),
-// tetap paksa codec H.264 (avc1) + AAC (mp4a) biar video-nya bisa
-// diputer di player native WhatsApp HP -- alasan lengkapnya lihat
-// komentar di pemanggil. 3 tingkat fallback: DASH avc1+mp4a pas cap ->
-// progresif avc1 pas cap -> apa pun pas cap -> pamungkas "apa aja yang
-// penting kebentuk" (buat kasus video yang formatnya di luar cap sama
-// sekali, misal gara-gara SABR cuma nyisa 1 opsi).
-function buildVideoFormatSelector(maxHeight) {
+// BUG LAMA (ketemu pas investigasi kasus "video kekirim tanpa suara"):
+// filter `[height<=720]` di selector -f nolak SEMUA video vertikal, karena
+// video vertikal (mis. reel 9:16) disimpan dengan "height" gedenya di
+// SISI PANJANG -- 720x1280 itu height-nya 1280, BUKAN 720, jadi ketolak
+// filter height<=720 walau secara visual itu video 720p. Akibatnya
+// selector jatuh ke fallback "/best" paling akhir, yang diam-diam bisa
+// milih format VIDEO-ONLY kalau kebetulan gak ada format gabungan --
+// video 1440p VP9 (berat, dan bisa jadi cuma video tanpa audio).
+//
+// Fix: JANGAN filter pakai "height<=", pakai --format-sort (-S) dengan
+// "res:" -- res: di yt-dlp otomatis ngukur dari SISI TERPENDEK video
+// (jadi video vertikal 720x1280 dianggap "res 720" dengan benar, sama
+// kayak video horizontal 1280x720), dan itu SORT bukan FILTER keras jadi
+// gak ada kasus "ketolak semua -> jatuh ke /best". Codec H.264+AAC juga
+// dipindah dari filter jadi preferensi sort (vcodec:h264,acodec:aac),
+// biar tetep diusahain tapi gak bikin selector gagal total kalau
+// sumbernya cuma nyedia VP9/Opus.
+function buildVideoFormatSelector() {
+  // Selector -f: ambil video+audio terbaik (bv*+ba), fallback ke satu
+  // format gabungan terbaik (b) kalau DASH video+audio terpisah gak ada.
+  // Sengaja TIDAK ada filter height/vcodec di sini -- itu semua diatur
+  // lewat -S (lihat buildFormatSortArgs) biar gak ada risiko selector-nya
+  // ketolak total dan jatuh diam-diam ke format video-only.
+  return "bv*+ba/b";
+}
+
+// Argumen --format-sort terpisah, dipasangkan bareng buildVideoFormatSelector()
+// di atas. "res:${cap}" nge-cap resolusi (diukur dari sisi terpendek, jadi
+// benar buat video vertikal), lalu preferensi codec H.264+AAC biar hasil
+// akhirnya bisa diputer di player native WhatsApp HP.
+function buildFormatSortArgs(maxHeight) {
   const cap = YTDLP_ALLOWED_HEIGHTS.includes(maxHeight)
     ? maxHeight
     : YTDLP_DEFAULT_MAX_HEIGHT;
-  return (
-    `bestvideo[height<=${cap}][vcodec^=avc1]+bestaudio[acodec^=mp4a]` +
-    `/best[height<=${cap}][vcodec^=avc1]` +
-    `/best[height<=${cap}]` +
-    `/best`
-  );
+  return ["-S", `res:${cap},vcodec:h264,acodec:aac`];
 }
 
 async function downloadMediaFromUrl(url, mode, maxHeight) {
@@ -771,6 +855,15 @@ async function downloadMediaFromUrl(url, mode, maxHeight) {
     }
   }
 
+  // Khusus Instagram: tanpa cookies, Instagram nyembunyiin format audio
+  // reel/video dari yt-dlp (walau postingannya beneran ada suaranya) --
+  // ketemu pas investigasi kasus "video kekirim tanpa suara". Reuse file
+  // yang sama dengan GALLERYDL_COOKIES_FILE (dipakai jalur foto/gallery-dl
+  // juga), apapun asalnya (path manual atau hasil decode IG_COOKIES_B64).
+  if (isInstagramUrl(url) && GALLERYDL_COOKIES_FILE) {
+    commonArgs.push("--cookies", GALLERYDL_COOKIES_FILE);
+  }
+
   const args =
     mode === "audio"
       ? [
@@ -808,7 +901,8 @@ async function downloadMediaFromUrl(url, mode, maxHeight) {
           // ukuran file tetap ditegakkan lewat flag --max-filesize
           // (lihat DL_MAX_FILESIZE di atas), yang otomatis
           // mempertimbangkan filesize_approx juga.
-          buildVideoFormatSelector(maxHeight),
+          buildVideoFormatSelector(),
+          ...buildFormatSortArgs(maxHeight),
           "--merge-output-format",
           "mp4",
           url,
