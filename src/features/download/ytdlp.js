@@ -860,6 +860,13 @@ async function downloadMediaFromUrl(url, mode, maxHeight) {
   // ketemu pas investigasi kasus "video kekirim tanpa suara". Reuse file
   // yang sama dengan GALLERYDL_COOKIES_FILE (dipakai jalur foto/gallery-dl
   // juga), apapun asalnya (path manual atau hasil decode IG_COOKIES_B64).
+  // Log diagnostik sementara -- biar keliatan di Railway Logs KENAPA
+  // --cookies dipasang atau enggak, tanpa perlu nebak-nebak. Aman
+  // dibiarkan permanen (gak nampilin isi cookies-nya, cuma status).
+  console.log(
+    `[dl][debug] isInstagramUrl(url)=${isInstagramUrl(url)} GALLERYDL_COOKIES_FILE=${GALLERYDL_COOKIES_FILE ? `"${GALLERYDL_COOKIES_FILE}" (ada, ${fs.existsSync(GALLERYDL_COOKIES_FILE) ? "file ADA" : "file TIDAK ADA di disk!"})` : "(KOSONG)"}`,
+  );
+
   if (isInstagramUrl(url) && GALLERYDL_COOKIES_FILE) {
     commonArgs.push("--cookies", GALLERYDL_COOKIES_FILE);
   }
