@@ -320,11 +320,26 @@ function probeVideoInfo(inputPath) {
 //   crf      : kualitas x264, makin besar makin kecil ukurannya
 //              (default: biarin x264 pakai default-nya, 23)
 //   audioBitrate : default "128k"
+//   threads  : jumlah thread encoder x264 (default 2 -- lihat catatan di
+//              bawah, JANGAN dibiarkan auto-detect)
 // Dipakai dua tingkat sama ensureWhatsAppCompatibleVideo() di bawah: pass
 // pertama kualitas normal, pass kedua (cuma kalau hasilnya masih kegedean
 // buat WhatsApp) diperkecil lagi pakai crf/maxWidth yang lebih agresif.
+//
+// CATATAN PENTING soal "-threads": kalau opsi ini gak di-set, x264 bakal
+// auto-detect jumlah CPU dan spawn sebanyak itu thread encoder. Di host
+// container kayak Railway, jumlah core yang kedetect adalah core MESIN
+// FISIK host (bisa puluhan/70+), BUKAN jatah CPU asli plan kamu -- padahal
+// jatah MEMORI-nya tetap kecil. Tiap thread x264 butuh buffer frame sendiri,
+// jadi makin banyak thread = makin banyak memori yang diklaim di awal,
+// SEBELUM frame pertama sempat di-render. Hasilnya: proses ffmpeg langsung
+// ditembak mati (OOM kill / SIGKILL) oleh container, muncul sebagai
+// "exit null" (bukan exit code beneran, tapi mati kena sinyal) dan log
+// cuma sempat nunjukin "frame=0" tanpa progress apa pun. Makanya di sini
+// threads DIBATASI KECIL secara eksplisit, biar konsumsi memorinya bisa
+// diprediksi dan gak auto-mengikuti core count host yang gak relevan.
 function runFfmpegTranscodeToH264(inputPath, outputPath, opts = {}) {
-  const { maxWidth = 1280, crf = null, audioBitrate = "128k" } = opts;
+  const { maxWidth = 1280, crf = null, audioBitrate = "128k", threads = 2 } = opts;
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, [
       "-y",
@@ -332,6 +347,8 @@ function runFfmpegTranscodeToH264(inputPath, outputPath, opts = {}) {
       inputPath,
       "-c:v",
       "libx264",
+      "-threads",
+      String(threads),
       "-profile:v",
       "high",
       "-pix_fmt",
@@ -468,9 +485,18 @@ async function ensureWhatsAppCompatibleVideo(inputPath, opts = {}) {
   // Tier pertama = kualitas normal (sama kayak perilaku lama) kalau cuma
   // masalah codec. Kalau file-nya kegedean, langsung mulai dari tier yang
   // sudah pakai CRF biar ada efek pengecilan beneran.
+  //
+  // Kalau cuma masalah codec (bukan kegedean), sekarang ada tier kedua
+  // sebagai fallback: kalau tier pertama gagal (misalnya kena OOM kill di
+  // host), coba lagi dengan resolusi lebih kecil + CRF lebih agresif --
+  // makin kecil frame-nya, makin kecil juga puncak pemakaian memorinya,
+  // jadi ada peluang tier kedua ini lolos walau tier pertama kena OOM.
   const tiers = tooBig
     ? WA_SHRINK_TIERS
-    : [{ maxWidth: 1280, crf: null, audioBitrate: "128k" }];
+    : [
+        { maxWidth: 1280, crf: null, audioBitrate: "128k" },
+        { maxWidth: 640, crf: 30, audioBitrate: "96k" },
+      ];
 
   let lastGood = null;
 
@@ -499,6 +525,23 @@ async function ensureWhatsAppCompatibleVideo(inputPath, opts = {}) {
       `Videonya kepanjangan/kegedean buat WhatsApp -- setelah dikompres pun masih ${(sizeOf(lastGood) / 1024 / 1024).toFixed(0)}MB (batas ~${(maxBytes / 1024 / 1024).toFixed(0)}MB). Coba video yang lebih pendek, atau pakai "!dl <link> mp3" kalau cuma butuh audionya.`,
     );
     err.tooLargeForWhatsApp = true;
+    throw err;
+  }
+
+  // Semua tier transcode gagal TOTAL (misalnya tetap kena OOM kill walau
+  // sudah dikecilin) DAN codec sumbernya memang bukan H.264. Dulu di sini
+  // kita balikin inputPath apa adanya ("mendingan coba kirim daripada
+  // gagal total") -- tapi itu keliru: kalau codec-nya bukan H.264, WA
+  // mobile PASTI gak bisa buka file itu, jadi "mencoba kirim" cuma
+  // menunda kegagalan sampai user buka videonya dan nemu "This video is
+  // not available". Lebih jujur (dan lebih membantu) buat langsung kasih
+  // error yang jelas di sini, daripada diam-diam ngirim file yang gak
+  // akan pernah bisa diputar.
+  if (!lastGood && !isH264) {
+    const err = new Error(
+      "Gagal transcode video ke format yang bisa dibuka WhatsApp (server kehabisan resource pas nge-encode). Coba lagi beberapa saat, atau pakai video dengan resolusi/durasi lebih kecil.",
+    );
+    err.transcodeFailed = true;
     throw err;
   }
 
