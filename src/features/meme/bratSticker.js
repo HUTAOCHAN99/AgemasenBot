@@ -5,8 +5,11 @@ const { MEME_FONT_PATH } = require("./emoji");
 
 // =====================================================
 // Fitur: "!sbrat <teks>" (alias ".sbrat") -- generate stiker gaya BRAT
-// (khas cover album "brat" Charli XCX): kanvas abu-abu muda, teks hitam
-// pekat berukuran raksasa, rata kiri, blur ringan, antarbaris rapat.
+// (khas cover album "brat" Charli XCX): kanvas putih/nyaris putih, teks
+// hitam dengan font normal (bukan bold), ukuran relatif kecil (banyak
+// white space), rata kiri, blur ringan, antarbaris rapat. Layout kata
+// mengalir kiri->kanan berbasis LEBAR TEKS SEBENARNYA (bukan hitungan
+// karakter), lalu turun baris kalau ruang horizontal habis.
 //
 // BEDA dari !meme/!smeme/!s: fitur-fitur itu semua butuh SUMBER MEDIA
 // (GIF/video/stiker/foto) yang di-reply/caption. !sbrat murni generate
@@ -14,13 +17,27 @@ const { MEME_FONT_PATH } = require("./emoji");
 // sendiri, bukan nebeng ke stickerBuilder.js/textRender.js yang memang
 // didesain buat nge-overlay teks DI ATAS media.
 //
-// Font pakai infrastruktur yang SAMA seperti !meme/!smeme (lihat
-// emoji.js) secara default -- gak perlu font baru diinstall di server.
-// Bisa dioverride independen lewat env var BRAT_FONT_PATH kalau suatu
-// saat mau pakai font lain khusus buat !sbrat tanpa mengubah font meme.
+// Font: DEFAULT-nya SENGAJA BEDA dari !meme/!smeme (lihat
+// BRAT_FONT_REGULAR_FALLBACK di bawah) karena MEME_FONT_PATH default-nya
+// adalah varian BOLD, sementara brat-style aslinya pakai sans-serif
+// normal/ringan. Tetap bisa dioverride independen lewat env var
+// BRAT_FONT_PATH tanpa mengubah font meme.
 // =====================================================
 
-const BRAT_FONT_PATH = process.env.BRAT_FONT_PATH || MEME_FONT_PATH;
+// Font BRAT: default-nya SENGAJA dipisah dari MEME_FONT_PATH (yang
+// defaultnya DejaVuSans-Bold -- itu penyebab utama teks !sbrat sebelumnya
+// selalu keliatan bold berat). Brat-style asli pakai sans-serif ringan/
+// normal (Helvetica Neue-ish), jadi default-nya diarahkan ke DejaVu Sans
+// varian REGULAR/"Book" (bukan Bold) yang lazim tersedia satu paket sama
+// DejaVuSans-Bold di server Linux. Tetap bisa dioverride lewat env var
+// BRAT_FONT_PATH kalau mau pakai font lain yang lebih mendekati referensi.
+const BRAT_FONT_REGULAR_FALLBACK =
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+const BRAT_FONT_PATH =
+  process.env.BRAT_FONT_PATH ||
+  (fs.existsSync(BRAT_FONT_REGULAR_FALLBACK)
+    ? BRAT_FONT_REGULAR_FALLBACK
+    : MEME_FONT_PATH); // fallback terakhir kalau regular gak ketemu sama sekali
 const BRAT_FONT_FAMILY = "BratFont";
 
 let bratFontRegistered = false;
@@ -38,123 +55,143 @@ function ensureBratFontRegistered() {
 }
 
 const CANVAS_SIZE = 1024;
-const BG_COLOR = "#E6E6E6";
-const TEXT_COLOR = "#111111";
-const MARGIN_RATIO = 0.065; // margin kecil (~6.5%), sesuai brief 5-8%
-const LINE_HEIGHT_RATIO = 1.15; // rapat, tapi cukup buat hindari ascender/descender numpuk
-const MIN_LINES = 1;
-const MAX_LINES = 4;
-const MIN_FONT_SIZE = 26;
-const MAX_FONT_SIZE = 820;
+const BG_COLOR = "#FFFFFF"; // putih bersih, sesuai referensi (dulu abu-abu #E6E6E6)
+const TEXT_COLOR = "#151515"; // hitam pekat (bukan pure #000 biar gak terlalu keras)
+const MARGIN_RATIO = 0.09; // margin lebih longgar (~9%) supaya white space kerasa
+const LINE_HEIGHT_RATIO = 1.2; // rapat tapi tetap ada nafas antar baris
+// Font size DIBATASI cukup rendah dengan sengaja -- brief minta teks
+// "relatif kecil terhadap canvas", BUKAN memenuhi kanvas kayak poster.
+// Nilai ini dikalibrasi supaya paragraf ~6 baris kira-kira mengisi
+// separuh tinggi kanvas (mirip referensi), bukan 80-90% seperti versi lama.
+const MIN_FONT_SIZE = 28;
+const MAX_FONT_SIZE = 100;
+const MAX_LINES = 8; // batas aman (MAX_CHARS=80 bikin ini jarang kepakai)
 const BLUR_SIGMA = 3; // gaussian blur ringan (brief minta 2-4px)
 const MAX_CHARS = 80; // batas panjang teks biar layout tetap rapi
+// Teks pendek (<= sekian kata) TIDAK dipaksa muat 1 baris -- dipecah jadi
+// beberapa baris pendek dengan sedikit variasi horizontal ("loose flow"),
+// sesuai bagian "TEKS PENDEK" di brief.
+const SHORT_TEXT_WORD_THRESHOLD = 6;
 
 function splitWords(text) {
   return text.trim().split(/\s+/).filter(Boolean);
 }
 
-// Bagi array kata jadi PERSIS `numLines` baris (urutan kata tetap
-// dipertahankan -- ini bukan penyusunan ulang, cuma nyari titik potong
-// terbaik), dengan meminimalkan variansi PANJANG KARAKTER antar baris.
-// Ini "algoritma sederhana" yang bikin hasil potongan barisnya keliatan
-// SEIMBANG secara visual, dipakai buat kasus semacam:
-//   "ayo ayo ganyang fufufafa" (3 baris) -> "ayo ayo" / "ganyang" / "fufufafa"
-// (7 / 7 / 8 karakter -- jauh lebih seimbang dibanding potongan lain)
-// dibanding word-wrap biasa yang cuma "makan kata sampai mentok lebar".
-//
-// Pakai DP klasik "pembagian array jadi k bagian, minimalkan jumlah
-// kuadrat panjang tiap bagian" -- karena total panjang teks FIXED,
-// meminimalkan jumlah kuadrat = memaksa semua bagian sedekat mungkin ke
-// panjang rata-rata (itulah definisi "seimbang" di sini).
-function balancedPartition(words, numLines) {
-  const n = words.length;
-  if (numLines <= 1 || n <= 1) return [words];
-  if (numLines >= n) return words.map((w) => [w]); // 1 kata per baris
+// ---------------------------------------------------------------------
+// Word-wrap "asli": mengalir dari kiri ke kanan berbasis LEBAR TEKS YANG
+// SEBENARNYA (ctx.measureText), bukan jumlah karakter/DP balance seperti
+// versi lama. Aturan intinya persis seperti brief:
+//   currentLineWidth + wordWidth + spacing <= availableWidth
+// kalau gak muat -> baris baru. Ini yang bikin hasil wrap mengikuti
+// bentuk visual kata (kata lebar kayak "diberi-tahu" diperlakukan beda
+// dari kata pendek "ya"), bukan cuma hitungan huruf.
+function greedyWrapWords(ctx, words, maxWidth) {
+  const spaceWidth = ctx.measureText(" ").width || 10;
+  const lines = [];
+  let current = [];
+  let currentWidth = 0;
 
-  const lineLen = (j, i) => {
-    let len = 0;
-    for (let k = j; k < i; k++) len += words[k].length;
-    return len + (i - j - 1); // + spasi antar kata dalam baris itu
-  };
+  for (const word of words) {
+    const wordWidth = ctx.measureText(word).width;
+    const extra = current.length === 0 ? 0 : spaceWidth;
 
-  const INF = Infinity;
-  const dp = Array.from({ length: numLines + 1 }, () =>
-    new Array(n + 1).fill(INF),
-  );
-  const choice = Array.from({ length: numLines + 1 }, () =>
-    new Array(n + 1).fill(-1),
-  );
-  dp[0][0] = 0;
-
-  for (let k = 1; k <= numLines; k++) {
-    for (let i = k; i <= n; i++) {
-      for (let j = k - 1; j < i; j++) {
-        if (dp[k - 1][j] === INF) continue;
-        const len = lineLen(j, i);
-        const cost = dp[k - 1][j] + len * len;
-        if (cost < dp[k][i]) {
-          dp[k][i] = cost;
-          choice[k][i] = j;
-        }
-      }
+    if (current.length > 0 && currentWidth + extra + wordWidth > maxWidth) {
+      lines.push(current);
+      current = [word];
+      currentWidth = wordWidth;
+    } else {
+      current.push(word);
+      currentWidth += extra + wordWidth;
     }
   }
-
-  const lines = [];
-  let i = n;
-  for (let k = numLines; k >= 1; k--) {
-    const j = choice[k][i];
-    lines.unshift(words.slice(j, i));
-    i = j;
-  }
+  if (current.length > 0) lines.push(current);
   return lines;
 }
 
-// Cari ukuran font TERBESAR (dalam batas MIN/MAX_FONT_SIZE) yang bikin
-// SEMUA baris muat dalam maxWidth, dan total tinggi bloknya muat dalam
-// maxHeight.
-function fitFontSizeForLines(ctx, lines, maxWidth, maxHeight) {
+// Cari ukuran font TERBESAR (dalam batas MIN/MAX_FONT_SIZE, yang sudah
+// sengaja dibikin moderat) yang membuat hasil greedy-wrap tetap muat
+// dalam maxHeight. MAX_FONT_SIZE yang rendah + logic ini artinya: makin
+// panjang teksnya, makin banyak baris yang kebentuk secara alami dari
+// greedy-wrap, dan kalau itu bikin blok teks kepanjangan vertikal, baru
+// font-size diturunkan bertahap sampai muat -- BUKAN font dimaksimalkan
+// dulu baru dipaksa entah berapa baris seperti algoritma lama.
+function fitGreedyLayout(ctx, words, maxWidth, maxHeight) {
+  for (let size = MAX_FONT_SIZE; size >= MIN_FONT_SIZE; size -= 2) {
+    ctx.font = `${size}px "${BRAT_FONT_FAMILY}"`;
+    const lines = greedyWrapWords(ctx, words, maxWidth);
+    const totalHeight = size * LINE_HEIGHT_RATIO * lines.length;
+
+    if (totalHeight <= maxHeight && lines.length <= MAX_LINES) {
+      return { lines, size, mode: "flow" };
+    }
+  }
+  // Fallback: teks kepanjangan banget -- pakai font minimum apa adanya
+  // (MAX_CHARS=80 bikin kasus ini jarang tersentuh sama sekali).
+  ctx.font = `${MIN_FONT_SIZE}px "${BRAT_FONT_FAMILY}"`;
+  return {
+    lines: greedyWrapWords(ctx, words, maxWidth),
+    size: MIN_FONT_SIZE,
+    mode: "flow",
+  };
+}
+
+// ---------------------------------------------------------------------
+// Mode "loose flow" khusus TEKS PENDEK (brief bagian "TEKS PENDEK"):
+// jangan paksa semua kata jadi satu baris rapat. Sebagai gantinya, kata
+// dikelompokkan 1-2 per baris (deterministik dari isi kata, bukan random
+// bebas), lalu tiap baris diberi offset horizontal terkontrol -- baris
+// pertama tetap condong ke kiri, baris berikutnya boleh sedikit ke
+// tengah/kanan. Offset SELALU dihitung dari sisa ruang (maxWidth -
+// lineWidth), jadi mustahil keluar kanvas atau overlap antar baris
+// (baris tetap ditumpuk vertikal seperti mode biasa).
+function buildLooseGroups(words) {
+  const groups = [];
+  let i = 0;
+  while (i < words.length) {
+    const w = words[i];
+    const next = words[i + 1];
+    const combine =
+      next !== undefined &&
+      w.length + next.length <= 9 && // cuma gabung kalau dua-duanya pendek
+      seededJitter(`${w}${next}${i}-combine`, 1) > 0; // ~50% deterministik
+    if (combine) {
+      groups.push([w, next]);
+      i += 2;
+    } else {
+      groups.push([w]);
+      i += 1;
+    }
+  }
+  return groups;
+}
+
+function fitLooseLayout(ctx, words, maxWidth, maxHeight) {
+  const groups = buildLooseGroups(words);
   for (let size = MAX_FONT_SIZE; size >= MIN_FONT_SIZE; size -= 2) {
     ctx.font = `${size}px "${BRAT_FONT_FAMILY}"`;
     const widest = Math.max(
-      ...lines.map((line) => ctx.measureText(line.join(" ")).width),
+      ...groups.map((g) => ctx.measureText(g.join(" ")).width),
     );
-    const totalHeight = size * LINE_HEIGHT_RATIO * lines.length;
+    const totalHeight = size * LINE_HEIGHT_RATIO * groups.length;
 
-    if (widest <= maxWidth && totalHeight <= maxHeight) return size;
+    if (widest <= maxWidth && totalHeight <= maxHeight) {
+      return { lines: groups, size, mode: "loose" };
+    }
   }
-  return MIN_FONT_SIZE;
+  ctx.font = `${MIN_FONT_SIZE}px "${BRAT_FONT_FAMILY}"`;
+  return { lines: groups, size: MIN_FONT_SIZE, mode: "loose" };
 }
 
-// Inti algoritma line-break: coba semua opsi jumlah baris (1..4, dibatasi
-// jumlah kata yang ada), balance-partition tiap opsi lewat balancedPartition,
-// lalu hitung font terbesar yang muat buat tiap opsi. Opsi dengan font
-// PALING BESAR yang menang -- karena target brief adalah teks memenuhi
-// ~80-90% kanvas, jadi "line-break paling estetis" didefinisikan sebagai
-// "line-break yang bikin teksnya bisa dirender paling besar". Kalau ada
-// beberapa opsi dengan font size yang SAMA persis, menangkan yang barisnya
-// LEBIH SEDIKIT -- gak ada gunanya mecah baris lebih banyak kalau toh
-// ukuran fontnya gak nambah gede, itu cuma bikin makin ramai tanpa manfaat
-// visual (mis. "ayo ayo / ganyang / fufufafa" [3 baris] menang atas
-// "ayo / ayo / ganyang / fufufafa" [4 baris] kalau font size-nya sama).
+// Router kecil: teks pendek -> loose flow, selain itu -> greedy flow
+// biasa. Keduanya sama-sama "satu sistem" (word-flow kiri->kanan,
+// turun baris kalau gak muat) -- bedanya cuma seberapa banyak kata
+// digabung per baris, sesuai instruksi brief supaya panjang/pendek
+// teks berbagi prinsip layout yang sama.
 function pickBestLayout(ctx, words, maxWidth, maxHeight) {
-  const maxPossibleLines = Math.max(
-    MIN_LINES,
-    Math.min(MAX_LINES, words.length),
-  );
-
-  let best = null;
-  for (let numLines = MIN_LINES; numLines <= maxPossibleLines; numLines++) {
-    const lines = balancedPartition(words, numLines);
-    const size = fitFontSizeForLines(ctx, lines, maxWidth, maxHeight);
-
-    if (!best || size > best.size) {
-      best = { lines, size };
-    }
-    // size === best.size -> best sudah dari numLines lebih kecil (loop naik),
-    // jadi TIDAK diganti -- ini yang mewujudkan tie-break "lebih sedikit baris".
+  if (words.length <= SHORT_TEXT_WORD_THRESHOLD) {
+    return fitLooseLayout(ctx, words, maxWidth, maxHeight);
   }
-  return best;
+  return fitGreedyLayout(ctx, words, maxWidth, maxHeight);
 }
 
 // Random kecil TAPI deterministik (seed dari isi baris itu sendiri) --
@@ -185,35 +222,69 @@ function renderBratPng(text) {
   const maxHeight = CANVAS_SIZE - margin * 2;
 
   const words = splitWords(text);
-  const { lines, size } = pickBestLayout(ctx, words, maxWidth, maxHeight);
+  const { lines, size, mode } = pickBestLayout(ctx, words, maxWidth, maxHeight);
 
   ctx.font = `${size}px "${BRAT_FONT_FAMILY}"`;
   ctx.textAlign = "left";
   ctx.textBaseline = "alphabetic";
   ctx.fillStyle = TEXT_COLOR;
 
+  const spaceWidth = ctx.measureText(" ").width || size * 0.28;
   const lineGap = size * LINE_HEIGHT_RATIO;
   const totalHeight = lineGap * lines.length;
   // Blok teks ditengahkan vertikal dalam area yang tersedia (bukan nempel
-  // ke atas/bawah), tapi tiap baris tetap RATA KIRI dari margin kiri.
+  // ke atas/bawah), tapi tiap baris tetap mulai rata kiri dari margin kiri
+  // (sesuai default alignment LEFT di brief).
   let y = margin + (maxHeight - totalHeight) / 2 + size * 0.78;
 
-  for (const lineWords of lines) {
+  lines.forEach((lineWords, lineIndex) => {
     const lineText = lineWords.join(" ");
-    // Jitter halus (beberapa px + rotasi <2 derajat) -- "sedikit
+    const lineWidth = ctx.measureText(lineText).width;
+
+    // Offset horizontal awal baris:
+    // - mode "flow" (teks panjang/normal): tiap baris rata kiri (cuma
+    //   jitter beberapa px) -- ini yang menghasilkan paragraf alami
+    //   seperti referensi.
+    // - mode "loose" (teks pendek): baris PERTAMA tetap dipaksa dekat
+    //   kiri, baris berikutnya boleh bergeser ke arah tengah/kanan
+    //   secara terkontrol (bergantung sisa ruang horizontal), sesuai
+    //   brief bagian "TEKS PENDEK". Offset ini dihitung dari sisa
+    //   ruang (maxWidth - lineWidth) jadi TIDAK PERNAH keluar kanvas.
+    let startXOffset = 0;
+    if (mode === "loose" && lineIndex > 0) {
+      const room = Math.max(0, maxWidth - lineWidth);
+      // Faktor 0..0.55 -- condong kiri secara umum, tapi sebagian baris
+      // bisa jatuh di area tengah/kanan seperti pada referensi ASCII.
+      const factor = (seededJitter(lineText + lineIndex + "shift", 1) + 1) / 2 * 0.55;
+      startXOffset = room * factor;
+    }
+
+    // Jitter halus per baris (beberapa px + rotasi <2 derajat) -- "sedikit
     // berantakan tapi tetap mudah dibaca" sesuai brief, bukan diacak liar.
-    const dx = seededJitter(lineText + "x", 6);
-    const dy = seededJitter(lineText + "y", 2);
-    const angle = seededJitter(lineText + "r", 1.2) * (Math.PI / 180);
+    const dx = seededJitter(lineText + lineIndex + "x", 6);
+    const dy = seededJitter(lineText + lineIndex + "y", 2);
+    const angle = seededJitter(lineText + lineIndex + "r", 1.2) * (Math.PI / 180);
 
     ctx.save();
-    ctx.translate(margin + dx, y + dy);
+    ctx.translate(margin + startXOffset + dx, y + dy);
     ctx.rotate(angle);
-    ctx.fillText(lineText, 0, 0);
+
+    // Render kata per kata (bukan satu fillText string gabungan) supaya
+    // jarak antarkata bisa dikasih variasi kecil ("natural", bukan
+    // seragam sempurna) -- variasinya dibatasi ±25% dari lebar spasi
+    // normal, cukup kecil untuk tetap aman terhadap batas wrap.
+    let cursorX = 0;
+    lineWords.forEach((word, wordIndex) => {
+      ctx.fillText(word, cursorX, 0);
+      const wordWidth = ctx.measureText(word).width;
+      const gapJitter = seededJitter(word + wordIndex + lineIndex + "gap", spaceWidth * 0.25);
+      cursorX += wordWidth + spaceWidth + gapJitter;
+    });
+
     ctx.restore();
 
     y += lineGap;
-  }
+  });
 
   return canvas.toBuffer("image/png");
 }
@@ -240,8 +311,10 @@ async function textToBratSticker(text) {
 module.exports = {
   MAX_CHARS,
   splitWords,
-  balancedPartition,
-  fitFontSizeForLines,
+  greedyWrapWords,
+  fitGreedyLayout,
+  buildLooseGroups,
+  fitLooseLayout,
   pickBestLayout,
   renderBratPng,
   pngToBratWebp,

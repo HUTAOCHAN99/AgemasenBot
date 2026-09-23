@@ -762,8 +762,8 @@ async function handleMessagesUpsert(sock, { messages, type }) {
 
     // =====================
     // !sbrat <teks>  (alias: .sbrat <teks>)
-    // Stiker gaya BRAT (background abu-abu, teks hitam besar, blur
-    // ringan) dibuat MURNI dari teks -- beda dari !meme/!smeme/!s yang
+    // Stiker gaya BRAT (background putih, teks hitam ukuran kecil, font
+    // normal, blur ringan) dibuat MURNI dari teks -- beda dari !meme/!smeme/!s yang
     // semuanya butuh sumber media (GIF/video/stiker/foto). Logic render-
     // nya ada di bratSticker.js.
     // =====================
