@@ -222,7 +222,7 @@ Ubah GIF/video/stiker/foto apa pun jadi stiker biasa, tanpa teks.
 
   sbrat: `🖤 *!sbrat <teks>*
 
-Ubah teks jadi stiker gaya BRAT (background abu-abu, teks hitam besar rata kiri, blur ringan) -- murni dari teks, gak butuh media apa pun.
+Ubah teks jadi stiker gaya BRAT (background putih, teks hitam lowercase font sempit, rata kiri-kanan, efek blur "fried") -- murni dari teks, gak butuh media apa pun.
 
 *Cara pakai:*
 Ketik teksnya langsung setelah command.
