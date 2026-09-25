@@ -86,6 +86,7 @@ Hmph... jangan salah paham. Aku cuma nunjukkin daftar command-nya, bukan berarti
 ▸ !smeme
 ▸ !s
 ▸ !sbrat
+▸ !schat
 ▸ !togif
 ▸ !toimg
 
@@ -238,6 +239,28 @@ Ketik teksnya langsung setelah command.
 💡 Emoji boleh ikut di dalam teks (termasuk bendera 🇮🇩 dan emoji warna kulit 👍🏽), tampil sebagai gambar emoji.
 
 ⚠️ Maksimal sekitar 80 karakter biar layout stikernya tetap rapi.`,
+
+  schat: `💬 *!schat Nama|Pesan|badge*
+
+Ubah teks jadi stiker "dialog chat" ala screenshot WhatsApp -- avatar bulat, nama pengirim, sama bubble pesannya. Murni dari teks, gak wajib pakai media.
+
+*Cara pakai:*
+Ketik \`!schat Nama|Pesan\` (bagian \`|badge\` di akhir itu opsional, biasanya emoji kecil di sebelah nama).
+
+*Avatar-nya otomatis, gak perlu upload apa-apa:*
+• *Reply* ke pesan seseorang di grup, terus ketik \`!schat ...\` -> avatar-nya foto profil ORANG itu.
+• *Tag* orangnya (@nomor) di teks command -> avatar-nya foto profil orang yang di-tag.
+• Gak reply/tag siapa-siapa -> avatar-nya foto profil KAMU sendiri.
+• Mau paksa avatar dari gambar tertentu? Kirim gambar/stiker dengan caption \`!schat ...\`, atau kirim gambarnya dulu terus *reply* pakai \`!schat ...\` -- ini prioritas paling atas.
+• Kalau fotonya gak bisa diambil (mis. privasi WA-nya ditutup), otomatis fallback ke lingkaran warna + huruf awal nama.
+
+*Contoh:*
+\`\`\`
+!schat A.Z.A.N|kurang2in satirnya dong
+!schat Budi|Woy udah pada makan belom?|😂
+\`\`\`
+
+⚠️ Nama maksimal 40 karakter, pesan maksimal 500 karakter (batas ini juga dicek ulang di kode -- lihat MAX_NAME_CHARS/MAX_MESSAGE_CHARS di dialogSticker.js).`,
 
   togif: `🎞️ *!togif*
 

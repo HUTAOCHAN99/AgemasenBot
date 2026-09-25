@@ -1,5 +1,6 @@
-const { downloadMediaMessage } = require("@whiskeysockets/baileys");
+const { downloadMediaMessage, jidNormalizedUser } = require("@whiskeysockets/baileys");
 const { PDFParse } = require("pdf-parse");
+const axios = require("axios");
 
 const { runArtikelCommand } = require("../commands/artikel");
 const {
@@ -69,6 +70,11 @@ const {
   textToBratSticker,
   MAX_CHARS: BRAT_MAX_CHARS,
 } = require("../features/meme/bratSticker");
+const {
+  textToDialogSticker,
+  MAX_NAME_CHARS: SCHAT_MAX_NAME_CHARS,
+  MAX_MESSAGE_CHARS: SCHAT_MAX_MESSAGE_CHARS,
+} = require("../features/meme/dialogSticker");
 
 const {
   findImageSource,
@@ -96,6 +102,46 @@ const {
 // ukuran file/waktu proses tetap aman buat WhatsApp -- lihat
 // YTDLP_ALLOWED_HEIGHTS di ytdlp.js.
 const DL_ALLOWED_HEIGHTS = [144, 240, 360, 480, 720];
+
+// =====================================================
+// Helper khusus "!schat": nentuin jid siapa yang fotonya mau dipakai
+// jadi avatar, KALAU user gak ngirim/reply gambar secara langsung.
+//
+// Prioritas:
+//   1. Jid pengirim pesan yang di-REPLY (ctx.participant) -- kalau user
+//      reply ke chat orang lain terus ketik "!schat ...", ambil pp orang
+//      yang di-reply itu. Ini yang paling natural buat "sticker dialog
+//      dari chat yang di-reply".
+//   2. Jid orang yang di-TAG/mention (@user) di teks command-nya.
+//   3. Fallback: pengirim command itu sendiri (pp sendiri).
+// =====================================================
+function resolveSchatAvatarJid(msg, senderJid) {
+  const ctx = msg.message?.extendedTextMessage?.contextInfo;
+  if (ctx?.participant) return ctx.participant;
+  if (ctx?.mentionedJid && ctx.mentionedJid.length > 0) return ctx.mentionedJid[0];
+  return senderJid;
+}
+
+// Ambil foto profil WA (buffer) buat 1 jid. Baileys sock.profilePictureUrl
+// bisa gagal/nolak kalau privasi orangnya emang ditutup ("hanya kontak
+// saya", dst) -- itu WAJAR, bukan bug, makanya error di sini SENGAJA
+// ditelan (return null) supaya !schat tetap lanjut pakai avatar fallback
+// (lingkaran huruf) alih-alih gagal total.
+async function fetchProfilePictureBuffer(sock, jid) {
+  if (!jid) return null;
+
+  try {
+    const normalized = jidNormalizedUser(jid);
+    const url = await sock.profilePictureUrl(normalized, "image");
+    const res = await axios.get(url, {
+      responseType: "arraybuffer",
+      timeout: 8000,
+    });
+    return Buffer.from(res.data);
+  } catch (err) {
+    return null;
+  }
+}
 
 // Tangani satu event "messages.upsert" dari Baileys. Ini adalah router
 // utama semua command (!ping, !img, !meme, !dl, dst) -- pisahan logic
@@ -807,6 +853,100 @@ async function handleMessagesUpsert(sock, { messages, type }) {
         console.log("=====================");
         await sock.sendMessage(jid, {
           text: `❌ Gagal membuat stiker BRAT.\n${err.message || "Terjadi kesalahan saat merender teks, coba lagi ya."}`,
+        });
+      }
+
+      return;
+    }
+
+    // =====================
+    // !schat Nama|Pesan|badge  -> stiker "dialog chat" ala screenshot
+    // WhatsApp (avatar bulat + nama pengirim + bubble pesan). Bagian
+    // "badge" opsional (mis. emoji kecil di sebelah nama).
+    //
+    // Render-nya MURNI dari teks (Canvas, lihat dialogSticker.js --
+    // diport dari prototype dialog-sticker-generator.html) -- avatar
+    // OPSIONAL, dipakai kalau ada gambar/stiker yang di-reply atau
+    // dikirim bareng caption "!schat ..."; kalau enggak ada, fallback ke
+    // lingkaran warna + huruf awal nama.
+    // =====================
+    if (text === "!schat" || text.startsWith("!schat ")) {
+      const raw = text.slice(6).trim();
+      const parts = raw.split("|").map((s) => s.trim());
+      const senderName = parts[0] || "";
+      const chatMessage = parts[1] || "";
+      const badge = parts[2] || "";
+
+      if (!senderName || !chatMessage) {
+        await sendCommandDetail(sock, jid, "schat");
+        return;
+      }
+
+      if (senderName.length > SCHAT_MAX_NAME_CHARS) {
+        await sock.sendMessage(jid, {
+          text: `⚠️ Nama pengirimnya kepanjangan (maksimal ${SCHAT_MAX_NAME_CHARS} karakter).`,
+        });
+        return;
+      }
+
+      if (chatMessage.length > SCHAT_MAX_MESSAGE_CHARS) {
+        await sock.sendMessage(jid, {
+          text:
+            `⚠️ Pesannya kepanjangan (${chatMessage.length} karakter, maksimal ${SCHAT_MAX_MESSAGE_CHARS}) ` +
+            "biar layout stikernya tetap rapi & prosesnya gak lama.",
+        });
+        return;
+      }
+
+      try {
+        await sock.sendMessage(jid, { text: "⏳ Membuat stiker..." });
+
+        // Avatar -- 3 sumber, dicoba berurutan sampai ada yang berhasil:
+        //   1. Gambar/stiker yang di-reply atau dikirim bareng caption-nya
+        //      (matcher sama seperti !smeme).
+        //   2. Foto profil WA -- punya orang yang di-reply/di-tag, atau
+        //      punya pengirim command sendiri kalau gak reply/tag siapa2
+        //      (lihat resolveSchatAvatarJid).
+        //   3. Kalau semua gagal (mis. privasi pp-nya ditutup): fallback
+        //      ke lingkaran warna + huruf awal nama di dalam
+        //      textToDialogSticker sendiri.
+        const avatarSource = findStickerSource(msg);
+        let avatarBuffer = null;
+
+        if (avatarSource) {
+          try {
+            avatarBuffer = await downloadGifBuffer(
+              avatarSource.content,
+              avatarSource.refKey,
+            );
+          } catch (err) {
+            console.log("⚠️ Gagal download avatar buat !schat, coba fallback pp:", err.message);
+          }
+        }
+
+        if (!avatarBuffer) {
+          const avatarJid = resolveSchatAvatarJid(msg, getSenderJid(msg));
+          avatarBuffer = await fetchProfilePictureBuffer(sock, avatarJid);
+        }
+
+        const stickerBuffer = await textToDialogSticker({
+          avatarBuffer,
+          senderName,
+          badge,
+          message: chatMessage,
+          randomNameColor: !avatarBuffer, // biar variatif kalau avatar-nya fallback ke lingkaran huruf
+        });
+
+        await sock.sendMessage(jid, {
+          sticker: stickerBuffer,
+          isAnimated: false,
+        });
+      } catch (err) {
+        console.log("=== [schat] gagal ===");
+        console.log(err.message || err);
+        console.log("=====================");
+        await sock.sendMessage(jid, {
+          text: `❌ Gagal membuat stiker chat.\n${err.message || "Terjadi kesalahan saat merender, coba lagi ya."}`,
         });
       }
 
