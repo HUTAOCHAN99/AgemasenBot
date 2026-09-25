@@ -231,9 +231,11 @@ Ketik teksnya langsung setelah command.
 \`\`\`
 !sbrat ayo ayo ganyang fufufafa
 !sbrat hidup cuma sekali
+!sbrat capek banget hari ini 😭
 \`\`\`
 
 💡 Bisa juga pakai titik: \`.sbrat teksnya\`.
+💡 Emoji boleh ikut di dalam teks (termasuk bendera 🇮🇩 dan emoji warna kulit 👍🏽), tampil sebagai gambar emoji.
 
 ⚠️ Maksimal sekitar 80 karakter biar layout stikernya tetap rapi.`,
 

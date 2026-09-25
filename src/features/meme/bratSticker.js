@@ -2,6 +2,12 @@ const fs = require("fs");
 const path = require("path");
 const sharp = require("sharp");
 const { createCanvas, GlobalFonts } = require("@napi-rs/canvas");
+const {
+  splitTextEmoji,
+  preloadEmojisInText,
+  emojiImageCache,
+  emojiToCodepoints,
+} = require("./emoji");
 
 // =====================================================
 // Fitur: "!sbrat <teks>" (alias ".sbrat") -- stiker gaya BRAT.
@@ -17,8 +23,18 @@ const { createCanvas, GlobalFonts } = require("@napi-rs/canvas");
 //      di KIRI-ATAS (bukan ditengahkan).
 //   4. Ukuran font dicari otomatis: mulai dari 1/3 lebar kanvas, turun
 //      sampai hasil word-wrap muat di area teks. Line-height 0.9.
-//   5. Setiap baris KECUALI baris terakhir di-JUSTIFY (sisa lebar dibagi
-//      rata ke celah antarkata). Baris terakhir tetap rata kiri.
+//   5. Setiap baris di-JUSTIFY (sisa lebar dibagi rata ke celah antarkata).
+//      Baris terakhir ikut di-justify HANYA kalau isinya lebih dari 2 kata
+//      (LAST_LINE_JUSTIFY_MIN_WORDS); kalau 1-2 kata tetap rata kiri.
+//      Baris 1 kata tetap rata kiri (gak ada celah untuk dibagi).
+//   5b. Margin kiri & kanan diukur dari TINTA huruf yang sebenarnya (bukan
+//      dari lebar advance font), jadi jarak tepi kiri teks ke kanvas sama
+//      dengan jarak tepi kanan teks ke kanvas.
+//   5c. EMOJI didukung: font brat gak punya glyph emoji, jadi tiap emoji
+//      digambar sebagai gambar Twemoji (fetch + cache lewat emoji.js, sama
+//      seperti fitur meme) dan diperlakukan sebagai bagian dari kata --
+//      ikut word-wrap, ikut justify, ikut kena efek fried. Emoji yang
+//      gambarnya gagal diambil dibuang dari teks (bukan jadi kotak kosong).
 //   6. Efek "fried": blur (fried/100 * 3px pada kanvas 600px) lalu
 //      kompresi JPEG berkualitas rendah (quality = 1 - fried/100).
 //      Default fried = 80, sama seperti slider di web generator.
@@ -70,6 +86,15 @@ const BASE_FONT_SIZE = CANVAS_SIZE / 3; // = min(200, size/3) di generator
 const MIN_FONT_SIZE = 20 * SCALE;
 const FONT_STEP = 2; // generator pakai 5; lebih halus = font lebih pas ke ruang
 const MAX_CHARS = 80;
+// Baris terakhir baru di-justify kalau jumlah katanya LEBIH dari 2
+// (artinya minimal 3). Ubah angka ini kalau mau ambang lain.
+const LAST_LINE_JUSTIFY_MIN_WORDS = 3;
+
+// Emoji digambar sebagai gambar persegi. Angka relatif terhadap ukuran font
+// (tinggi huruf brat: puncak ascender ~0.16, baseline ~0.885).
+const EMOJI_SIZE_EM = 0.8; // sisi gambar emoji
+const EMOJI_TOP_EM = 0.12; // jarak gambar dari atas kotak teks
+const EMOJI_GAP_EM = 0.05; // celah kecil setelah tiap emoji
 
 // Fried level 1..99 (default 80 seperti slider di generator).
 const FRIED_LEVEL = Math.min(
@@ -98,19 +123,61 @@ function splitWords(text) {
   return normalized ? normalized.split(" ") : [];
 }
 
+// --- Helper emoji ------------------------------------------------------
+function emojiBox(size) {
+  return size * EMOJI_SIZE_EM;
+}
+
+function emojiAdvance(size) {
+  return emojiBox(size) + size * EMOJI_GAP_EM;
+}
+
+function getEmojiImg(emoji) {
+  return emojiImageCache.get(emojiToCodepoints(emoji)) || null;
+}
+
+// Buang emoji yang gambarnya gak tersedia (gagal fetch / gak ada di Twemoji)
+// supaya gak muncul sebagai ruang kosong di stiker.
+function stripUnavailableEmoji(text) {
+  return splitTextEmoji(text)
+    .filter((seg) => seg.type !== "emoji" || getEmojiImg(seg.value))
+    .map((seg) => seg.value)
+    .join("");
+}
+
+// Lebar 1 kata (campuran teks + emoji). Emoji dihitung selebar emojiAdvance.
+function measureWord(ctx, word, size) {
+  let width = 0;
+  for (const seg of splitTextEmoji(word)) {
+    width +=
+      seg.type === "emoji"
+        ? emojiAdvance(size)
+        : ctx.measureText(seg.value).width;
+  }
+  return width;
+}
+
+// Pecah kata jadi "unit": 1 karakter teks, atau 1 emoji utuh (emoji gabungan
+// gak boleh kepotong di tengah).
+function splitUnits(word) {
+  return splitTextEmoji(word).flatMap((seg) =>
+    seg.type === "emoji" ? [seg.value] : Array.from(seg.value),
+  );
+}
+
 // Kata yang lebih lebar dari area teks dipecah per karakter (di generator
 // cuma berlaku kalau inputnya 1 kata; di sini berlaku untuk semua kata
 // supaya kata panjang di tengah kalimat gak keluar kanvas).
-function breakLongWord(ctx, word, maxWidth) {
-  if (ctx.measureText(word).width <= maxWidth) return [word];
+function breakLongWord(ctx, word, maxWidth, size) {
+  if (measureWord(ctx, word, size) <= maxWidth) return [word];
 
   const chunks = [];
   let current = "";
-  for (const char of Array.from(word)) {
-    const test = current + char;
-    if (current && ctx.measureText(test).width > maxWidth) {
+  for (const unit of splitUnits(word)) {
+    const test = current + unit;
+    if (current && measureWord(ctx, test, size) > maxWidth) {
       chunks.push(current);
-      current = char;
+      current = unit;
     } else {
       current = test;
     }
@@ -119,20 +186,25 @@ function breakLongWord(ctx, word, maxWidth) {
   return chunks;
 }
 
-// Word-wrap greedy berbasis lebar teks sebenarnya (measureText), sama
-// seperti wrapText() di generator. Mengembalikan array string (1 per baris).
-function wrapText(ctx, words, maxWidth) {
-  const tokens = words.flatMap((w) => breakLongWord(ctx, w, maxWidth));
+// Word-wrap greedy berbasis lebar sebenarnya (measureText; emoji dihitung
+// lewat measureWord), sama seperti wrapText() di generator. Mengembalikan
+// array string (1 per baris). `size` = ukuran font saat ini (untuk emoji).
+function wrapText(ctx, words, maxWidth, size) {
+  const tokens = words.flatMap((w) => breakLongWord(ctx, w, maxWidth, size));
+  const spaceWidth = ctx.measureText(" ").width;
   const lines = [];
   let current = tokens[0] || "";
+  let currentWidth = current ? measureWord(ctx, current, size) : 0;
 
   for (let i = 1; i < tokens.length; i++) {
-    const test = `${current} ${tokens[i]}`;
-    if (ctx.measureText(test).width <= maxWidth) {
-      current = test;
+    const tokenWidth = measureWord(ctx, tokens[i], size);
+    if (currentWidth + spaceWidth + tokenWidth <= maxWidth) {
+      current = `${current} ${tokens[i]}`;
+      currentWidth += spaceWidth + tokenWidth;
     } else {
       lines.push(current);
       current = tokens[i];
+      currentWidth = tokenWidth;
     }
   }
   lines.push(current);
@@ -148,39 +220,151 @@ function calculateOptimalFontSize(ctx, words, maxWidth, maxHeight) {
   let size = BASE_FONT_SIZE;
   for (; size >= MIN_FONT_SIZE; size -= FONT_STEP) {
     applyFont(ctx, size);
-    const lines = wrapText(ctx, words, maxWidth);
+    const lines = wrapText(ctx, words, maxWidth, size);
     if (lines.length * size * LINE_HEIGHT_RATIO <= maxHeight) {
       return { size, lines };
     }
   }
   applyFont(ctx, MIN_FONT_SIZE);
-  return { size: MIN_FONT_SIZE, lines: wrapText(ctx, words, maxWidth) };
+  return {
+    size: MIN_FONT_SIZE,
+    lines: wrapText(ctx, words, maxWidth, MIN_FONT_SIZE),
+  };
 }
 
-// Justify: sisa lebar dibagi rata ke celah antarkata (drawJustifiedLine).
-function drawJustifiedLine(ctx, line, x, y, maxWidth) {
+// Ukur TEPI TINTA sebenarnya dari sebuah teks (bukan lebar advance):
+// gambar di kanvas kecil, lalu pindai piksel dari kiri dan dari kanan.
+// Hasilnya jarak dari titik origin x ke piksel tinta pertama (left) dan
+// terakhir (right). Ini yang bikin margin kiri/kanan benar-benar simetris,
+// karena letter-spacing negatif dan side-bearing huruf membuat tinta
+// bergeser dari posisi advance-nya.
+let inkCtx = null;
+const inkCache = new Map();
+function measureTextInk(text, size) {
+  const key = `${size}|${text}`;
+  const cached = inkCache.get(key);
+  if (cached) return cached;
+
+  const pad = Math.ceil(size);
+  const width = Math.ceil(inkCtxMeasure(text, size)) + pad * 2;
+  const height = Math.ceil(size * 1.6);
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  applyFont(ctx, size);
+  ctx.fillStyle = "#000000";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(text, pad, Math.ceil(size * 1.2));
+
+  const { data } = ctx.getImageData(0, 0, width, height);
+  const THRESHOLD = 64; // alpha; cukup untuk lewati anti-alias tipis
+  const columnHasInk = (x) => {
+    for (let y = 0; y < height; y++) {
+      if (data[(y * width + x) * 4 + 3] > THRESHOLD) return true;
+    }
+    return false;
+  };
+
+  let first = 0;
+  while (first < width && !columnHasInk(first)) first++;
+  let last = width - 1;
+  while (last > first && !columnHasInk(last)) last--;
+
+  // Kolom piksel x menutupi [x, x+1), jadi tepi kanan = last + 1.
+  const result = { left: first - pad, right: last + 1 - pad };
+  inkCache.set(key, result);
+  return result;
+}
+
+// Lebar advance untuk ukuran kanvas kecil di atas (dipisah supaya
+// measureInk tetap ringkas).
+function inkCtxMeasure(text, size) {
+  if (!inkCtx) inkCtx = createCanvas(1, 1).getContext("2d");
+  applyFont(inkCtx, size);
+  return inkCtx.measureText(text).width;
+}
+
+// Tepi tinta sebuah KATA (bisa campuran teks + emoji): jarak dari origin
+// kata ke tinta paling kiri (left) dan paling kanan (right). Segmen teks
+// diukur lewat piksel, gambar emoji dianggap penuh selebar emojiBox.
+function measureInk(word, size) {
+  const segs = splitTextEmoji(word);
+  if (segs.length === 0) return { left: 0, right: 0 };
+
+  const first = segs[0];
+  const last = segs[segs.length - 1];
+  const left = first.type === "emoji" ? 0 : measureTextInk(first.value, size).left;
+
+  let prefix = 0;
+  for (let i = 0; i < segs.length - 1; i++) {
+    prefix +=
+      segs[i].type === "emoji"
+        ? emojiAdvance(size)
+        : inkCtxMeasure(segs[i].value, size);
+  }
+  const right =
+    prefix +
+    (last.type === "emoji"
+      ? emojiBox(size)
+      : measureTextInk(last.value, size).right);
+
+  return { left, right };
+}
+
+// Gambar 1 kata di (x, y): segmen teks pakai fillText, emoji pakai drawImage.
+function drawWord(ctx, word, x, y, size) {
+  let cursor = x;
+  for (const seg of splitTextEmoji(word)) {
+    if (seg.type === "emoji") {
+      const img = getEmojiImg(seg.value);
+      if (img) {
+        ctx.drawImage(
+          img,
+          cursor,
+          y + size * EMOJI_TOP_EM,
+          emojiBox(size),
+          emojiBox(size),
+        );
+      }
+      cursor += emojiAdvance(size);
+    } else {
+      ctx.fillText(seg.value, cursor, y);
+      cursor += ctx.measureText(seg.value).width;
+    }
+  }
+}
+
+// Gambar satu baris. Tepi TINTA kata pertama dipasang tepat di margin kiri;
+// kalau di-justify, tepi TINTA kata terakhir dipasang tepat di margin kanan
+// dan sisa lebar dibagi rata ke celah antarkata (drawJustifiedLine).
+function drawLine(ctx, line, y, size, justify) {
   const words = line.split(" ");
-  if (words.length <= 1) {
-    ctx.fillText(line, x, y);
-    return;
+  const x0 = MARGIN - measureInk(words[0], size).left;
+  const widths = words.map((w) => measureWord(ctx, w, size));
+
+  let gap = ctx.measureText(" ").width; // rata kiri: celah normal
+  if (justify && words.length > 1) {
+    const rightInk = measureInk(words[words.length - 1], size).right;
+    const xLast = CANVAS_SIZE - MARGIN - rightInk; // origin kata terakhir
+    const widthsExceptLast = widths
+      .slice(0, -1)
+      .reduce((sum, w) => sum + w, 0);
+    gap = Math.max(xLast - x0 - widthsExceptLast, 0) / (words.length - 1);
   }
 
-  const widths = words.map((w) => ctx.measureText(w).width);
-  const totalWords = widths.reduce((sum, w) => sum + w, 0);
-  const gap = Math.max(maxWidth - totalWords, 0) / (words.length - 1);
-
-  let cursorX = x;
+  let cursorX = x0;
   words.forEach((word, i) => {
-    ctx.fillText(word, cursorX, y);
+    drawWord(ctx, word, cursorX, y, size);
     cursorX += widths[i] + gap;
   });
 }
 
 // Render kanvas putih + teks brat -> buffer PNG (belum di-blur/fried).
-function renderBratPng(text) {
+function renderBratPngSync(text) {
   ensureBratFontRegistered();
 
-  const words = splitWords(text);
+  // Emoji yang gambarnya gak berhasil di-preload dibuang dulu.
+  const words = splitWords(stripUnavailableEmoji(normalizeText(text)));
   if (words.length === 0) words.push("brat"); // sama seperti generator
 
   const canvas = createCanvas(CANVAS_SIZE, CANVAS_SIZE);
@@ -213,15 +397,21 @@ function renderBratPng(text) {
   const lineGap = size * LINE_HEIGHT_RATIO;
   let y = MARGIN;
   lines.forEach((line, index) => {
-    if (index < lines.length - 1) {
-      drawJustifiedLine(ctx, line, MARGIN, y, maxWidth);
-    } else {
-      ctx.fillText(line, MARGIN, y); // baris terakhir rata kiri
-    }
+    const isLast = index === lines.length - 1;
+    // Baris biasa selalu di-justify; baris terakhir hanya kalau > 2 kata.
+    const justify =
+      !isLast || line.split(" ").length >= LAST_LINE_JUSTIFY_MIN_WORDS;
+    drawLine(ctx, line, y, size, justify);
     y += lineGap;
   });
 
   return canvas.toBuffer("image/png");
+}
+
+// Versi async: pra-load gambar emoji dulu (fetch + cache), baru render.
+async function renderBratPng(text) {
+  await preloadEmojisInText(normalizeText(text));
+  return renderBratPngSync(text);
 }
 
 // Efek "fried" ala generator, lalu jadi WebP untuk stiker:
@@ -244,7 +434,7 @@ async function pngToBratWebp(pngBuffer, friedLevel = FRIED_LEVEL) {
 // Dipanggil dari router: teks -> buffer stiker WebP siap kirim.
 // Semua proses di memory (tanpa file temp).
 async function textToBratSticker(text) {
-  const pngBuffer = renderBratPng(text);
+  const pngBuffer = await renderBratPng(text);
   return pngToBratWebp(pngBuffer);
 }
 

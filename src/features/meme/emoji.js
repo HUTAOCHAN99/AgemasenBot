@@ -31,19 +31,26 @@ function ensureFontsRegistered() {
   }
 }
 
-// Regex Unicode buat nangkep 1 "cluster" emoji utuh, termasuk emoji
-// gabungan (mis. 👨‍👩‍👧, atau emoji+variation selector ❤️) supaya tidak
-// kepotong jadi beberapa gambar terpisah.
-const EMOJI_REGEX =
-  /\p{Extended_Pictographic}(\u200D\p{Extended_Pictographic})*\uFE0F?/gu;
+// Regex Unicode buat nangkep 1 "cluster" emoji utuh supaya tidak kepotong
+// jadi beberapa gambar terpisah. Mendukung:
+//   - bendera (2 regional indicator, mis. 🇮🇩)
+//   - emoji + variation selector (❤️) dan skin tone (👍🏽)
+//   - emoji gabungan pakai ZWJ (👨‍👩‍👧, ❤️‍🔥, 🧑🏽‍💻)
+const EMOJI_MODIFIER = "[\\u{1F3FB}-\\u{1F3FF}]";
+const EMOJI_UNIT = `\\p{Extended_Pictographic}\\uFE0F?${EMOJI_MODIFIER}?`;
+const EMOJI_REGEX = new RegExp(
+  `\\p{Regional_Indicator}{2}|${EMOJI_UNIT}(?:\\u200D${EMOJI_UNIT})*`,
+  "gu",
+);
 
-// "😂" -> "1f602" (dipakai buat nama file Twemoji). Variation selector
-// (U+FE0F) dibuang karena Twemoji umumnya tidak menyertakannya di nama file,
-// kecuali untuk emoji gabungan pakai ZWJ (U+200D) yang justru harus tetap ada.
+// "😂" -> "1f602" (dipakai buat nama file Twemoji). Aturan Twemoji:
+// variation selector (U+FE0F) dibuang, KECUALI untuk emoji gabungan pakai
+// ZWJ (U+200D) -- di situ FE0F harus tetap ada (mis. 2764-fe0f-200d-1f525).
 function emojiToCodepoints(emoji) {
+  const hasZwj = emoji.includes("\u200D");
   return Array.from(emoji)
     .map((ch) => ch.codePointAt(0))
-    .filter((cp) => cp !== 0xfe0f)
+    .filter((cp) => hasZwj || cp !== 0xfe0f)
     .map((cp) => cp.toString(16))
     .join("-");
 }
@@ -91,7 +98,12 @@ async function getEmojiImage(emoji) {
       `⚠️ Gagal ambil gambar emoji "${emoji}" (${code}):`,
       err.message,
     );
-    emojiImageCache.set(code, null);
+    // Cache "tidak ada" HANYA kalau memang 404 (emoji tidak ada di Twemoji).
+    // Gagal karena jaringan/timeout gak di-cache, biar dicoba lagi lain kali
+    // (kalau di-cache, emoji itu hilang terus sampai bot direstart).
+    if (err.response && err.response.status === 404) {
+      emojiImageCache.set(code, null);
+    }
     return null;
   }
 }
