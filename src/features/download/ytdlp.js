@@ -380,13 +380,53 @@ function probeVideoInfo(inputPath) {
 // cuma sempat nunjukin "frame=0" tanpa progress apa pun. Makanya di sini
 // threads DIBATASI KECIL secara eksplisit, biar konsumsi memorinya bisa
 // diprediksi dan gak auto-mengikuti core count host yang gak relevan.
+// Beberapa video sumber (banyak ketemu di klip TikTok/reels ber-HEVC)
+// nyimpen metadata warna (colour_primaries/transfer_characteristics/
+// matrix_coefficients) dengan nilai "reserved" (3) -- nilai yang menurut
+// ITU-T H.273 belum dialokasikan. FFmpeg 7.x punya bug (trac.ffmpeg.org/
+// ticket/11020) di mana filter graph-nya (termasuk filter "scale" yang
+// kita pakai di bawah) langsung nolak stream kayak gitu dengan error
+// "Invalid color range" -> "Error reinitializing filters!" -> encoder
+// gak pernah kebuka. Ini KONSISTEN gagal (bukan soal resource/OOM),
+// jadi tanpa fix ini semua tier transcode bakal gagal terus-terusan
+// buat video dengan metadata kayak gini.
+//
+// Fix-nya: pakai bitstream filter buat nimpa nilai "reserved" itu jadi
+// nilai valid (1 = BT.709, asumsi paling aman buat video web/mobile)
+// SEBELUM filter graph sempat baca metadata itu. Nyetel "-color_range"/
+// "-colorspace" dkk sebagai opsi output TIDAK cukup (sudah dicoba di
+// thread bug-nya, tetap gagal) karena itu cuma ngubah metadata di
+// output, bukan apa yang dibaca decoder/filter graph di tengah proses.
+const METADATA_BSF_BY_CODEC = {
+  h264: "h264_metadata",
+  hevc: "hevc_metadata",
+  h265: "hevc_metadata",
+  av1: "av1_metadata",
+};
+
+function buildColorFixBsfArgs(codecName) {
+  const bsf = METADATA_BSF_BY_CODEC[(codecName || "").toLowerCase()];
+  if (!bsf) return [];
+  return [
+    "-bsf:v",
+    `${bsf}=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1`,
+  ];
+}
+
 function runFfmpegTranscodeToH264(inputPath, outputPath, opts = {}) {
-  const { maxWidth = 1280, crf = null, audioBitrate = "128k", threads = 2 } = opts;
+  const {
+    maxWidth = 1280,
+    crf = null,
+    audioBitrate = "128k",
+    threads = 2,
+    codecName = null,
+  } = opts;
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, [
       "-y",
       "-i",
       inputPath,
+      ...buildColorFixBsfArgs(codecName),
       "-c:v",
       "libx264",
       "-threads",
@@ -484,6 +524,10 @@ async function ensureWhatsAppCompatibleVideo(inputPath, opts = {}) {
 
   const info = await probeVideoInfo(inputPath);
   const isH264 = /Video:\s*h264/i.test(info);
+  // Nama codec mentah (h264/hevc/av1/vp9/dst) buat mutusin bitstream
+  // filter mana yang perlu dipasang di runFfmpegTranscodeToH264 (lihat
+  // komentar panjang di situ soal bug "Invalid color range" FFmpeg 7.x).
+  const codecName = info.match(/Video:\s*([a-z0-9]+)/i)?.[1] || null;
 
   // Ketemu pas investigasi kasus "video kekirim tanpa suara": kadang
   // sumbernya SENDIRI (sebelum kita proses apa-apa) udah gak punya stream
@@ -556,7 +600,7 @@ async function ensureWhatsAppCompatibleVideo(inputPath, opts = {}) {
   for (const [i, tier] of tiers.entries()) {
     const outPath = path.join(workDir, `${prefix}-h264-${i}.mp4`);
     try {
-      await runFfmpegTranscodeToH264(inputPath, outPath, tier);
+      await runFfmpegTranscodeToH264(inputPath, outPath, { ...tier, codecName });
     } catch (err) {
       console.error(`[dl] Transcode tier ${i} gagal:`, err.message);
       continue;
