@@ -17,6 +17,7 @@ const {
 const { getSenderJid, getSessionKey, getTsundereSessionKey, isOwnerMsg } = require("../utils/whatsapp");
 const { isBotDisabledFor } = require("../state/botState");
 const { recordUserActivity, isUserDisabled } = require("../state/userState");
+const { rememberName, getCachedName } = require("../state/nameCache");
 const {
   handleWhoamiCommand,
   sendNgambekReply,
@@ -103,6 +104,78 @@ const {
 // YTDLP_ALLOWED_HEIGHTS di ytdlp.js.
 const DL_ALLOWED_HEIGHTS = [144, 240, 360, 480, 720];
 
+function normalizeJidSafe(jid) {
+  if (!jid) return null;
+  try {
+    return jidNormalizedUser(jid);
+  } catch {
+    return jid;
+  }
+}
+
+// Dipanggil buat SETIAP pesan masuk (lihat awal handleMessagesUpsert):
+// "nyolong dengar" pushName pengirimnya dan disimpan ke nameCache, di
+// SEMUA bentuk jid yang Baileys kasih buat pesan ini (participant/@lid
+// DAN participantPn/senderPn/nomor asli sekaligus, kalau ada) -- supaya
+// nanti pas di-tag/reply pakai !schat, nama aslinya ketemu gak peduli
+// bentuk jid mana yang muncul di situ. Lihat komentar panjang di
+// state/nameCache.js buat alasan lengkapnya.
+function rememberNamesFromMsg(msg) {
+  const pushName = msg.pushName;
+  if (!pushName) return;
+
+  const isGroup = !!msg.key.participant;
+  const rawJids = [
+    msg.key.participant,
+    msg.key.participantPn,
+    msg.key.senderPn,
+    isGroup ? null : msg.key.remoteJid, // chat pribadi: remoteJid = si pengirim
+  ].filter(Boolean);
+
+  for (const raw of rawJids) {
+    rememberName(normalizeJidSafe(raw), pushName);
+  }
+}
+
+// Pola AWALAN teks mention WhatsApp mentah, mis. "@262796902162504 " --
+// ini yang BENERAN kekirim di isi pesan kalau user pilih kontak lewat
+// fitur @mention WA (WA gak pernah nyisipin nama asli ke teksnya, cuma
+// angka ID). Dipakai buat deteksi "field Nama di !schat ini DIAWALI hasil
+// nge-tag" -- baik itu SELURUH isinya (murni hasil pilih @mention) maupun
+// cuma awalannya doang (user nge-tag buat avatar, TERUS nambahin nama
+// custom sendiri setelahnya, mis. "@628xxx aku baik").
+const MENTION_PREFIX_RE = /^@\d{5,}\s*/;
+const MENTION_UNKNOWN_NAME_FALLBACK = "Seseorang";
+
+// Resolusi nama yang ditampilkan di stiker:
+//   1. Field Nama gak diawali mention sama sekali -> dipakai apa adanya
+//      (user ketik manual, gak nge-tag).
+//   2. Diawali mention TAPI ada teks custom nempel setelahnya (mis.
+//      "@628xxx aku baik") -> teks custom itu yang dipakai, avatar tetap
+//      dari orang yang di-tag. Ini prioritas PALING TINGGI -- user yang
+//      nulis sendiri, jadi dianggap paling benar, gak perlu nebak apa pun.
+//   3. Field-nya CUMA mention doang, gak ada nama custom nempel -> coba
+//      pushName pengirim sendiri (kalau avatar-nya emang dirinya sendiri),
+//      lalu coba nameCache (butuh orang itu PERNAH kelihatan ngirim pesan
+//      sebelumnya), baru kalau semua gagal fallback ke label generik
+//      "Seseorang" (BUKAN angka ID mentah -- jelek & gak enak dibaca).
+function resolveSchatDisplayName(rawName, msg, avatarJid) {
+  const mentionMatch = rawName.match(MENTION_PREFIX_RE);
+  if (!mentionMatch) return rawName;
+
+  const customName = rawName.slice(mentionMatch[0].length).trim();
+  if (customName) return customName;
+
+  const normalized = avatarJid ? normalizeJidSafe(avatarJid) : null;
+
+  if (normalized && normalized === getSenderJid(msg) && msg.pushName) {
+    return msg.pushName.trim();
+  }
+
+  const cached = normalized ? getCachedName(normalized) : null;
+  return cached || MENTION_UNKNOWN_NAME_FALLBACK;
+}
+
 // =====================================================
 // Helper khusus "!schat": nentuin jid siapa yang fotonya mau dipakai
 // jadi avatar, KALAU user gak ngirim/reply gambar secara langsung.
@@ -162,6 +235,12 @@ async function handleMessagesUpsert(sock, { messages, type }) {
     // supaya siapa pun bisa reply ke pesan bot manapun dan tetap nyambung
     // ke obrolan yang sama. Lihat komentar di getTsundereSessionKey.
     const tsundereSessionKey = getTsundereSessionKey(msg);
+
+    // "Nyolong dengar" pushName pengirim pesan ini (lihat nameCache.js) --
+    // dipanggil paling awal & UNCONDITIONAL (gak peduli command apa/lagi
+    // dimatiin atau enggak) biar cache-nya selalu ke-update dari lalu
+    // lintas chat normal, terlepas dari fitur apa yang akhirnya jalan.
+    rememberNamesFromMsg(msg);
 
     const text = (
       msg.message.conversation ||
@@ -924,14 +1003,21 @@ async function handleMessagesUpsert(sock, { messages, type }) {
           }
         }
 
+        // Jid ini dipakai DUA KALI: buat fallback pp (di bawah) DAN buat
+        // resolveSchatDisplayName (gantiin "@<ID mentah>" di field Nama
+        // jadi nama asli kalau field itu ternyata hasil nge-tag lewat
+        // @mention WA -- lihat komentarnya di atas).
+        const avatarJid = resolveSchatAvatarJid(msg, getSenderJid(msg));
+
         if (!avatarBuffer) {
-          const avatarJid = resolveSchatAvatarJid(msg, getSenderJid(msg));
           avatarBuffer = await fetchProfilePictureBuffer(sock, avatarJid);
         }
 
+        const displayName = resolveSchatDisplayName(senderName, msg, avatarJid);
+
         const stickerBuffer = await textToDialogSticker({
           avatarBuffer,
-          senderName,
+          senderName: displayName,
           badge,
           message: chatMessage,
           randomNameColor: !avatarBuffer, // biar variatif kalau avatar-nya fallback ke lingkaran huruf
