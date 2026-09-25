@@ -85,7 +85,15 @@ const LETTER_SPACING_EM = -0.05;
 const BASE_FONT_SIZE = CANVAS_SIZE / 3; // = min(200, size/3) di generator
 const MIN_FONT_SIZE = 20 * SCALE;
 const FONT_STEP = 2; // generator pakai 5; lebih halus = font lebih pas ke ruang
-const MAX_CHARS = 80;
+// Limit ini BUKAN buat batasi tampilan (font emang udah otomatis mengecil
+// sendiri kalau teksnya panjang -- lihat calculateOptimalFontSize/MIN_FONT_SIZE
+// di atas; teks yang kepanjangan bakal kepotong di bawah kanvas, bukan error).
+// Ini murni pengaman performa: proses gambar canvas di sini SINKRON dan
+// CPU-bound, dan karena Node cuma 1 thread, selama proses jalan seluruh bot
+// ikut macet buat SEMUA orang (bukan cuma pengirim). Makin panjang teksnya,
+// makin lama nge-block. 3000 karakter ~1-2 detik, masih aman; kalau mau
+// dinaikkan lagi, naikkan sedikit-sedikit sambil dicek waktu rendernya.
+const MAX_CHARS = 3000;
 // Baris terakhir baru di-justify kalau jumlah katanya LEBIH dari 2
 // (artinya minimal 3). Ubah angka ini kalau mau ambang lain.
 const LAST_LINE_JUSTIFY_MIN_WORDS = 3;

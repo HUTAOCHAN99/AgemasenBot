@@ -787,7 +787,7 @@ async function handleMessagesUpsert(sock, { messages, type }) {
         await sock.sendMessage(jid, {
           text:
             `⚠️ Teksnya kepanjangan (${bratText.length} karakter, maksimal ${BRAT_MAX_CHARS}) ` +
-            "biar layout stikernya tetap rapi. Coba dipersingkat lagi ya.",
+            "biar prosesnya gak lama dan gak bikin bot lag. Coba dipersingkat lagi ya.",
         });
         return;
       }
