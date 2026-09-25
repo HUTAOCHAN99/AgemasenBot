@@ -189,12 +189,25 @@ function breakLongWord(ctx, word, maxWidth, size) {
 // Word-wrap greedy berbasis lebar sebenarnya (measureText; emoji dihitung
 // lewat measureWord), sama seperti wrapText() di generator. Mengembalikan
 // array string (1 per baris). `size` = ukuran font saat ini (untuk emoji).
+// Dipakai sebagai FALLBACK TERAKHIR di calculateOptimalFontSize (lihat di
+// bawah) -- yaitu kalau bahkan di MIN_FONT_SIZE ada kata yang masih lebih
+// lebar dari area teks, baru kata itu dipenggal paksa.
 function wrapText(ctx, words, maxWidth, size) {
   const tokens = words.flatMap((w) => breakLongWord(ctx, w, maxWidth, size));
+  return wrapTokensNoBreak(ctx, tokens, maxWidth, size);
+}
+
+// Word-wrap greedy TANPA memenggal kata: kalau 1 kata sendirian sudah lebih
+// lebar dari maxWidth, kata itu tetap ditaruh sendirian di baris itu (lebar
+// baris boleh melebihi maxWidth sementara -- ini dipakai calculateOptimalFontSize
+// buat mendeteksi "kata ini masih kepanjangan, font-nya harus lebih kecil lagi"
+// SEBELUM nyerah dan memenggal kata).
+function wrapTokensNoBreak(ctx, tokens, maxWidth, size) {
+  if (tokens.length === 0) return [];
   const spaceWidth = ctx.measureText(" ").width;
   const lines = [];
-  let current = tokens[0] || "";
-  let currentWidth = current ? measureWord(ctx, current, size) : 0;
+  let current = tokens[0];
+  let currentWidth = measureWord(ctx, current, size);
 
   for (let i = 1; i < tokens.length; i++) {
     const tokenWidth = measureWord(ctx, tokens[i], size);
@@ -211,20 +224,35 @@ function wrapText(ctx, words, maxWidth, size) {
   return lines;
 }
 
-// Cari font TERBESAR (mulai 1/3 kanvas, turun bertahap) yang membuat
-// hasil wrap muat di tinggi area teks -- setara calculateOptimalFontSize().
-// Beda kecil dari generator: kalau sampai ukuran minimum pun gak muat,
-// yang dipakai ukuran minimum + baris hasil ukuran itu (di generator
-// ukuran dan baris bisa gak sinkron pada kasus ini).
+// Baris "overflow" = baris yang lebih lebar dari maxWidth (cuma bisa terjadi
+// kalau baris itu berisi 1 kata yang sendirian sudah kepanjangan).
+function hasOverflowingLine(ctx, lines, maxWidth, size) {
+  return lines.some((line) => measureWord(ctx, line, size) > maxWidth);
+}
+
+// Cari font TERBESAR (mulai 1/3 kanvas, turun bertahap) yang membuat SEMUA
+// kata muat utuh (gak dipenggal) dalam maxWidth x maxHeight -- setara
+// calculateOptimalFontSize() di generator, ditambah pengaman supaya kata
+// gak dipenggal selama masih ada ukuran font lebih kecil yang muat.
+//
+// Kalau langsung pakai wrapText (yang boleh memenggal kata) di sini, loop
+// bisa berhenti di font BESAR gara-gara pemenggalan bikin baris "muat"
+// tingginya -- padahal turun sedikit lagi kata itu muat utuh 1 baris tanpa
+// dipenggal sama sekali. Makanya di loop ini dipakai wrapTokensNoBreak, dan
+// breakLongWord baru dipakai kalau MIN_FONT_SIZE pun kata itu masih kepanjangan.
 function calculateOptimalFontSize(ctx, words, maxWidth, maxHeight) {
   let size = BASE_FONT_SIZE;
   for (; size >= MIN_FONT_SIZE; size -= FONT_STEP) {
     applyFont(ctx, size);
-    const lines = wrapText(ctx, words, maxWidth, size);
-    if (lines.length * size * LINE_HEIGHT_RATIO <= maxHeight) {
+    const lines = wrapTokensNoBreak(ctx, words, maxWidth, size);
+    const fitsHeight = lines.length * size * LINE_HEIGHT_RATIO <= maxHeight;
+    const fitsWidth = !hasOverflowingLine(ctx, lines, maxWidth, size);
+    if (fitsHeight && fitsWidth) {
       return { size, lines };
     }
   }
+  // Sampai MIN_FONT_SIZE pun masih ada kata yang kepanjangan atau baris
+  // kebanyakan -- baru di sini kata dipenggal paksa (breakLongWord).
   applyFont(ctx, MIN_FONT_SIZE);
   return {
     size: MIN_FONT_SIZE,
