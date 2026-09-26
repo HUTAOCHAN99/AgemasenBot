@@ -424,9 +424,9 @@ function runFfmpegTranscodeToH264(inputPath, outputPath, opts = {}) {
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, [
       "-y",
+      ...buildColorFixBsfArgs(codecName),
       "-i",
       inputPath,
-      ...buildColorFixBsfArgs(codecName),
       "-c:v",
       "libx264",
       "-threads",
