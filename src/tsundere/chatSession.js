@@ -298,7 +298,8 @@ function isReplyToBotMessage(chat, msg) {
     msg.message?.extendedTextMessage?.contextInfo ||
     msg.message?.imageMessage?.contextInfo ||
     msg.message?.videoMessage?.contextInfo ||
-    msg.message?.documentMessage?.contextInfo;
+    msg.message?.documentMessage?.contextInfo ||
+    msg.message?.stickerMessage?.contextInfo;
 
   const stanzaId = ctx?.stanzaId;
   if (!stanzaId) return false;
