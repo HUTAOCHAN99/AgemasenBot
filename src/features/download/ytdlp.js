@@ -404,12 +404,29 @@ const METADATA_BSF_BY_CODEC = {
   av1: "av1_metadata",
 };
 
+// PENTING: nama opsi warnanya beda ejaan tergantung bsf-nya, meskipun
+// artinya sama persis (section 6.4.2 masing-masing spec).
+// - h264_metadata & hevc_metadata -> ejaan INGGRIS: "colour_primaries"
+//   (ikut istilah "colour_description" di spec H.264/HEVC)
+// - av1_metadata -> ejaan AMERIKA: "color_primaries" (tanpa huruf "u",
+//   ikut istilah AV1 spec section 6.4.2)
+// Pakai ejaan yang salah bikin ffmpeg langsung stop dengan error
+// "Option 'colour_primaries' not found" SEBELUM sempat baca -i sama
+// sekali -- makanya video AV1 (banyak dari YouTube Shorts) selalu gagal
+// di kedua tier transcode, sementara H.264/HEVC baik-baik saja.
+const COLOR_OPTION_SPELLING_BY_BSF = {
+  h264_metadata: "colour",
+  hevc_metadata: "colour",
+  av1_metadata: "color",
+};
+
 function buildColorFixBsfArgs(codecName) {
   const bsf = METADATA_BSF_BY_CODEC[(codecName || "").toLowerCase()];
   if (!bsf) return [];
+  const spelling = COLOR_OPTION_SPELLING_BY_BSF[bsf] || "colour";
   return [
     "-bsf:v",
-    `${bsf}=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1`,
+    `${bsf}=${spelling}_primaries=1:transfer_characteristics=1:matrix_coefficients=1`,
   ];
 }
 
