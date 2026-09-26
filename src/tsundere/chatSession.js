@@ -272,7 +272,8 @@ function isBotMentioned(sock, msg) {
     msg.message?.extendedTextMessage?.contextInfo ||
     msg.message?.imageMessage?.contextInfo ||
     msg.message?.videoMessage?.contextInfo ||
-    msg.message?.documentMessage?.contextInfo;
+    msg.message?.documentMessage?.contextInfo ||
+    msg.message?.stickerMessage?.contextInfo;
 
   const mentioned = ctx?.mentionedJid || [];
   return mentioned.some((j) => {
